@@ -4,15 +4,11 @@ use crate::ui::float::Floats;
 
 use super::*;
 
-const LINK_QUERY_TAIL_LEN: usize = 74;
-
 #[derive(Default)]
 struct TestHost {
     view: Cell<u64>,
     floats: RefCell<Floats>,
-    allow_link: Cell<bool>,
     opened_links: RefCell<Vec<(u64, u64)>>,
-    header: RefCell<Option<String>>,
 }
 
 impl Host for TestHost {
@@ -20,19 +16,11 @@ impl Host for TestHost {
         Ok(self.view.get())
     }
 
-    fn links(&self, view: u64) -> Result<Vec<LuaLink>, String> {
-        assert_eq!(view, 0);
-        Ok(vec![LuaLink {
-            id: 7,
-            label: format!("猫{}", "a".repeat(LINK_QUERY_TAIL_LEN)),
-            target: "cat.md".into(),
-        }])
+    fn links(&self, _view: u64) -> Result<Vec<LuaLink>, String> {
+        Ok(Vec::new())
     }
 
     fn open_link(&self, view: u64, id: u64) -> Result<(), String> {
-        if !self.allow_link.get() {
-            return Err("missing target".into());
-        }
         self.opened_links.borrow_mut().push((view, id));
         Ok(())
     }
@@ -42,7 +30,6 @@ impl Host for TestHost {
     }
 
     fn update_float(&self, view: u64, float: u64, options: FloatOptions) -> Result<(), String> {
-        *self.header.borrow_mut() = options.header.clone();
         self.floats.borrow_mut().update(view, float, options)
     }
 
@@ -83,52 +70,41 @@ impl Drop for Scratch {
 }
 
 #[test]
-fn links_plugin_uses_config_relative_require_and_the_captured_view()
+fn plugin_tests() -> Result<(), Box<dyn std::error::Error>> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runner = root.join("plugins/tests/testrunner.lua");
+    let lua = Lua::new();
+    config::install_searcher(&lua, &root.join("init.lua"))?;
+    config::source_chunk(&lua, &runner, &fs::read(&runner)?).exec()?;
+    Ok(())
+}
+
+#[test]
+fn config_relative_module_can_register_a_mapping_that_uses_a_captured_view()
 -> Result<(), Box<dyn std::error::Error>> {
     let config = Scratch::new()?;
-    fs::create_dir(config.0.join("plugins"))?;
+    fs::create_dir(config.0.join("modules"))?;
     fs::write(
-        config.0.join("plugins/links.lua"),
-        include_str!("../../plugins/links.lua"),
+        config.0.join("modules/action.lua"),
+        r#"
+        local view = tvi.ui.current_view()
+        return function()
+            assert(view:open_link(1))
+        end
+        "#,
     )?;
     let init = config.init(
         r#"
-        local links = require("plugins.links")
-        tvi.keymap.set("normal", "gl", links.open, { desc = "リンク一覧を開く" })
+        local action = require("modules.action")
+        tvi.keymap.set("normal", "gl", action)
         "#,
     )?;
     let host = Rc::new(TestHost::default());
     let (runtime, diagnostic) = Runtime::load_from(host.clone(), Some(init));
     assert_eq!(diagnostic, None);
-    runtime.run_mapping(0)?;
-    let (view, float) = host.floats.borrow().active().ok_or("expected a float")?;
     host.view.set(17);
-
-    let send = |name: &str, text| {
-        runtime.run_float_key(
-            view,
-            float,
-            PluginKey {
-                name: name.into(),
-                text,
-            },
-        )
-    };
-    let query = format!("猫{}", "a".repeat(LINK_QUERY_TAIL_LEN));
-    for ch in query.chars() {
-        send(&ch.to_string(), Some(ch))?;
-    }
-    assert_eq!(*host.header.borrow(), Some(format!("> {query}")));
-    send("Enter", None)?;
-    assert_eq!(
-        *host.header.borrow(),
-        Some(format!("missing target  |  > {query}"))
-    );
-    assert_eq!(host.floats.borrow().active(), Some((view, float)));
-    host.allow_link.set(true);
-    send("Enter", None)?;
-    assert_eq!(&*host.opened_links.borrow(), &[(0, 7)]);
-    assert_eq!(host.floats.borrow().active(), None);
+    runtime.run_mapping(0)?;
+    assert_eq!(&*host.opened_links.borrow(), &[(0, 1)]);
     Ok(())
 }
 

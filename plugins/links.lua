@@ -68,7 +68,7 @@ function M.open()
       lines[index] = link.label .. "  →  " .. link.target
     end
     if #lines == 0 then
-      lines[1] = #links == 0 and "開けるリンクがありません" or "一致するリンクがありません"
+      lines[1] = #links == 0 and "No links to open" or "No matching links"
     end
     return {
       header = (problem and problem .. "  |  " or "") .. "> " .. query,
@@ -78,7 +78,7 @@ function M.open()
   end
 
   local opts = display()
-  opts.title = "リンク"
+  opts.title = "Links"
   opts.on_key = function(float, key)
     if key.name == "Enter" then
       local link = candidates[selected]
@@ -87,13 +87,13 @@ function M.open()
         if ok then
           float:close()
         else
-          float:update(display(tostring(err or "リンクを開けませんでした")))
+          float:update(display(tostring(err or "Could not open link")))
         end
       end
       return
-    elseif key.name == "Up" then
+    elseif key.name == "Up" or key.name == "C-p" then
       selected = math.max(1, selected - 1)
-    elseif key.name == "Down" then
+    elseif key.name == "Down" or key.name == "C-n" then
       selected = math.max(1, math.min(#candidates, selected + 1))
     elseif key.name == "Backspace" then
       local last = utf8.offset(query, -1)
