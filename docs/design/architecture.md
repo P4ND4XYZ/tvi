@@ -7,6 +7,7 @@
 [機能仕様](../index.md)のMarkdown閲覧、3つの動作モード、移動・検索を実現するための構成です。
 単一crate内で責務を分け、状態遷移と検索処理を端末なしで確認できるようにします。
 UIにはratatui、端末制御にはcrossterm、Markdown描画にはtui-markdownを使用します。
+この閲覧基盤に、[Lua連携](lua-integration.md)として設定・キーマップ・フロートの仕組みを追加します。
 
 ## 構成と責務
 
@@ -30,10 +31,18 @@ UIにはratatui、端末制御にはcrossterm、Markdown描画にはtui-markdown
 
 以下の矢印は「依存元 → 依存先」であり、処理順序ではありません。
 
-```text
-main → app, ui, markdown::tui_markdown, terminal
-ui → app, markdown::MarkdownRenderer
-markdown::tui_markdown → markdown::MarkdownRenderer, tui-markdown
+```mermaid
+flowchart TD
+    main --> app
+    main --> ui
+    main --> tui_markdown["markdown::tui_markdown"]
+    main --> terminal
+
+    ui --> app
+    ui --> MarkdownRenderer["markdown::MarkdownRenderer"]
+
+    tui_markdown --> MarkdownRenderer
+    tui_markdown --> tui_markdown_lib["tui-markdown"]
 ```
 
 - `app`は`ui`、`markdown`、`terminal`に依存しません。

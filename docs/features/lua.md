@@ -1,0 +1,52 @@
+# Lua設定とプラグイン
+
+[目次に戻る](../index.md)
+
+利用者がLuaでプラグインを読み込み、キーを割り当てるための機能です。
+
+## 起動時の設定
+
+| OS | 設定ファイル |
+|---|---|
+| Windows | `%LOCALAPPDATA%\tvi\init.lua` |
+| Linux | `$XDG_CONFIG_HOME/tvi/init.lua`。未設定・空・相対パスの場合は `~/.config/tvi/init.lua` |
+
+起動時に該当する `init.lua` を読み込みます。`--config` は設けません。設定ファイルがなければ通常どおり起動し、エラーがあればファイル名と理由を通知して、既定の操作で閲覧を続けられるようにします。
+
+[plugins/links.lua](../../plugins/links.lua) を、`init.lua` と同じディレクトリの `plugins/links.lua` にコピーします。`require` は設定ディレクトリを基準に解決します。プラグインの読み込みだけではキーを登録しません。
+
+```lua
+local links = require("plugins.links")
+tvi.keymap.set("normal", "gl", links.open, { desc = "リンク一覧を開く" })
+```
+
+## 公開API
+
+| API | 動作 |
+|---|---|
+| `tvi.keymap.set(mode, keys, callback, opts)` | モード別にキーを登録する。`opts.desc` は操作の説明 |
+| `tvi.ui.current_view()` | フロートではなく現在の本文ビューを取得する |
+| `view:links()` | 表示文書の対象リンクを出現順に返す。各候補は `id`、`label`、`target` を持つ |
+| `view:open_link(id)` | そのビューでリンクを開き、成否と失敗理由を `ok, err` として返す |
+| `view:open_float(opts)` | ビューに紐づくフロートを開き、ハンドルを返す |
+| `float:update(opts)` / `float:close()` | そのフロートの表示を更新・終了する |
+
+キーマップの `mode` は `normal`・`command`・`search` です。
+既定操作と同じキーは登録できませんが、`gg` と `gl` のように先頭キーを共有することはできます。
+COMMANDとSEARCHでは文字入力・編集・確定・キャンセル用のキーを変更せず、未使用のショートカットを登録できます。
+
+取得したビューハンドルはフォーカスが移っても対象が変わりません。ビューが閉じている場合や、リンクIDの取得元と異なる文書を表示している場合は、リンクを開きません。
+
+### フロートの表示項目
+
+| 項目 | 内容 |
+|---|---|
+| `title` | 枠に表示するタイトル |
+| `header` | 本文をスクロールしても残る任意の1行 |
+| `lines` | 本文に表示する文字列の配列 |
+| `focus_line` | `lines` 内の1始まりの強調行。見える位置までスクロールし、`false` で強調を解除する |
+| `on_key(float, key)` | 作成時に指定する入力コールバック。`key.name` はキー名、`key.text` は入力文字 |
+
+`float:update` は指定された表示項目だけを更新し、`lines` を渡した場合は本文全体を置き換えます。位置とサイズは自動です。
+初版はフロート1枚までとし、表示中に2枚目を開く操作は拒否します。閉じたハンドルで別のフロートは操作できません。
+入力やエラー時の動作は[動作モードと入力](modes.md)を参照してください。
