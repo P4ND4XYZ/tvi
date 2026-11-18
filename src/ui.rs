@@ -1,0 +1,312 @@
+pub mod input;
+pub mod layout;
+
+use ratatui::{
+    Frame,
+    buffer::CellWidth,
+    layout::{Position, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Text},
+    widgets::{Clear, Paragraph, Wrap},
+};
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::{
+    app::{App, Direction, Mode},
+    markdown::{MarkdownRenderer, RenderedMarkdown},
+};
+use layout::Layout;
+
+pub fn prepare(renderer: &impl MarkdownRenderer, markdown: &str, width: u16) -> RenderedMarkdown {
+    renderer.render(markdown, width)
+}
+
+pub fn anchors(layout: &Layout<'_>) -> Vec<usize> {
+    layout.rows().iter().map(|row| row.anchor).collect()
+}
+
+pub fn body_area(area: Rect, mode: Mode) -> Rect {
+    let chrome = if mode == Mode::Normal { 1 } else { 2 };
+    Rect {
+        height: area.height.saturating_sub(chrome),
+        ..area
+    }
+}
+
+pub fn draw(frame: &mut Frame<'_>, app: &App, layout: &Layout<'_>) {
+    let area = frame.area();
+    if area.is_empty() {
+        return;
+    }
+    let body = body_area(area, app.mode());
+    let text = layout.text();
+    if !body.is_empty() && app.top_row() < text.lines.len() {
+        let lines = text
+            .lines
+            .iter()
+            .skip(app.top_row())
+            .take(usize::from(body.height))
+            .cloned();
+        frame.render_widget(
+            Paragraph::new(lines.collect::<Text<'_>>().style(text.style)),
+            body,
+        );
+        highlight(frame, app, body, layout);
+    }
+    if app.help_open() && !body.is_empty() {
+        frame.render_widget(Clear, body);
+        frame.render_widget(Paragraph::new(HELP).wrap(Wrap { trim: true }), body);
+    }
+    let status = Rect::new(area.x, body.bottom(), area.width, 1);
+    frame.render_widget(
+        Paragraph::new(status_line(app, layout.rows().len()))
+            .style(Style::new().add_modifier(Modifier::REVERSED)),
+        status,
+    );
+
+    if let Some(prefix) = prompt_prefix(app.mode()) {
+        let prompt_y = area.bottom().saturating_sub(1);
+        let prompt_area = Rect::new(area.x, prompt_y, area.width, 1);
+        let (suffix, width) = prompt_suffix(app.prompt(), area.width - 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![prefix.into(), suffix.into()])),
+            prompt_area,
+        );
+        if width < area.width - 1 {
+            frame.set_cursor_position(Position::new(area.x + 1 + width, prompt_y));
+        }
+    }
+}
+
+fn prompt_prefix(mode: Mode) -> Option<&'static str> {
+    match mode {
+        Mode::Normal => None,
+        Mode::Command => Some(":"),
+        Mode::Search(Direction::Forward) => Some("/"),
+        Mode::Search(Direction::Backward) => Some("?"),
+    }
+}
+
+fn prompt_suffix(prompt: &str, budget: u16) -> (&str, u16) {
+    let mut start = prompt.len();
+    let mut width = 0;
+    for (offset, grapheme) in prompt.grapheme_indices(true).rev() {
+        let next = grapheme.cell_width();
+        if next > budget - width {
+            break;
+        }
+        start = offset;
+        width += next;
+    }
+    (&prompt[start..], width)
+}
+
+fn status_line(app: &App, len: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mode = match app.mode() {
+        Mode::Normal => "NORMAL",
+        Mode::Command => "COMMAND",
+        Mode::Search(_) => "SEARCH",
+    };
+    let row = if len == 0 { 0 } else { app.top_row() + 1 };
+    let mut text = format!("{mode}  {row}/{len}");
+    if let Some((index, total)) = app.search_selection() {
+        let state = if app.highlights().0.is_empty() {
+            " off"
+        } else {
+            ""
+        };
+        let result = write!(text, "  [{index}/{total}{state}]");
+        debug_assert!(result.is_ok(), "formatting to String cannot fail");
+    } else if !app.search_query().is_empty() {
+        text.push_str("  [0/0]");
+    }
+    if let Some(notice) = app.notice() {
+        text.push_str("  ");
+        text.push_str(notice);
+    }
+    text.push_str("  ");
+    text.push_str(app.name());
+    text
+}
+
+fn highlight(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Layout<'_>) {
+    let (matches, current) = app.highlights();
+    let Some((first, last)) = matches.first().zip(matches.last()) else {
+        return;
+    };
+    if layout
+        .row_for_offset(last.end.saturating_sub(1))
+        .is_some_and(|row| row < app.top_row())
+        || layout
+            .row_for_offset(first.start)
+            .is_some_and(|row| row >= app.top_row() + usize::from(area.height))
+    {
+        return;
+    }
+    for (y, row) in (area.top()..area.bottom()).zip(layout.rows().iter().skip(app.top_row())) {
+        let Some(last) = row.cells.last() else {
+            continue;
+        };
+        let start = matches.partition_point(|hit| hit.end <= row.anchor);
+        for hit in matches[start..]
+            .iter()
+            .take_while(|hit| hit.start < last.bytes.end)
+            .filter(|&hit| Some(hit) != current)
+            .chain(current)
+        {
+            let style = if Some(hit) == current {
+                Style::new().bg(Color::Yellow).fg(Color::Black)
+            } else {
+                Style::new().bg(Color::Blue).fg(Color::White)
+            };
+            for cell in row.cells_for(hit.clone()) {
+                let (Ok(left), Ok(right)) = (
+                    u16::try_from(cell.columns.start),
+                    u16::try_from(cell.columns.end),
+                ) else {
+                    continue;
+                };
+                frame
+                    .buffer_mut()
+                    .set_style(Rect::new(area.x + left, y, right - left, 1), style);
+            }
+        }
+    }
+}
+
+const HELP: &str = "Help (Esc to close)\n\
+    j/↓ k/↑  Line down/up\n\
+    Ctrl-d/u  Half page   Ctrl-f/b Page   PgDn/PgUp Page\n\
+    gg/G  Start/end   : Command   / ? Search forward/backward\n\
+    n/N  Next/reverse match   :noh / :nohlsearch Hide highlights\n\
+    Backspace Edit   Enter Confirm   Esc Cancel\n\
+    F1 / :help Help   q / :q / :quit Quit";
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::*;
+    use crate::markdown::tui_markdown::TuiMarkdown;
+    use input::Input;
+
+    fn paint(
+        terminal: &mut Terminal<TestBackend>,
+        app: &mut App,
+        doc: &RenderedMarkdown,
+    ) -> Result<(), Infallible> {
+        terminal.draw(|frame| {
+            let layout = Layout::at_width(doc, frame.area().width);
+            app.reflow(
+                &anchors(&layout),
+                usize::from(body_area(frame.area(), app.mode()).height),
+            );
+            draw(frame, app, &layout);
+        })?;
+        Ok(())
+    }
+
+    fn press(
+        input: &mut Input,
+        app: &mut App,
+        doc: &RenderedMarkdown,
+        width: u16,
+        keys: impl IntoIterator<Item = KeyCode>,
+    ) {
+        let locations = anchors(&Layout::at_width(doc, width));
+        for code in keys {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            if let Some(action) = input.action(key, app.mode(), app.help_open()) {
+                app.apply(action, &locations, doc.search_text());
+            }
+        }
+    }
+
+    #[test]
+    fn search_spans_wrapped_rows_near_end_and_resize_preserves_selection() -> Result<(), Infallible>
+    {
+        use KeyCode::{Char, Enter, Esc};
+
+        let mut app = App::new("test.md".into(), "first\n\nabcdefgMATCH tail".into());
+        let doc = prepare(&TuiMarkdown, app.markdown(), 8);
+        let mut terminal = Terminal::new(TestBackend::new(8, 5))?;
+        let mut input = Input::default();
+        paint(&mut terminal, &mut app, &doc)?;
+        press(
+            &mut input,
+            &mut app,
+            &doc,
+            8,
+            "/MATCH".chars().map(Char).chain([Enter]),
+        );
+        paint(&mut terminal, &mut app, &doc)?;
+        assert_eq!(app.top_row(), 1);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            (buffer[(7, 1)].symbol(), buffer[(7, 1)].bg),
+            ("M", Color::Yellow)
+        );
+        assert_eq!(
+            (buffer[(0, 2)].symbol(), buffer[(0, 2)].bg),
+            ("A", Color::Yellow)
+        );
+
+        terminal.backend_mut().resize(32, 5);
+        paint(&mut terminal, &mut app, &doc)?;
+        assert_eq!(app.top_row(), 0);
+        assert_eq!(app.search_selection(), Some((1, 1)));
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            (buffer[(8, 2)].symbol(), buffer[(8, 2)].bg),
+            ("A", Color::Yellow)
+        );
+        let status: String = (0..32).map(|x| buffer[(x, 4)].symbol()).collect();
+        assert!(
+            status.contains("NORMAL") && status.contains("[1/1]") && status.contains("test.md")
+        );
+
+        press(
+            &mut input,
+            &mut app,
+            &doc,
+            32,
+            ":noh".chars().map(Char).chain([Enter]),
+        );
+        paint(&mut terminal, &mut app, &doc)?;
+        assert_eq!(terminal.backend().buffer()[(8, 2)].bg, Color::Reset);
+        press(&mut input, &mut app, &doc, 32, [Char('?'), Char('q'), Esc]);
+        paint(&mut terminal, &mut app, &doc)?;
+        assert_eq!(terminal.backend().buffer()[(8, 2)].bg, Color::Reset);
+        assert_eq!(app.search_selection(), Some((1, 1)));
+        press(&mut input, &mut app, &doc, 32, [Char('n')]);
+
+        terminal.backend_mut().resize(8, 5);
+        paint(&mut terminal, &mut app, &doc)?;
+        assert_eq!(app.top_row(), 1);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(7, 1)].bg, Color::Yellow);
+        assert_eq!(buffer[(0, 2)].bg, Color::Yellow);
+        Ok(())
+    }
+
+    #[test]
+    fn help_is_an_overlay_closed_by_escape() -> Result<(), Infallible> {
+        let mut app = App::new("test.md".into(), "body".into());
+        let doc = prepare(&TuiMarkdown, app.markdown(), 42);
+        let mut terminal = Terminal::new(TestBackend::new(42, 10))?;
+        let mut input = Input::default();
+        press(&mut input, &mut app, &doc, 42, [KeyCode::F(1)]);
+        paint(&mut terminal, &mut app, &doc)?;
+        assert_eq!(app.mode(), Mode::Normal);
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "H");
+        press(&mut input, &mut app, &doc, 42, [KeyCode::Esc]);
+        paint(&mut terminal, &mut app, &doc)?;
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "b");
+        Ok(())
+    }
+}
