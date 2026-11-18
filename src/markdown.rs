@@ -6,6 +6,13 @@ pub mod tui_markdown;
 
 pub trait MarkdownRenderer {
     fn render(&self, markdown: &str, width: u16) -> RenderedMarkdown;
+    fn links(&self, markdown: &str) -> Vec<MarkdownLink>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MarkdownLink {
+    pub label: String,
+    pub target: String,
 }
 
 /// 幅に依存しない論理行と、検索テキスト上のUTF-8バイト範囲。

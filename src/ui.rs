@@ -1,3 +1,4 @@
+pub mod float;
 pub mod input;
 pub mod layout;
 
@@ -33,7 +34,7 @@ pub fn body_area(area: Rect, mode: Mode) -> Rect {
     }
 }
 
-pub fn draw(frame: &mut Frame<'_>, app: &App, layout: &Layout<'_>) {
+pub fn draw(frame: &mut Frame<'_>, app: &App, layout: &Layout<'_>, float_active: bool) {
     let area = frame.area();
     if area.is_empty() {
         return;
@@ -72,7 +73,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, layout: &Layout<'_>) {
             Paragraph::new(Line::from(vec![prefix.into(), suffix.into()])),
             prompt_area,
         );
-        if width < area.width - 1 {
+        if !float_active && width < area.width - 1 {
             frame.set_cursor_position(Position::new(area.x + 1 + width, prompt_y));
         }
     }
@@ -181,6 +182,7 @@ const HELP: &str = "Help (Esc to close)\n\
     Ctrl-d/u  Half page   Ctrl-f/b Page   PgDn/PgUp Page\n\
     gg/G  Start/end   : Command   / ? Search forward/backward\n\
     n/N  Next/reverse match   :noh / :nohlsearch Hide highlights\n\
+    Ctrl-o  Return from a link jump\n\
     Backspace Edit   Enter Confirm   Esc Cancel\n\
     F1 / :help Help   q / :q / :quit Quit";
 
@@ -206,7 +208,7 @@ mod tests {
                 &anchors(&layout),
                 usize::from(body_area(frame.area(), app.mode()).height),
             );
-            draw(frame, app, &layout);
+            draw(frame, app, &layout, false);
         })?;
         Ok(())
     }

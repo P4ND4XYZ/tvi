@@ -71,7 +71,7 @@ function M.open()
       lines[1] = #links == 0 and "開けるリンクがありません" or "一致するリンクがありません"
     end
     return {
-      header = "> " .. query .. (problem and "  |  " .. problem or ""),
+      header = (problem and problem .. "  |  " or "") .. "> " .. query,
       lines = lines,
       focus_line = #candidates > 0 and selected or false,
     }

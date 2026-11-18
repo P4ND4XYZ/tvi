@@ -1,0 +1,392 @@
+use std::{
+    cell::{Ref, RefCell},
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    rc::{Rc, Weak},
+};
+
+use mlua::{Error, Function, Lua, RegistryKey, Table, UserData, UserDataMethods, Value};
+
+use crate::ui::{
+    float::FloatOptions,
+    input::{Keymap, KeymapMode, PluginKey},
+};
+
+mod config;
+#[cfg(test)]
+mod tests;
+
+pub struct LuaLink {
+    pub id: u64,
+    pub label: String,
+    pub target: String,
+}
+
+pub trait Host {
+    fn current_view(&self) -> Result<u64, String>;
+    fn links(&self, view: u64) -> Result<Vec<LuaLink>, String>;
+    fn open_link(&self, view: u64, id: u64) -> Result<(), String>;
+    fn open_float(&self, view: u64, options: FloatOptions) -> Result<u64, String>;
+    fn update_float(&self, view: u64, float: u64, options: FloatOptions) -> Result<(), String>;
+    fn close_float(&self, view: u64, float: u64) -> Result<(), String>;
+}
+
+pub struct Runtime {
+    // Lua の終了時に実行されるファイナライザからホストを呼べないようにする。
+    state: Rc<State>,
+    lua: Lua,
+}
+
+struct State {
+    host: Rc<dyn Host>,
+    keymap: RefCell<Keymap>,
+    mappings: RefCell<Vec<RegistryKey>>,
+    float: RefCell<Option<ActiveFloat>>,
+}
+
+struct ActiveFloat {
+    view: u64,
+    id: u64,
+    callback: Option<RegistryKey>,
+}
+
+impl Runtime {
+    pub fn load(host: Rc<dyn Host>) -> (Self, Option<String>) {
+        Self::load_from(host, config::init_path())
+    }
+
+    fn new(host: Rc<dyn Host>) -> Self {
+        Self {
+            state: Rc::new(State {
+                host,
+                keymap: RefCell::default(),
+                mappings: RefCell::default(),
+                float: RefCell::default(),
+            }),
+            lua: Lua::new(),
+        }
+    }
+
+    pub(crate) fn load_from(host: Rc<dyn Host>, path: Option<PathBuf>) -> (Self, Option<String>) {
+        let Some(path) = path else {
+            return (Self::new(host), None);
+        };
+        let filename = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        let source = match config::read_source(&path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == ErrorKind::NotFound => return (Self::new(host), None),
+            Err(error) => return (Self::new(host), Some(format!("{filename}: {error}"))),
+        };
+        let runtime = Self::new(Rc::clone(&host));
+        match runtime.configure(&path, &source) {
+            Ok(()) => (runtime, None),
+            Err(error) => {
+                let mut message = lua_diagnostic(&error, Some(&filename));
+                let active = runtime.state.float.borrow_mut().take();
+                if let Some(active) = active
+                    && let Err(error) = host.close_float(active.view, active.id)
+                {
+                    message.push_str("\ncannot close configuration float: ");
+                    message.push_str(&error);
+                }
+                (Self::new(host), Some(message))
+            }
+        }
+    }
+
+    fn configure(&self, path: &Path, source: &[u8]) -> mlua::Result<()> {
+        config::install_searcher(&self.lua, path)?;
+        self.install_api()?;
+        let filename = path.file_name().map_or(path, Path::new);
+        config::source_chunk(&self.lua, filename, source).exec()
+    }
+
+    fn install_api(&self) -> mlua::Result<()> {
+        // os.exit は Rust 側の端末復元を通らずにプロセスを終了する。
+        let os: Table = self.lua.globals().get("os")?;
+        os.set(
+            "exit",
+            self.lua.create_function(|_, ()| {
+                Err::<(), _>(Error::runtime(
+                    "os.exit is unavailable while tvi is running",
+                ))
+            })?,
+        )?;
+
+        let tvi = self.lua.create_table()?;
+        let keymap = self.lua.create_table()?;
+        let state = Rc::downgrade(&self.state);
+        keymap.set(
+            "set",
+            self.lua.create_function(
+                move |lua, (mode, keys, callback, opts): (String, String, Function, Option<Table>)| {
+                    let mode = match mode.as_str() {
+                        "normal" => KeymapMode::Normal,
+                        "command" => KeymapMode::Command,
+                        "search" => KeymapMode::Search,
+                        _ => return Err(Error::runtime(format!("unknown keymap mode: {mode}"))),
+                    };
+                    let desc = match opts {
+                        Some(opts) => opts.get("desc")?,
+                        None => None,
+                    };
+                    let state = live_state(&state)?;
+                    let mut keymap = state.keymap.try_borrow_mut().map_err(Error::external)?;
+                    let mut mappings = state.mappings.borrow_mut();
+                    let id = u64::try_from(mappings.len()).map_err(Error::external)?;
+                    let callback = lua.create_registry_value(callback)?;
+                    keymap.register(mode, &keys, id, desc).map_err(Error::runtime)?;
+                    mappings.push(callback);
+                    Ok(())
+                },
+            )?,
+        )?;
+        tvi.set("keymap", keymap)?;
+
+        let ui = self.lua.create_table()?;
+        let state = Rc::downgrade(&self.state);
+        ui.set(
+            "current_view",
+            self.lua.create_function(move |_, ()| {
+                let id = live_state(&state)?
+                    .host
+                    .current_view()
+                    .map_err(Error::runtime)?;
+                Ok(ViewHandle {
+                    id,
+                    state: state.clone(),
+                })
+            })?,
+        )?;
+        tvi.set("ui", ui)?;
+        self.lua.globals().set("tvi", tvi)
+    }
+
+    pub fn keymap(&self) -> Ref<'_, Keymap> {
+        self.state.keymap.borrow()
+    }
+
+    pub fn run_mapping(&self, id: u64) -> Result<(), String> {
+        self.call_mapping(id)
+            .map_err(|error| lua_diagnostic(&error, None))
+    }
+
+    fn call_mapping(&self, id: u64) -> mlua::Result<()> {
+        let callback = {
+            let mappings = self.state.mappings.borrow();
+            let callback = usize::try_from(id)
+                .ok()
+                .and_then(|index| mappings.get(index))
+                .ok_or_else(|| Error::runtime("key mapping has expired"))?;
+            self.lua.registry_value::<Function>(callback)?
+        };
+        callback.call(())
+    }
+
+    pub fn run_float_key(&self, view: u64, float: u64, key: PluginKey) -> Result<(), String> {
+        self.call_float_key(view, float, key)
+            .map_err(|error| lua_diagnostic(&error, None))
+    }
+
+    fn call_float_key(&self, view: u64, id: u64, key: PluginKey) -> mlua::Result<()> {
+        let callback = {
+            let active = self.state.float.borrow();
+            let active = active
+                .as_ref()
+                .filter(|active| active.view == view && active.id == id);
+            let Some(callback) = active.and_then(|active| active.callback.as_ref()) else {
+                return Ok(());
+            };
+            self.lua.registry_value::<Function>(callback)?
+        };
+        let key_table = self.lua.create_table()?;
+        key_table.set("name", key.name)?;
+        key_table.set("text", key.text.map(|text| text.to_string()))?;
+        callback.call((
+            FloatHandle {
+                view,
+                id,
+                state: Rc::downgrade(&self.state),
+            },
+            key_table,
+        ))
+    }
+
+    pub fn forget_float(&self, float: u64) {
+        self.state.forget_float(float);
+        self.lua.expire_registry_values();
+    }
+}
+
+fn lua_diagnostic(error: &Error, config_name: Option<&str>) -> String {
+    let message = error.to_string();
+    let (summary, traceback) = message.split_once('\n').unwrap_or((&message, ""));
+    let summary = summary
+        .strip_prefix("runtime error: ")
+        .or_else(|| summary.strip_prefix("syntax error: "))
+        .unwrap_or(summary);
+    let summary = if let Some((source, tail)) = summary.split_once(':')
+        && Path::new(source)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("lua"))
+        && let Some((line, reason)) = tail.split_once(": ")
+        && line.parse::<usize>().is_ok()
+    {
+        if config_name == Some(source) {
+            format!("{reason} (line {line})")
+        } else {
+            format!("{reason} ({source}:{line})")
+        }
+    } else {
+        summary.to_owned()
+    };
+    let mut diagnostic = match config_name {
+        Some(name) => format!("{name}: {summary}"),
+        None => summary,
+    };
+    if !traceback.is_empty() {
+        diagnostic.push('\n');
+        diagnostic.push_str(traceback);
+    }
+    diagnostic
+}
+
+fn live_state(state: &Weak<State>) -> mlua::Result<Rc<State>> {
+    state
+        .upgrade()
+        .ok_or_else(|| Error::runtime("Lua runtime has expired"))
+}
+
+impl State {
+    fn check_float(&self, view: u64, id: u64) -> mlua::Result<()> {
+        if self
+            .float
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.view == view && active.id == id)
+        {
+            Ok(())
+        } else {
+            Err(Error::runtime("float is closed"))
+        }
+    }
+
+    fn forget_float(&self, id: u64) {
+        let mut float = self.float.borrow_mut();
+        if float.as_ref().is_some_and(|active| active.id == id) {
+            *float = None;
+        }
+    }
+}
+
+struct ViewHandle {
+    id: u64,
+    state: Weak<State>,
+}
+
+impl UserData for ViewHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("links", |lua, view, ()| {
+            let links = live_state(&view.state)?
+                .host
+                .links(view.id)
+                .map_err(Error::runtime)?;
+            let list = lua.create_table_with_capacity(links.len(), 0)?;
+            for (index, link) in links.into_iter().enumerate() {
+                let candidate = lua.create_table()?;
+                candidate.set("id", link.id)?;
+                candidate.set("label", link.label)?;
+                candidate.set("target", link.target)?;
+                list.raw_set(index + 1, candidate)?;
+            }
+            Ok(list)
+        });
+        methods.add_method("open_link", |_, view, id: u64| {
+            let result = live_state(&view.state)?.host.open_link(view.id, id);
+            Ok(match result {
+                Ok(()) => (true, None),
+                Err(error) => (false, Some(error)),
+            })
+        });
+        methods.add_method("open_float", |lua, view, opts: Table| {
+            let state = live_state(&view.state)?;
+            let options = display_options(&opts)?;
+            let callback = opts
+                .get::<Option<Function>>("on_key")?
+                .map(|callback| lua.create_registry_value(callback))
+                .transpose()?;
+            if state.float.borrow().is_some() {
+                return Err(Error::runtime("a float is already open"));
+            }
+            let id = state
+                .host
+                .open_float(view.id, options)
+                .map_err(Error::runtime)?;
+            *state.float.borrow_mut() = Some(ActiveFloat {
+                view: view.id,
+                id,
+                callback,
+            });
+            Ok(FloatHandle {
+                view: view.id,
+                id,
+                state: view.state.clone(),
+            })
+        });
+    }
+}
+
+struct FloatHandle {
+    view: u64,
+    id: u64,
+    state: Weak<State>,
+}
+
+impl UserData for FloatHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("update", |_, float, opts: Table| {
+            let state = live_state(&float.state)?;
+            let options = display_options(&opts)?;
+            state.check_float(float.view, float.id)?;
+            state
+                .host
+                .update_float(float.view, float.id, options)
+                .map_err(Error::runtime)
+        });
+        methods.add_method("close", |lua, float, ()| {
+            let state = live_state(&float.state)?;
+            state.check_float(float.view, float.id)?;
+            state
+                .host
+                .close_float(float.view, float.id)
+                .map_err(Error::runtime)?;
+            state.forget_float(float.id);
+            lua.expire_registry_values();
+            Ok(())
+        });
+    }
+}
+
+fn display_options(options: &Table) -> mlua::Result<FloatOptions> {
+    let focus_line = match options.get("focus_line")? {
+        Value::Nil => None,
+        Value::Boolean(false) => Some(None),
+        Value::Integer(line) if line > 0 => {
+            Some(Some(usize::try_from(line).map_err(Error::external)?))
+        }
+        _ => {
+            return Err(Error::runtime(
+                "focus_line must be a positive integer or false",
+            ));
+        }
+    };
+    Ok(FloatOptions {
+        title: options.get("title")?,
+        header: options.get("header")?,
+        lines: options.get("lines")?,
+        focus_line,
+    })
+}

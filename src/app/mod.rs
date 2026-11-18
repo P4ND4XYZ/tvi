@@ -2,10 +2,10 @@ mod command;
 mod document;
 mod search;
 
-use std::ops::Range;
+use std::{ops::Range, path::PathBuf};
 
 use command::Command;
-use document::Document;
+pub use document::{Document, DocumentLink};
 pub use search::Direction;
 use search::Search;
 
@@ -38,12 +38,14 @@ pub enum Action {
     Cancel,
     Submit,
     RepeatSearch { reverse: bool },
+    JumpBack,
     Help,
     Quit,
 }
 
 pub struct App {
     document: Document,
+    history: Vec<HistoryEntry>,
     mode: Mode,
     prompt: String,
     notice: Option<String>,
@@ -51,6 +53,12 @@ pub struct App {
     viewport: Viewport,
     help: bool,
     quit: bool,
+}
+
+struct HistoryEntry {
+    document: Document,
+    search: Search,
+    anchor: usize,
 }
 
 #[derive(Default)]
@@ -109,9 +117,16 @@ impl Viewport {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(name: String, markdown: String) -> Self {
+        let path = PathBuf::from(&name);
+        Self::from_document(Document::new(name, markdown, path, Vec::new()))
+    }
+
+    pub fn from_document(document: Document) -> Self {
         Self {
-            document: Document { name, markdown },
+            document,
+            history: Vec::new(),
             mode: Mode::Normal,
             prompt: String::new(),
             notice: None,
@@ -130,6 +145,49 @@ impl App {
         &self.document.markdown
     }
 
+    pub fn document_id(&self) -> u64 {
+        self.document.id
+    }
+
+    pub fn links(&self) -> &[DocumentLink] {
+        &self.document.links
+    }
+
+    pub fn resolve_link(&self, id: u64) -> Result<PathBuf, String> {
+        self.document.resolve_link(id)
+    }
+
+    pub fn open_document(&mut self, document: Document) {
+        self.history.push(HistoryEntry {
+            document: std::mem::replace(&mut self.document, document),
+            search: std::mem::take(&mut self.search),
+            anchor: self.viewport.anchor,
+        });
+        self.viewport = Viewport::default();
+        self.mode = Mode::Normal;
+        self.prompt.clear();
+        self.notice = None;
+    }
+
+    pub fn reset_to_initial_document(&mut self) {
+        let initial = self.history.drain(..).next();
+        if let Some(entry) = initial {
+            *self = Self::from_document(entry.document);
+        }
+    }
+
+    fn jump_back(&mut self) {
+        if let Some(entry) = self.history.pop() {
+            self.document = entry.document;
+            self.search = entry.search;
+            self.viewport = Viewport {
+                anchor: entry.anchor,
+                ..Viewport::default()
+            };
+            self.notice = None;
+        }
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -140,6 +198,10 @@ impl App {
 
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    pub fn set_notice(&mut self, message: String) {
+        self.notice = Some(message);
     }
 
     pub fn help_open(&self) -> bool {
@@ -191,6 +253,7 @@ impl App {
                 self.search.step(reverse);
                 self.reveal_search(anchors);
             }
+            (Mode::Normal, Action::JumpBack) => self.jump_back(),
             (Mode::Normal, Action::Help) => self.help = true,
             (Mode::Normal, Action::Quit) => self.quit = true,
             (Mode::Command | Mode::Search(_), Action::Insert(ch)) if !ch.is_control() => {
@@ -326,5 +389,110 @@ mod tests {
         apply(Action::Insert('猫'));
         apply(Action::Backspace);
         assert_eq!(apply(Action::Submit), (Mode::Normal, true, false));
+    }
+
+    #[test]
+    fn link_ids_are_document_bound_and_paths_resolve_relatively() -> Result<(), String> {
+        let make_document = || {
+            Document::new(
+                "index.md".into(),
+                String::new(),
+                PathBuf::from("docs/index.md"),
+                vec![("Read me".into(), "../README.md".into())],
+            )
+        };
+        let mut app = App::from_document(make_document());
+        let original = app.document_id();
+        let id = app.links()[0].id;
+        assert_eq!(app.links()[0].label, "Read me");
+        assert_eq!(app.resolve_link(id)?, PathBuf::from("docs/../README.md"));
+
+        app.open_document(make_document());
+        let second = app.document_id();
+        let second_link = app.links()[0].id;
+        assert_ne!(second, original);
+        assert!(app.resolve_link(id).is_err());
+
+        app.open_document(make_document());
+        assert!(app.resolve_link(second_link).is_err());
+        app.apply(Action::JumpBack, &[], "");
+        assert_eq!(app.document_id(), second);
+        assert_eq!(app.links()[0].id, second_link);
+        app.apply(Action::JumpBack, &[], "");
+        assert_eq!(app.document_id(), original);
+        assert_eq!(app.links()[0].id, id);
+        assert!(app.resolve_link(second_link).is_err());
+        app.apply(Action::JumpBack, &[], "");
+        assert_eq!(app.document_id(), original);
+        Ok(())
+    }
+
+    #[test]
+    fn resetting_startup_discards_document_jumps() {
+        let mut app = App::new("initial.md".into(), String::new());
+        let original = app.document_id();
+        for path in ["first.md", "second.md"] {
+            app.open_document(Document::new(
+                path.into(),
+                String::new(),
+                PathBuf::from(path),
+                vec![],
+            ));
+        }
+        app.reset_to_initial_document();
+        assert_eq!(app.document_id(), original);
+        app.apply(Action::JumpBack, &[], "");
+        assert_eq!(app.document_id(), original);
+    }
+
+    #[test]
+    fn jump_back_restores_the_logical_position_and_hidden_search() {
+        let text = "hit\none\nhit\ntwo\nhit\nend";
+        let anchors = [0, 4, 8, 12, 16, 20];
+        let mut app = App::new("test.md".into(), text.into());
+        app.reflow(&anchors, 1);
+        for action in [
+            Action::Move(Motion::End),
+            Action::StartSearch(Direction::Backward),
+            Action::Insert('h'),
+            Action::Insert('i'),
+            Action::Insert('t'),
+            Action::Submit,
+            Action::StartCommand,
+            Action::Insert('n'),
+            Action::Insert('o'),
+            Action::Insert('h'),
+            Action::Submit,
+            Action::Move(Motion::LineUp),
+        ] {
+            app.apply(action, &anchors, text);
+        }
+        assert_eq!(app.top_row(), 3);
+        assert_eq!(app.search_selection(), Some((3, 3)));
+        assert_eq!(app.highlights(), (&[][..], None));
+
+        app.open_document(Document::new(
+            "next.md".into(),
+            "next".into(),
+            PathBuf::from("next.md"),
+            vec![],
+        ));
+        app.reflow(&[0], 1);
+        assert_eq!(app.top_row(), 0);
+        assert_eq!(app.search_query(), "");
+        assert_eq!(app.search_selection(), None);
+
+        app.apply(Action::JumpBack, &[0], "next");
+        app.reflow(&[0, 8, 16, 20], 2);
+        assert_eq!(app.top_row(), 1);
+        app.reflow(&anchors, 1);
+        assert_eq!(app.top_row(), 3);
+        assert_eq!(app.search_query(), "hit");
+        assert_eq!(app.search_selection(), Some((3, 3)));
+        assert_eq!(app.highlights(), (&[][..], None));
+        app.apply(Action::RepeatSearch { reverse: false }, &anchors, text);
+        assert_eq!(app.top_row(), 2);
+        assert_eq!(app.search_selection(), Some((2, 3)));
+        assert_eq!(app.highlights().1, Some(&(8..11)));
     }
 }
