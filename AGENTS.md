@@ -25,3 +25,7 @@
 
 - 文書を追加・変更するときは、`docs/index.md`と関連する文書の説明・リンクも整合させます。
 - 文書の変更後は、相対リンクの参照先とMarkdownの基本書式を確認します。
+
+## Luaプラグインのテスト
+
+- Luaプラグインを追加するときは、`plugins/tests/` にテストを追加し、`plugins/tests/testrunner.lua` に登録します。
