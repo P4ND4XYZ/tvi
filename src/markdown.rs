@@ -2,7 +2,10 @@ use std::ops::Range;
 
 use ratatui::text::Text;
 
+mod table;
 pub mod tui_markdown;
+
+pub(crate) use table::{Table, TableLine};
 
 pub trait MarkdownRenderer {
     #[cfg(test)]
@@ -54,6 +57,7 @@ pub struct RenderedMarkdown {
     search_text: String,
     line_ranges: Vec<Range<usize>>,
     pub images: Vec<ImageLine>,
+    pub(crate) tables: Vec<Table>,
     width: u16,
 }
 
@@ -78,6 +82,7 @@ impl RenderedMarkdown {
             search_text,
             line_ranges,
             images: Vec::new(),
+            tables: Vec::new(),
             width,
         }
     }

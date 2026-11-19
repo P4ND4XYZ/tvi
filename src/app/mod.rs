@@ -82,6 +82,54 @@ impl ViewAnchor {
     }
 }
 
+/// 表示行と、幅に依存しない文書内位置の対応。
+pub trait ViewRows {
+    fn len(&self) -> usize;
+    fn anchor_at(&self, row: usize) -> Option<ViewAnchor>;
+
+    fn row_at(&self, position: ViewAnchor) -> usize;
+
+    fn row_at_ordered(&self, position: ViewAnchor) -> usize {
+        let (mut start, mut end) = (0, self.len());
+        while start < end {
+            let mid = usize::midpoint(start, end);
+            if self.anchor_at(mid).is_some_and(|anchor| anchor <= position) {
+                start = mid + 1;
+            } else {
+                end = mid;
+            }
+        }
+        // 画像の表示方式が変わっても、同じ論理行の先頭を優先する。
+        if self
+            .anchor_at(start)
+            .is_some_and(|anchor| anchor.byte == position.byte)
+            && start
+                .checked_sub(1)
+                .and_then(|row| self.anchor_at(row))
+                .is_none_or(|anchor| anchor.byte != position.byte)
+        {
+            start
+        } else {
+            start.saturating_sub(1)
+        }
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> ViewRows for [ViewAnchor; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn anchor_at(&self, row: usize) -> Option<ViewAnchor> {
+        self.get(row).copied()
+    }
+
+    fn row_at(&self, position: ViewAnchor) -> usize {
+        self.row_at_ordered(position)
+    }
+}
+
 #[derive(Default)]
 struct Viewport {
     top: usize,
@@ -90,40 +138,24 @@ struct Viewport {
 }
 
 impl Viewport {
-    fn last_top(&self, anchors: &[ViewAnchor]) -> usize {
-        anchors.len().saturating_sub(self.height.max(1))
+    fn last_top(&self, rows: &impl ViewRows) -> usize {
+        rows.len().saturating_sub(self.height.max(1))
     }
 
-    fn row_at(anchors: &[ViewAnchor], position: ViewAnchor) -> usize {
-        let next = anchors.partition_point(|&anchor| anchor <= position);
-        // 復帰時にファイルが欠損していても、直前の段落ではなく元の画像の代替表示へ戻る。
-        if anchors
-            .get(next)
-            .is_some_and(|anchor| anchor.byte == position.byte)
-            && next
-                .checked_sub(1)
-                .is_none_or(|last| anchors[last].byte != position.byte)
-        {
-            next
-        } else {
-            next.saturating_sub(1)
-        }
-    }
-
-    fn reflow(&mut self, anchors: &[ViewAnchor], height: usize) {
+    fn reflow(&mut self, rows: &impl ViewRows, height: usize) {
         self.height = height;
-        self.top = Self::row_at(anchors, self.anchor).min(self.last_top(anchors));
+        self.top = rows.row_at(self.anchor).min(self.last_top(rows));
     }
 
-    fn show(&mut self, row: usize, anchors: &[ViewAnchor]) {
-        self.top = row.min(self.last_top(anchors));
-        if let Some(&anchor) = anchors.get(self.top) {
+    fn show(&mut self, row: usize, rows: &impl ViewRows) {
+        self.top = row.min(self.last_top(rows));
+        if let Some(anchor) = rows.anchor_at(self.top) {
             self.anchor = anchor;
         }
     }
 
-    fn navigate(&mut self, motion: Motion, anchors: &[ViewAnchor]) {
-        if self.height == 0 || anchors.is_empty() {
+    fn navigate(&mut self, motion: Motion, rows: &impl ViewRows) {
+        if self.height == 0 || rows.len() == 0 {
             return;
         }
         let half = (self.height / 2).max(1);
@@ -135,15 +167,15 @@ impl Viewport {
             Motion::PageDown => self.top.saturating_add(self.height),
             Motion::PageUp => self.top.saturating_sub(self.height),
             Motion::Start => 0,
-            Motion::End => self.last_top(anchors),
+            Motion::End => self.last_top(rows),
         };
-        self.show(next, anchors);
+        self.show(next, rows);
     }
 
-    fn search_target(&mut self, offset: usize, anchors: &[ViewAnchor]) {
+    fn search_target(&mut self, offset: usize, rows: &impl ViewRows) {
         // 実表示が末尾でクランプしても、リサイズでは一致の開始位置を維持する。
         self.anchor = ViewAnchor::text(offset);
-        self.reflow(anchors, self.height);
+        self.reflow(rows, self.height);
     }
 }
 
@@ -271,11 +303,11 @@ impl App {
         }
     }
 
-    pub fn reflow(&mut self, anchors: &[ViewAnchor], height: usize) {
-        self.viewport.reflow(anchors, height);
+    pub fn reflow(&mut self, rows: &impl ViewRows, height: usize) {
+        self.viewport.reflow(rows, height);
     }
 
-    pub fn apply(&mut self, action: Action, anchors: &[ViewAnchor], text: &str) {
+    pub fn apply(&mut self, action: Action, rows: &impl ViewRows, text: &str) {
         if self.help {
             if action == Action::Cancel {
                 self.help = false;
@@ -283,14 +315,14 @@ impl App {
             return;
         }
         match (self.mode, action) {
-            (Mode::Normal, Action::Move(motion)) => self.viewport.navigate(motion, anchors),
+            (Mode::Normal, Action::Move(motion)) => self.viewport.navigate(motion, rows),
             (Mode::Normal, Action::StartCommand) => self.start_input(Mode::Command),
             (Mode::Normal, Action::StartSearch(direction)) => {
                 self.start_input(Mode::Search(direction));
             }
             (Mode::Normal, Action::RepeatSearch { reverse }) => {
                 self.search.step(reverse);
-                self.reveal_search(anchors);
+                self.reveal_search(rows);
             }
             (Mode::Normal, Action::JumpBack) => self.jump_back(),
             (Mode::Normal, Action::Help) => self.help = true,
@@ -311,13 +343,12 @@ impl App {
             (Mode::Search(direction), Action::Submit) => {
                 let query = std::mem::take(&mut self.prompt);
                 self.mode = Mode::Normal;
-                let offset = anchors
-                    .get(self.viewport.top)
-                    .copied()
+                let offset = rows
+                    .anchor_at(self.viewport.top)
                     .unwrap_or(self.viewport.anchor)
                     .byte;
                 self.search.submit(query, direction, text, offset);
-                self.reveal_search(anchors);
+                self.reveal_search(rows);
             }
             _ => {}
         }
@@ -329,9 +360,9 @@ impl App {
         self.notice = None;
     }
 
-    fn reveal_search(&mut self, anchors: &[ViewAnchor]) {
+    fn reveal_search(&mut self, rows: &impl ViewRows) {
         self.notice = if let Some(hit) = self.search.current() {
-            self.viewport.search_target(hit.start, anchors);
+            self.viewport.search_target(hit.start, rows);
             None
         } else if self.search.query().is_empty() {
             Some("No previous search".into())

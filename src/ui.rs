@@ -13,7 +13,7 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::app::{App, Direction, Mode, ViewAnchor};
+use crate::app::{App, Direction, Mode};
 use layout::Layout;
 
 #[cfg(test)]
@@ -22,10 +22,6 @@ use crate::markdown::{MarkdownRenderer, RenderedMarkdown};
 #[cfg(test)]
 fn prepare(renderer: &impl MarkdownRenderer, markdown: &str, width: u16) -> RenderedMarkdown {
     renderer.render(markdown, width)
-}
-
-pub fn anchors(layout: &Layout<'_>) -> Vec<ViewAnchor> {
-    layout.rows().iter().map(|row| row.anchor).collect()
 }
 
 pub fn body_area(area: Rect, mode: Mode) -> Rect {
@@ -139,23 +135,14 @@ fn status_line(app: &App, len: usize) -> String {
 
 fn highlight(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Layout<'_>) {
     let (matches, current) = app.highlights();
-    let Some((first, last)) = matches.first().zip(matches.last()) else {
-        return;
-    };
-    if layout
-        .row_for_offset(last.end.saturating_sub(1))
-        .is_some_and(|row| row < app.top_row())
-        || layout
-            .row_for_offset(first.start)
-            .is_some_and(|row| row >= app.top_row() + usize::from(area.height))
-    {
+    if matches.is_empty() {
         return;
     }
     for (y, row) in (area.top()..area.bottom()).zip(layout.rows().iter().skip(app.top_row())) {
-        let Some(last) = row.cells.last() else {
+        let Some((first, last)) = row.cells.first().zip(row.cells.last()) else {
             continue;
         };
-        let start = matches.partition_point(|hit| hit.end <= row.anchor.byte);
+        let start = matches.partition_point(|hit| hit.end <= first.bytes.start);
         for hit in matches[start..]
             .iter()
             .take_while(|hit| hit.start < last.bytes.end)
@@ -210,7 +197,7 @@ mod tests {
         terminal.draw(|frame| {
             let layout = Layout::at_width(doc, frame.area().width);
             app.reflow(
-                &anchors(&layout),
+                &layout,
                 usize::from(body_area(frame.area(), app.mode()).height),
             );
             draw(frame, app, &layout, false);
@@ -225,7 +212,7 @@ mod tests {
         width: u16,
         keys: impl IntoIterator<Item = KeyCode>,
     ) {
-        let locations = anchors(&Layout::at_width(doc, width));
+        let locations = Layout::at_width(doc, width);
         for code in keys {
             let key = KeyEvent::new(code, KeyModifiers::NONE);
             if let Some(action) = input.action(key, app.mode(), app.help_open()) {
@@ -302,6 +289,47 @@ mod tests {
     }
 
     #[test]
+    fn table_highlights_both_columns_across_cell_wraps() -> Result<(), Infallible> {
+        let source = "| L | R |\n| --- | ---: |\n| **abcdef** | │XYZUV |\n| **abcdef** | │XYZUV |";
+        let mut app = App::new("test.md".into(), source.into());
+        let doc = prepare(&TuiMarkdown, app.markdown(), 13);
+        let mut terminal = Terminal::new(TestBackend::new(13, 10))?;
+        let mut input = Input::default();
+        paint(&mut terminal, &mut app, &doc)?;
+        press(
+            &mut input,
+            &mut app,
+            &doc,
+            13,
+            "/cdef │ │XY"
+                .chars()
+                .map(KeyCode::Char)
+                .chain([KeyCode::Enter]),
+        );
+        paint(&mut terminal, &mut app, &doc)?;
+        assert_eq!(app.search_selection(), Some((1, 2)));
+        let buffer = terminal.backend().buffer();
+        for (x, y, glyph) in [(4, 3, "c"), (2, 4, "d"), (8, 3, "│"), (10, 3, "Y")] {
+            assert_eq!(
+                (buffer[(x, y)].symbol(), buffer[(x, y)].bg),
+                (glyph, Color::Yellow)
+            );
+        }
+        assert!(buffer[(2, 4)].modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            (buffer[(6, 4)].symbol(), buffer[(6, 4)].bg),
+            ("│", Color::Reset)
+        );
+        assert_eq!(buffer[(8, 5)].bg, Color::Blue);
+        press(&mut input, &mut app, &doc, 13, [KeyCode::Char('N')]);
+        assert_eq!(app.search_selection(), Some((2, 2)));
+        terminal.backend_mut().resize(19, 10);
+        paint(&mut terminal, &mut app, &doc)?;
+        assert_eq!(app.search_selection(), Some((2, 2)));
+        Ok(())
+    }
+
+    #[test]
     fn image_cells_scroll_clip_and_leave_caption_search_visible() -> Result<(), Infallible> {
         use crate::app::{Action, Motion};
 
@@ -322,7 +350,7 @@ mod tests {
                         crate::terminal::ImageMode::Halfblocks,
                     );
                     app.reflow(
-                        &anchors(&layout),
+                        &layout,
                         usize::from(body_area(frame.area(), app.mode()).height),
                     );
                     draw(frame, app, &layout, float);
@@ -330,7 +358,7 @@ mod tests {
                 .map(|_| ())
         };
         let layout = Layout::with_images(&doc, 16, &loaded, crate::terminal::ImageMode::Halfblocks);
-        let locations = anchors(&layout);
+        let locations = &layout;
         let text = doc.search_text();
         assert_eq!(text, TuiMarkdown.render(source, 16).search_text());
         assert_eq!(layout.text().lines[6].to_string(), "same");
@@ -348,7 +376,7 @@ mod tests {
         );
         assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), "N");
         for motion in [Motion::PageDown, Motion::LineDown] {
-            app.apply(Action::Move(motion), &locations, text);
+            app.apply(Action::Move(motion), locations, text);
         }
         paint(&mut terminal, &mut app, false)?;
         assert_eq!(app.top_row(), 5);
@@ -363,18 +391,18 @@ mod tests {
         );
         paint(&mut terminal, &mut app, true)?;
         assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Reset);
-        app.apply(Action::Help, &locations, text);
+        app.apply(Action::Help, locations, text);
         paint(&mut terminal, &mut app, false)?;
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "H");
-        app.apply(Action::Cancel, &locations, text);
-        app.apply(Action::StartSearch(Direction::Forward), &locations, text);
+        app.apply(Action::Cancel, locations, text);
+        app.apply(Action::StartSearch(Direction::Forward), locations, text);
         for ch in "same".chars() {
-            app.apply(Action::Insert(ch), &locations, text);
+            app.apply(Action::Insert(ch), locations, text);
         }
         paint(&mut terminal, &mut app, false)?;
         assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), "/");
         assert_eq!(terminal.backend().buffer()[(0, 4)].bg, Color::Reset);
-        app.apply(Action::Submit, &locations, text);
+        app.apply(Action::Submit, locations, text);
         paint(&mut terminal, &mut app, false)?;
         assert_eq!(app.search_selection(), Some((2, 3)));
         assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Yellow);
@@ -402,13 +430,13 @@ mod tests {
             cell_height: 16,
         };
         let initial = Layout::with_images(&doc, 12, &loaded, mode);
-        let locations = anchors(&initial);
-        app.reflow(&locations, 4);
-        app.apply(Action::StartSearch(Direction::Forward), &locations, text);
+        let locations = &initial;
+        app.reflow(locations, 4);
+        app.apply(Action::StartSearch(Direction::Forward), locations, text);
         for ch in "label".chars() {
-            app.apply(Action::Insert(ch), &locations, text);
+            app.apply(Action::Insert(ch), locations, text);
         }
-        app.apply(Action::Submit, &locations, text);
+        app.apply(Action::Submit, locations, text);
         let offset = text.find("label").unwrap_or_default();
         assert_eq!(initial.row_for_offset(offset), Some(10));
         for (width, height, caption_row) in [(12, 5, 10), (6, 4, 6)] {
@@ -423,7 +451,7 @@ mod tests {
             assert_eq!(layout.row_for_offset(offset), Some(caption_row));
             terminal.draw(|frame| {
                 app.reflow(
-                    &anchors(&layout),
+                    &layout,
                     usize::from(body_area(frame.area(), app.mode()).height),
                 );
                 draw(frame, &app, &layout, false);

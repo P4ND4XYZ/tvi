@@ -1,15 +1,22 @@
+mod table;
+
 use std::ops::Range;
 
 use ratatui::{
     Frame,
     buffer::CellWidth,
     layout::Rect,
+    style::Style,
     text::{Line, Span, Text},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::images::PlacedImage;
-use crate::{app::ViewAnchor, markdown::RenderedMarkdown, terminal::ImageMode};
+use crate::{
+    app::{ViewAnchor, ViewRows},
+    markdown::RenderedMarkdown,
+    terminal::ImageMode,
+};
 
 /// ひとつの書記素が占めるセルと、対応する検索用UTF-8バイト範囲。
 #[derive(Debug, PartialEq, Eq)]
@@ -41,7 +48,9 @@ impl Row {
 pub struct Layout<'a> {
     text: Text<'a>,
     rows: Vec<Row>,
+    #[cfg(test)]
     search_len: usize,
+    reflowed: Vec<(Range<usize>, Range<usize>)>,
     images: Vec<PlacedImage>,
 }
 
@@ -68,17 +77,40 @@ impl<'a> Layout<'a> {
         let mut layout = Self {
             text: Text::default().style(original.style),
             rows: Vec::new(),
+            #[cfg(test)]
             search_len: document.search_text().len(),
+            reflowed: Vec::new(),
             images: Vec::new(),
         };
         if width != 0 {
             let mut placements = document.images.iter().peekable();
+            let mut tables = document.tables.iter().peekable();
+            let mut table_end = 0;
             for (index, (line, bytes)) in original
                 .lines
                 .iter()
                 .zip(document.line_ranges())
                 .enumerate()
             {
+                if index < table_end {
+                    continue;
+                }
+                if let Some(table) = tables.next_if(|table| table.start == index) {
+                    let end = index + table.lines.len();
+                    if table::wrap(
+                        &mut layout,
+                        table,
+                        &original.lines[index..end],
+                        document.search_text(),
+                        &document.line_ranges()[index..end],
+                        usize::from(width),
+                    )
+                    .is_some()
+                    {
+                        table_end = end;
+                        continue;
+                    }
+                }
                 let placement = placements.next_if(|placement| placement.line == index);
                 let mut skip = 0;
                 if let Some(placement) = placement
@@ -137,16 +169,29 @@ impl<'a> Layout<'a> {
         &self.rows
     }
 
-    /// 検索開始バイトまたは閲覧アンカーを表示行へ変換する。
-    /// 論理行末のLFと文書末尾は直前の表示行に属する。
-    #[must_use]
+    #[cfg(test)]
     pub fn row_for_offset(&self, offset: usize) -> Option<usize> {
-        if offset > self.search_len {
-            return None;
+        (offset <= self.search_len && !self.rows.is_empty())
+            .then(|| self.row_at(ViewAnchor::text(offset)))
+    }
+
+    fn table_row_at(&self, offset: usize) -> Option<usize> {
+        let table_line = self
+            .reflowed
+            .partition_point(|(bytes, _)| bytes.end < offset);
+        if let Some((bytes, rows)) = self.reflowed.get(table_line)
+            && bytes.start <= offset
+        {
+            if offset == bytes.end {
+                return Some(rows.end - 1);
+            }
+            return self.rows[rows.clone()]
+                .iter()
+                .position(|row| row.cells_for(offset..offset + 1).next().is_some())
+                .map(|row| rows.start + row)
+                .or(Some(rows.start));
         }
-        self.rows
-            .partition_point(|row| row.anchor <= ViewAnchor::text(offset))
-            .checked_sub(1)
+        None
     }
 
     fn wrap_line(
@@ -164,24 +209,20 @@ impl<'a> Layout<'a> {
             cells: Vec::new(),
         };
         let mut column = 0;
-        let mut spans = source.spans.iter();
-        let mut span_end = 0;
-        let mut style = ratatui::style::Style::default();
-        for (relative, grapheme) in search[bytes.start + skip..bytes.end].grapheme_indices(true) {
-            let relative = relative + skip;
-            // 装飾の境界が書記素の途中なら、先頭のスタイルで一体として描く。
-            while relative >= span_end {
-                let Some(span) = spans.next() else { break };
-                span_end += span.content.len();
-                style = span.style;
-            }
-            let measured = usize::from(grapheme.cell_width());
-            let (glyph, cells) = if measured == 0 || measured > width {
+        for Glyph {
+            start,
+            end,
+            symbol,
+            width: measured,
+            style,
+        } in glyphs(&source.spans, &search[bytes.clone()], bytes.start)
+            .filter(|g| g.start >= bytes.start + skip)
+        {
+            let (glyph, cells) = if measured > width {
                 ("�", 1)
             } else {
-                (grapheme, measured)
+                (symbol, measured)
             };
-            let start = bytes.start + relative;
             if column + cells > width {
                 self.text.lines.push(line);
                 self.rows.push(row);
@@ -192,19 +233,74 @@ impl<'a> Layout<'a> {
                 };
                 column = 0;
             }
-            if let Some(previous) = line.spans.last_mut().filter(|span| span.style == style) {
-                previous.content.to_mut().push_str(glyph);
-            } else {
-                line.spans.push(Span::styled(glyph, style));
-            }
+            push_glyph(&mut line, glyph, style);
             row.cells.push(Cell {
-                bytes: start..start + grapheme.len(),
+                bytes: start..end,
                 columns: column..column + cells,
             });
             column += cells;
         }
         self.text.lines.push(line);
         self.rows.push(row);
+    }
+}
+
+impl ViewRows for Layout<'_> {
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn anchor_at(&self, row: usize) -> Option<ViewAnchor> {
+        self.rows.get(row).map(|row| row.anchor)
+    }
+
+    fn row_at(&self, position: ViewAnchor) -> usize {
+        // 表は、先行列の続きより後続列の先頭が上に来ることがある。
+        self.table_row_at(position.byte)
+            .unwrap_or_else(|| self.row_at_ordered(position))
+    }
+}
+
+struct Glyph<'a> {
+    symbol: &'a str,
+    width: usize,
+    start: usize,
+    end: usize,
+    style: Style,
+}
+
+fn glyphs<'a, 's, 'span>(
+    spans: &'s [Span<'span>],
+    text: &'a str,
+    start: usize,
+) -> impl Iterator<Item = Glyph<'a>> + use<'a, 's, 'span> {
+    let mut spans = spans.iter();
+    let mut span_end = 0;
+    let mut style = Style::default();
+    text.grapheme_indices(true)
+        .map(move |(relative, grapheme)| {
+            // 装飾の境界が書記素の途中なら、先頭のスタイルで一体として描く。
+            while relative >= span_end {
+                let Some(span) = spans.next() else { break };
+                span_end += span.content.len();
+                style = span.style;
+            }
+            let measured = usize::from(grapheme.cell_width());
+            Glyph {
+                symbol: if measured == 0 { "�" } else { grapheme },
+                width: measured.max(1),
+                start: start + relative,
+                end: start + relative + grapheme.len(),
+                style,
+            }
+        })
+}
+
+fn push_glyph<'a>(line: &mut Line<'a>, symbol: &'a str, style: Style) {
+    if let Some(previous) = line.spans.last_mut().filter(|span| span.style == style) {
+        previous.content.to_mut().push_str(symbol);
+    } else {
+        line.spans.push(Span::styled(symbol, style));
     }
 }
 
@@ -275,6 +371,66 @@ mod tests {
         assert_eq!(anchor, 9);
         assert_eq!(wide.row_for_offset(anchor), Some(0));
         assert_eq!(narrow.row_for_offset(anchor), Some(1));
+    }
+
+    #[test]
+    fn commands_table_keeps_its_borders_aligned_at_48_cells() -> Result<(), &'static str> {
+        let document = TuiMarkdown.render(include_str!("../../docs/features/commands.md"), 48);
+        let wide = Layout::at_width(&document, 49);
+        let narrow = Layout::new(&document);
+        let table_start = |layout: &Layout<'_>| {
+            layout
+                .text()
+                .lines
+                .iter()
+                .position(|line| line.to_string().starts_with('┌'))
+        };
+        let wide_start = table_start(&wide).ok_or("wide table missing")?;
+        let narrow_start = table_start(&narrow).ok_or("narrow table missing")?;
+        let natural_start = document
+            .text()
+            .lines
+            .iter()
+            .position(|line| line.to_string().starts_with('┌'))
+            .ok_or("natural table missing")?;
+        let strings = |lines: &[Line<'_>]| lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            strings(&wide.text().lines[wide_start..wide_start + 7]),
+            strings(&document.text().lines[natural_start..natural_start + 7])
+        );
+        assert_eq!(wide.text().lines[wide_start].width(), 49);
+
+        let area = Rect::new(0, 0, 48, 8);
+        let mut buffer = Buffer::empty(area);
+        let table: Text<'_> = narrow.text().lines[narrow_start..narrow_start + 8]
+            .iter()
+            .cloned()
+            .collect();
+        assert!(table.lines.iter().all(|line| line.width() == 48));
+        Paragraph::new(table).render(area, &mut buffer);
+        for (y, borders) in ["┌┬┐", "│││", "├┼┤", "│││", "│││", "│││", "│││", "└┴┘"]
+            .into_iter()
+            .enumerate()
+        {
+            for (x, border) in [0, 21, 47].into_iter().zip(borders.chars()) {
+                assert_eq!(buffer[(x, y as u16)].symbol(), border.to_string());
+            }
+        }
+        assert_eq!(buffer[(2, 5)].symbol(), ":");
+        assert_eq!(buffer[(23, 5)].symbol(), "検");
+        assert_eq!(buffer[(43, 5)].symbol(), "効");
+        assert_eq!(buffer[(23, 6)].symbol(), "化");
+        assert_eq!(buffer[(2, 6)].symbol(), " ");
+        let continuation = document
+            .search_text()
+            .find("化 │")
+            .ok_or("missing continuation")?;
+        assert_eq!(narrow.row_for_offset(continuation), Some(narrow_start + 6));
+        assert_eq!(
+            wide.row_for_offset(narrow.rows()[narrow_start + 6].anchor.byte),
+            Some(wide_start + 5)
+        );
+        Ok(())
     }
 
     #[test]

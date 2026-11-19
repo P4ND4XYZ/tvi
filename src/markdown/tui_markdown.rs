@@ -12,6 +12,7 @@ use ratatui::{
 
 use super::{
     ImageLine, ImageReference, MarkdownLink, MarkdownRenderer, MarkdownResources, RenderedMarkdown,
+    table::{BORDER_MARKER, take_tables},
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -34,18 +35,15 @@ impl MarkdownRenderer for TuiMarkdown {
         } else {
             Cow::Borrowed(markdown)
         };
-        // 自然幅の表を論理行として保持する。表セルをライブラリ側で再配置すると、
-        // 幅に応じてテキストと順序が変わるため、他の論理行と同様にレイアウトで折り返す。
+        // 表の自然幅を検索用に保ち、折り返しに必要な罫線の位置だけを渡す。
         let mut image_lines = Vec::new();
-        let text = if resources.images.is_empty() {
-            ::tui_markdown::from_str(&source)
-        } else {
-            let sheet = ImagePositions {
-                next: std::sync::Arc::new(AtomicUsize::new(0)),
-                ordinals: resources.images.iter().map(|image| image.ordinal).collect(),
-            };
-            let options = ::tui_markdown::Options::new(sheet.clone());
-            let mut text = ::tui_markdown::from_str_with_options(&source, &options);
+        let sheet = PositionMarkers {
+            next: std::sync::Arc::new(AtomicUsize::new(0)),
+            ordinals: resources.images.iter().map(|image| image.ordinal).collect(),
+        };
+        let options = ::tui_markdown::Options::new(sheet.clone());
+        let mut text = ::tui_markdown::from_str_with_options(&source, &options);
+        if !resources.images.is_empty() {
             for (index, line) in text.lines.iter_mut().enumerate() {
                 if let Some(prefix) = line.spans.first().filter(|span| {
                     span.style.add_modifier.contains(IMAGE_POSITION)
@@ -62,11 +60,28 @@ impl MarkdownRenderer for TuiMarkdown {
             {
                 // adapter と描画側のイベント対応が崩れた場合は本文を従来どおり表示する。
                 image_lines.clear();
-                ::tui_markdown::from_str(&source)
-            } else {
-                text
             }
-        };
+        }
+        let tables = take_tables(&mut text, || {
+            use pulldown_cmark::Alignment::{Center, Right};
+            use ratatui::layout::Alignment;
+
+            parser(&source)
+                .filter_map(|event| match event {
+                    Event::Start(Tag::Table(alignments)) => Some(
+                        alignments
+                            .into_iter()
+                            .map(|alignment| match alignment {
+                                Center => Alignment::Center,
+                                Right => Alignment::Right,
+                                _ => Alignment::Left,
+                            })
+                            .collect(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        });
         let lines = text.lines.into_iter().map(|line| {
             let spans = line.spans.into_iter().map(|span| {
                 Span::styled(
@@ -83,6 +98,7 @@ impl MarkdownRenderer for TuiMarkdown {
         let mut owned = lines.collect::<Text<'static>>().style(text.style);
         owned.alignment = text.alignment;
         let mut document = RenderedMarkdown::new(owned, width);
+        document.tables = tables;
         document.images = image_lines
             .into_iter()
             .zip(&resources.images)
@@ -103,12 +119,17 @@ impl MarkdownRenderer for TuiMarkdown {
 const IMAGE_POSITION: Modifier = Modifier::HIDDEN;
 
 #[derive(Clone)]
-struct ImagePositions {
+struct PositionMarkers {
     next: std::sync::Arc<AtomicUsize>,
     ordinals: std::sync::Arc<[usize]>,
 }
 
-impl ::tui_markdown::StyleSheet for ImagePositions {
+impl ::tui_markdown::StyleSheet for PositionMarkers {
+    fn table_border(&self) -> Style {
+        ::tui_markdown::StyleSheet::table_border(&::tui_markdown::DefaultStyleSheet)
+            .add_modifier(BORDER_MARKER)
+    }
+
     fn image_alt(&self) -> Style {
         let ordinal = self.next.fetch_add(1, Ordering::Relaxed);
         let style = Style::new().add_modifier(Modifier::DIM | Modifier::ITALIC);
@@ -120,7 +141,7 @@ impl ::tui_markdown::StyleSheet for ImagePositions {
     }
 }
 
-fn extract_resources(markdown: &str) -> MarkdownResources {
+fn parser(markdown: &str) -> Parser<'_> {
     // 描画側のパーサーと同じ拡張を有効にする。
     let options = Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -133,13 +154,17 @@ fn extract_resources(markdown: &str) -> MarkdownResources {
         | Options::ENABLE_DEFINITION_LIST
         | Options::ENABLE_GFM
         | Options::ENABLE_TABLES;
+    Parser::new_ext(markdown, options)
+}
+
+fn extract_resources(markdown: &str) -> MarkdownResources {
     let mut resources = MarkdownResources::default();
     let mut active: Option<MarkdownLink> = None;
     let mut image_depth = 0;
     let mut depth = 0;
     let mut paragraph = None;
     let mut candidate = None::<ImageReference>;
-    for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
+    for (event, range) in parser(markdown).into_offset_iter() {
         if matches!(&event, Event::End(_)) {
             depth -= 1;
         }

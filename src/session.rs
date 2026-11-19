@@ -5,7 +5,7 @@ use std::{
 use crossterm::event::KeyEvent;
 
 use crate::{
-    app::{App, Document, ViewAnchor},
+    app::{App, Document, ViewRows},
     images,
     lua::{Host, LuaLink, Runtime},
     markdown::{MarkdownRenderer, tui_markdown::TuiMarkdown},
@@ -197,7 +197,6 @@ fn run_document(
     };
     let mut width = document.width();
     let mut layout = Layout::with_images(&document, width, &images, image_mode);
-    let mut anchors = ui::anchors(&layout);
     let mut previous_size = None;
     let result = (|| loop {
         let size = screen.size()?;
@@ -218,11 +217,10 @@ fn run_document(
                 image_mode = mode;
                 retired.extend(layout.transmitted_ids());
                 layout = Layout::with_images(&document, width, &images, image_mode);
-                anchors = ui::anchors(&layout);
             }
             let mut session = session.borrow_mut();
             let body = ui::body_area(area, session.app.mode());
-            session.app.reflow(&anchors, usize::from(body.height));
+            session.app.reflow(&layout, usize::from(body.height));
             ui::draw(
                 frame,
                 &session.app,
@@ -238,7 +236,7 @@ fn run_document(
             let key = keys
                 .pop_replayed()
                 .map_or_else(|| terminal_input.poll_key(), |key| Ok(Some(key)))?;
-            if keys.dispatch(key, session, runtime, &anchors, document.search_text()) {
+            if keys.dispatch(key, session, runtime, &layout, document.search_text()) {
                 let app = &session.borrow().app;
                 if app.should_quit() || app.document_id() != document_id {
                     return Ok(());
@@ -265,7 +263,7 @@ impl InputQueue {
         key: Option<KeyEvent>,
         session: &RefCell<Session>,
         runtime: &Runtime,
-        anchors: &[ViewAnchor],
+        rows: &impl ViewRows,
         search_text: &str,
     ) -> bool {
         let active_float = session.borrow().floats.active();
@@ -299,7 +297,7 @@ impl InputQueue {
         }
         match dispatch.action {
             InputAction::Builtin(action) => {
-                session.borrow_mut().app.apply(action, anchors, search_text);
+                session.borrow_mut().app.apply(action, rows, search_text);
             }
             InputAction::Lua(mapping) => {
                 if let Err(error) = runtime.run_mapping(mapping) {
@@ -461,6 +459,60 @@ error("startup failed")
         session.app.apply(Action::JumpBack, &[], "");
         assert_eq!(session.app.document_id(), initial_id);
         Ok(())
+    }
+
+    #[test]
+    fn search_reveals_the_later_column_and_keeps_the_reading_position_on_resize() {
+        let source = "| L | R |\n| --- | --- |\n| abcdefgh | FIND |\n| abcdefgh | FIND |\n\nend";
+        let session = Rc::new(RefCell::new(Session::new(Document::new(
+            "source.md".into(),
+            source.into(),
+            PathBuf::from("source.md"),
+            vec![],
+        ))));
+        let (runtime, _) = Runtime::load_from(session.clone(), None);
+        let document = TuiMarkdown.render(source, 13);
+        let wide = Layout::at_width(&document, 19);
+        let narrow = Layout::new(&document);
+        let mut keys = InputQueue::default();
+        session.borrow_mut().app.reflow(&wide, 1);
+        for code in "/FIND".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+            assert!(keys.dispatch(
+                Some(KeyEvent::new(code, KeyModifiers::NONE)),
+                &session,
+                &runtime,
+                &wide,
+                document.search_text()
+            ));
+        }
+        assert_eq!(session.borrow().app.top_row(), 3);
+        let locations = narrow;
+        session.borrow_mut().app.reflow(&locations, 1);
+        assert_eq!(session.borrow().app.top_row(), 3);
+        assert_eq!(locations.text().lines[3].to_string(), "│ abc │ FIN │");
+        for (key, row, selection) in [('N', 6, (2, 2)), ('n', 3, (1, 2))] {
+            assert!(keys.dispatch(
+                Some(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                &session,
+                &runtime,
+                &locations,
+                document.search_text()
+            ));
+            assert_eq!(session.borrow().app.top_row(), row);
+            assert_eq!(session.borrow().app.search_selection(), Some(selection));
+        }
+        assert!(keys.dispatch(
+            Some(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            &session,
+            &runtime,
+            &locations,
+            document.search_text()
+        ));
+        assert_eq!(session.borrow().app.top_row(), 4);
+        session.borrow_mut().app.reflow(&wide, 1);
+        assert_eq!(session.borrow().app.top_row(), 3);
+        session.borrow_mut().app.reflow(&locations, 1);
+        assert_eq!(session.borrow().app.top_row(), 4);
     }
 
     #[test]
