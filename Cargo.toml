@@ -5,11 +5,16 @@ edition = "2024"
 
 [dependencies]
 crossterm = "0.29"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 mlua = { version = "0.11", features = ["lua54", "vendored"] }
 pulldown-cmark = "0.13"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "11.0.6", default-features = false }
 tui-markdown = { version = "0.3.13", features = ["highlight-code"] }
 unicode-segmentation = "1.13"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
 
 
 [lints.rust]

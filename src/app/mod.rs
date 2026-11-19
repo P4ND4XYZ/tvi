@@ -2,7 +2,12 @@ mod command;
 mod document;
 mod search;
 
-use std::{ops::Range, path::PathBuf};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
+
+use crate::markdown::MarkdownResources;
 
 use command::Command;
 pub use document::{Document, DocumentLink};
@@ -58,40 +63,66 @@ pub struct App {
 struct HistoryEntry {
     document: Document,
     search: Search,
-    anchor: usize,
+    anchor: ViewAnchor,
+}
+
+/// 画像の行番号も記憶する。同じバイト位置では画像がキャプションより前に並ぶ。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ViewAnchor {
+    pub byte: usize,
+    pub image_row: u16,
+}
+
+impl ViewAnchor {
+    pub const fn text(byte: usize) -> Self {
+        Self {
+            byte,
+            image_row: u16::MAX,
+        }
+    }
 }
 
 #[derive(Default)]
 struct Viewport {
     top: usize,
-    anchor: usize,
+    anchor: ViewAnchor,
     height: usize,
 }
 
 impl Viewport {
-    fn last_top(&self, anchors: &[usize]) -> usize {
+    fn last_top(&self, anchors: &[ViewAnchor]) -> usize {
         anchors.len().saturating_sub(self.height.max(1))
     }
 
-    fn row_at(anchors: &[usize], offset: usize) -> usize {
-        anchors
-            .partition_point(|&anchor| anchor <= offset)
-            .saturating_sub(1)
+    fn row_at(anchors: &[ViewAnchor], position: ViewAnchor) -> usize {
+        let next = anchors.partition_point(|&anchor| anchor <= position);
+        // 復帰時にファイルが欠損していても、直前の段落ではなく元の画像の代替表示へ戻る。
+        if anchors
+            .get(next)
+            .is_some_and(|anchor| anchor.byte == position.byte)
+            && next
+                .checked_sub(1)
+                .is_none_or(|last| anchors[last].byte != position.byte)
+        {
+            next
+        } else {
+            next.saturating_sub(1)
+        }
     }
 
-    fn reflow(&mut self, anchors: &[usize], height: usize) {
+    fn reflow(&mut self, anchors: &[ViewAnchor], height: usize) {
         self.height = height;
         self.top = Self::row_at(anchors, self.anchor).min(self.last_top(anchors));
     }
 
-    fn show(&mut self, row: usize, anchors: &[usize]) {
+    fn show(&mut self, row: usize, anchors: &[ViewAnchor]) {
         self.top = row.min(self.last_top(anchors));
         if let Some(&anchor) = anchors.get(self.top) {
             self.anchor = anchor;
         }
     }
 
-    fn navigate(&mut self, motion: Motion, anchors: &[usize]) {
+    fn navigate(&mut self, motion: Motion, anchors: &[ViewAnchor]) {
         if self.height == 0 || anchors.is_empty() {
             return;
         }
@@ -109,9 +140,9 @@ impl Viewport {
         self.show(next, anchors);
     }
 
-    fn search_target(&mut self, offset: usize, anchors: &[usize]) {
+    fn search_target(&mut self, offset: usize, anchors: &[ViewAnchor]) {
         // 実表示が末尾でクランプしても、リサイズでは一致の開始位置を維持する。
-        self.anchor = offset;
+        self.anchor = ViewAnchor::text(offset);
         self.reflow(anchors, self.height);
     }
 }
@@ -143,6 +174,14 @@ impl App {
 
     pub fn markdown(&self) -> &str {
         &self.document.markdown
+    }
+
+    pub fn document_path(&self) -> &Path {
+        &self.document.path
+    }
+
+    pub fn markdown_resources(&self) -> &MarkdownResources {
+        &self.document.resources
     }
 
     pub fn document_id(&self) -> u64 {
@@ -232,11 +271,11 @@ impl App {
         }
     }
 
-    pub fn reflow(&mut self, anchors: &[usize], height: usize) {
+    pub fn reflow(&mut self, anchors: &[ViewAnchor], height: usize) {
         self.viewport.reflow(anchors, height);
     }
 
-    pub fn apply(&mut self, action: Action, anchors: &[usize], text: &str) {
+    pub fn apply(&mut self, action: Action, anchors: &[ViewAnchor], text: &str) {
         if self.help {
             if action == Action::Cancel {
                 self.help = false;
@@ -275,7 +314,8 @@ impl App {
                 let offset = anchors
                     .get(self.viewport.top)
                     .copied()
-                    .unwrap_or(self.viewport.anchor);
+                    .unwrap_or(self.viewport.anchor)
+                    .byte;
                 self.search.submit(query, direction, text, offset);
                 self.reveal_search(anchors);
             }
@@ -289,7 +329,7 @@ impl App {
         self.notice = None;
     }
 
-    fn reveal_search(&mut self, anchors: &[usize]) {
+    fn reveal_search(&mut self, anchors: &[ViewAnchor]) {
         self.notice = if let Some(hit) = self.search.current() {
             self.viewport.search_target(hit.start, anchors);
             None
@@ -319,7 +359,7 @@ mod tests {
     #[test]
     fn motions_clamp_to_a_full_final_viewport_and_anchor_reflows() {
         let mut app = App::new("test.md".into(), String::new());
-        let anchors = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27];
+        let anchors = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27].map(ViewAnchor::text);
         app.reflow(&anchors, 4);
         for (motion, row) in [
             (Motion::LineUp, 0),
@@ -335,7 +375,7 @@ mod tests {
             app.apply(Action::Move(motion), &anchors, "");
             assert_eq!(app.top_row(), row, "{motion:?}");
         }
-        app.reflow(&[0, 9, 18, 27], 3);
+        app.reflow(&[0, 9, 18, 27].map(ViewAnchor::text), 3);
         assert_eq!(app.top_row(), 1);
         app.reflow(&anchors, 4);
         assert_eq!(app.top_row(), 6);
@@ -346,7 +386,7 @@ mod tests {
     #[test]
     fn missing_or_empty_search_does_not_move_the_view() {
         let mut app = App::new("test.md".into(), "猫\n犬".into());
-        let anchors = [0, 4];
+        let anchors = [0, 4].map(ViewAnchor::text);
         let text = "猫\n犬";
         app.reflow(&anchors, 1);
         app.apply(Action::Move(Motion::End), &anchors, text);
@@ -448,7 +488,7 @@ mod tests {
     #[test]
     fn jump_back_restores_the_logical_position_and_hidden_search() {
         let text = "hit\none\nhit\ntwo\nhit\nend";
-        let anchors = [0, 4, 8, 12, 16, 20];
+        let anchors = [0, 4, 8, 12, 16, 20].map(ViewAnchor::text);
         let mut app = App::new("test.md".into(), text.into());
         app.reflow(&anchors, 1);
         for action in [
@@ -477,13 +517,13 @@ mod tests {
             PathBuf::from("next.md"),
             vec![],
         ));
-        app.reflow(&[0], 1);
+        app.reflow(&[ViewAnchor::text(0)], 1);
         assert_eq!(app.top_row(), 0);
         assert_eq!(app.search_query(), "");
         assert_eq!(app.search_selection(), None);
 
-        app.apply(Action::JumpBack, &[0], "next");
-        app.reflow(&[0, 8, 16, 20], 2);
+        app.apply(Action::JumpBack, &[ViewAnchor::text(0)], "next");
+        app.reflow(&[0, 8, 16, 20].map(ViewAnchor::text), 2);
         assert_eq!(app.top_row(), 1);
         app.reflow(&anchors, 1);
         assert_eq!(app.top_row(), 3);

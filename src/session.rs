@@ -5,10 +5,11 @@ use std::{
 use crossterm::event::KeyEvent;
 
 use crate::{
-    app::{App, Document},
+    app::{App, Document, ViewAnchor},
+    images,
     lua::{Host, LuaLink, Runtime},
     markdown::{MarkdownRenderer, tui_markdown::TuiMarkdown},
-    terminal::{self, Screen},
+    terminal::{self, ImageMode, Screen},
     ui::{
         self,
         float::{FloatOptions, Floats},
@@ -79,12 +80,12 @@ fn load_document(path: &Path) -> Result<Document, ReadDocumentError> {
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .replace(char::is_control, "�");
-    let links = TuiMarkdown
-        .links(&markdown)
+    let mut resources = TuiMarkdown.resources(&markdown);
+    let links = std::mem::take(&mut resources.links)
         .into_iter()
         .map(|link| (link.label, link.target))
         .collect();
-    Ok(Document::new(name, markdown, path.to_owned(), links))
+    Ok(Document::new(name, markdown, path.to_owned(), links).with_resources(resources))
 }
 
 fn require_regular_file(path: &Path) -> io::Result<()> {
@@ -152,7 +153,11 @@ fn validate_view(view: u64) -> Result<(), String> {
     }
 }
 
-pub fn run(screen: &mut Screen, document: Document) -> io::Result<()> {
+pub fn run(
+    screen: &mut Screen,
+    terminal_input: &mut terminal::Input,
+    document: Document,
+) -> io::Result<()> {
     let session = Rc::new(RefCell::new(Session::new(document)));
     let (runtime, error) = Runtime::load(session.clone());
     if let Some(error) = error {
@@ -161,36 +166,58 @@ pub fn run(screen: &mut Screen, document: Document) -> io::Result<()> {
 
     let mut keys = InputQueue::default();
     while !session.borrow().app.should_quit() {
-        run_document(screen, &session, &runtime, &mut keys)?;
+        run_document(screen, terminal_input, &session, &runtime, &mut keys)?;
     }
     Ok(())
 }
 
 fn run_document(
     screen: &mut Screen,
+    terminal_input: &mut terminal::Input,
     session: &RefCell<Session>,
     runtime: &Runtime,
     keys: &mut InputQueue,
 ) -> io::Result<()> {
-    let (document_id, document) = {
+    let mut image_mode = terminal_input.image_mode();
+    let (document_id, document, images) = {
         let session = session.borrow();
         let app = &session.app;
+        let width = screen.size()?.width;
+        let resources = app.markdown_resources();
+        let images = if !resources.images.is_empty() && image_mode != ImageMode::Text {
+            images::load(app.document_path(), &resources.images)
+        } else {
+            Vec::new()
+        };
         (
             app.document_id(),
-            ui::prepare(&TuiMarkdown, app.markdown(), screen.size()?.width),
+            TuiMarkdown.render_document(app.markdown(), width, resources),
+            images,
         )
     };
     let mut width = document.width();
-    let mut layout = Layout::new(&document);
+    let mut layout = Layout::with_images(&document, width, &images, image_mode);
     let mut anchors = ui::anchors(&layout);
-    loop {
+    let mut previous_size = None;
+    let result = (|| loop {
+        let size = screen.size()?;
+        if previous_size
+            .replace(size)
+            .is_some_and(|previous| previous != size)
+        {
+            terminal_input.refresh_cell_size();
+        }
+        let mode = terminal_input.image_mode();
         let mut drawn_size = (0, 0);
-        screen.draw(|frame| {
+        let mut retired = Vec::new();
+        let draw_result = screen.draw(|frame| {
             let area = frame.area();
             drawn_size = (area.width, area.height);
-            if width != area.width {
+            if width != area.width || image_mode != mode {
                 width = area.width;
-                layout = Layout::at_width(&document, width);
+                image_mode = mode;
+                retired.extend(layout.transmitted_ids());
+                layout = Layout::with_images(&document, width, &images, image_mode);
                 anchors = ui::anchors(&layout);
             }
             let mut session = session.borrow_mut();
@@ -203,9 +230,14 @@ fn run_document(
                 session.floats.active().is_some(),
             );
             session.floats.draw(frame, body);
-        })?;
+        });
+        let cleanup = terminal::delete_images(retired);
+        draw_result?;
+        cleanup?;
         loop {
-            let key = keys.next_key()?;
+            let key = keys
+                .pop_replayed()
+                .map_or_else(|| terminal_input.poll_key(), |key| Ok(Some(key)))?;
             if keys.dispatch(key, session, runtime, &anchors, document.search_text()) {
                 let app = &session.borrow().app;
                 if app.should_quit() || app.document_id() != document_id {
@@ -214,20 +246,18 @@ fn run_document(
                 break;
             }
             let size = screen.size()?;
-            if (size.width, size.height) != drawn_size {
+            if (size.width, size.height) != drawn_size || terminal_input.image_mode() != image_mode
+            {
                 break;
             }
         }
-    }
+    })();
+    result.and(terminal::delete_images(layout.transmitted_ids()))
 }
 
 impl InputQueue {
-    fn next_key(&mut self) -> io::Result<Option<KeyEvent>> {
-        if let Some(key) = self.replay.pop_front() {
-            Ok(Some(key))
-        } else {
-            terminal::poll_key()
-        }
+    fn pop_replayed(&mut self) -> Option<KeyEvent> {
+        self.replay.pop_front()
     }
 
     fn dispatch(
@@ -235,7 +265,7 @@ impl InputQueue {
         key: Option<KeyEvent>,
         session: &RefCell<Session>,
         runtime: &Runtime,
-        anchors: &[usize],
+        anchors: &[ViewAnchor],
         search_text: &str,
     ) -> bool {
         let active_float = session.borrow().floats.active();
@@ -338,6 +368,52 @@ mod tests {
     }
 
     #[test]
+    fn local_images_follow_document_jumps_without_becoming_links() -> Result<(), Box<dyn Error>> {
+        let scratch = Scratch::new()?;
+        let docs = scratch.0.join("docs");
+        fs::create_dir(&docs)?;
+        let pixels = image::RgbImage::from_pixel(30, 60, image::Rgb([250, 0, 0]));
+        pixels.save_with_format(scratch.0.join("first.data"), image::ImageFormat::Png)?;
+        let pixels = image::RgbImage::from_pixel(30, 60, image::Rgb([0, 0, 250]));
+        pixels.save_with_format(docs.join("second.data"), image::ImageFormat::Jpeg)?;
+        fs::write(docs.join("broken.png"), b"not a PNG")?;
+        fs::create_dir(docs.join("directory.png"))?;
+        let root = scratch.0.join("root.md");
+        fs::write(&root, "[Next](docs/next.md)\n\n![same](first.data)")?;
+        fs::write(
+            docs.join("next.md"),
+            "![same](../first.data)\n\n![same](second.data)\n\n![same](broken.png)\n\n![same](directory.png)\n\n![same](missing.png)",
+        )?;
+        let session = RefCell::new(Session::new(read_document(&root)?));
+        let read = || {
+            let session = session.borrow();
+            let app = &session.app;
+            images::load(app.document_path(), &app.markdown_resources().images)
+        };
+        assert_eq!(
+            read().iter().map(Option::is_some).collect::<Vec<_>>(),
+            [true]
+        );
+        let links = session.links(BODY_VIEW)?;
+        assert_eq!(links.len(), 1);
+        session.open_link(BODY_VIEW, links[0].id)?;
+        assert!(session.links(BODY_VIEW)?.is_empty());
+        let loaded = read();
+        assert_eq!(
+            loaded.iter().map(Option::is_some).collect::<Vec<_>>(),
+            [true, true, false, false, false]
+        );
+        let png = loaded[0].as_ref().ok_or("PNG missing")?.to_rgb8();
+        let jpeg = loaded[1].as_ref().ok_or("JPEG missing")?.to_rgb8();
+        assert_eq!(png.get_pixel(0, 0).0, [250, 0, 0]);
+        assert!(jpeg.get_pixel(0, 0).0[2] > 240);
+        session.borrow_mut().app.apply(Action::JumpBack, &[], "");
+        assert_eq!(session.links(BODY_VIEW)?[0].id, links[0].id);
+        assert_eq!(read().len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn invalid_link_and_failed_init_leave_the_original_document() -> Result<(), Box<dyn Error>> {
         let scratch = Scratch::new()?;
         let docs = scratch.0.join("docs");
@@ -432,7 +508,7 @@ tvi.keymap.set("search", "<F2><F3>", function() end, { desc = "longer" })
             assert!(!send(&mut keys, KeyCode::F(2)));
             assert!(send(&mut keys, KeyCode::Char(key)));
             assert!(session.borrow().floats.active().is_some());
-            let replayed = keys.next_key()?;
+            let replayed = keys.pop_replayed();
             assert_eq!(
                 replayed,
                 Some(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))

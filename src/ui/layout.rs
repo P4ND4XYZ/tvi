@@ -1,12 +1,15 @@
 use std::ops::Range;
 
 use ratatui::{
+    Frame,
     buffer::CellWidth,
+    layout::Rect,
     text::{Line, Span, Text},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::markdown::RenderedMarkdown;
+use super::images::PlacedImage;
+use crate::{app::ViewAnchor, markdown::RenderedMarkdown, terminal::ImageMode};
 
 /// ひとつの書記素が占めるセルと、対応する検索用UTF-8バイト範囲。
 #[derive(Debug, PartialEq, Eq)]
@@ -18,7 +21,7 @@ pub struct Cell {
 /// 画面上の一行。空行も閲覧アンカーを持つ。
 #[derive(Debug)]
 pub struct Row {
-    pub anchor: usize,
+    pub anchor: ViewAnchor,
     pub cells: Vec<Cell>,
 }
 
@@ -39,28 +42,89 @@ pub struct Layout<'a> {
     text: Text<'a>,
     rows: Vec<Row>,
     search_len: usize,
+    images: Vec<PlacedImage>,
 }
 
 impl<'a> Layout<'a> {
+    #[cfg(test)]
     #[must_use]
     pub fn new(document: &'a RenderedMarkdown) -> Self {
         Self::at_width(document, document.width())
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn at_width(document: &'a RenderedMarkdown, width: u16) -> Self {
+        Self::with_images(document, width, &[], ImageMode::Text)
+    }
+
+    pub fn with_images(
+        document: &'a RenderedMarkdown,
+        width: u16,
+        images: &[Option<image::DynamicImage>],
+        mode: ImageMode,
+    ) -> Self {
         let original = document.text();
         let mut layout = Self {
             text: Text::default().style(original.style),
             rows: Vec::new(),
             search_len: document.search_text().len(),
+            images: Vec::new(),
         };
         if width != 0 {
-            for (line, bytes) in original.lines.iter().zip(document.line_ranges()) {
-                layout.wrap_line(line, document.search_text(), bytes, usize::from(width));
+            let mut placements = document.images.iter().peekable();
+            for (index, (line, bytes)) in original
+                .lines
+                .iter()
+                .zip(document.line_ranges())
+                .enumerate()
+            {
+                let placement = placements.next_if(|placement| placement.line == index);
+                let mut skip = 0;
+                if let Some(placement) = placement
+                    && let Some(Some(image)) = images.get(placement.image)
+                    && let Some(image) = PlacedImage::new(image, width, layout.rows.len(), mode)
+                {
+                    for row in 0..image.height() {
+                        layout.text.lines.push(Line::default());
+                        layout.rows.push(Row {
+                            anchor: ViewAnchor {
+                                byte: bytes.start,
+                                image_row: row,
+                            },
+                            cells: Vec::new(),
+                        });
+                    }
+                    layout.images.push(image);
+                    if !placement.has_alt {
+                        continue;
+                    }
+                    skip = placement.prefix_bytes;
+                }
+                layout.wrap_line(
+                    line,
+                    document.search_text(),
+                    bytes,
+                    usize::from(width),
+                    skip,
+                );
             }
         }
         layout
+    }
+
+    pub fn transmitted_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.images.iter().filter_map(PlacedImage::transmitted_id)
+    }
+
+    pub fn draw_images(&self, frame: &mut Frame<'_>, body: Rect, top: usize) {
+        let first = self.images.partition_point(|image| image.rows.end <= top);
+        for image in self.images[first..]
+            .iter()
+            .take_while(|image| image.rows.start < top + usize::from(body.height))
+        {
+            image.draw(frame, body, top);
+        }
     }
 
     #[must_use]
@@ -81,7 +145,7 @@ impl<'a> Layout<'a> {
             return None;
         }
         self.rows
-            .partition_point(|row| row.anchor <= offset)
+            .partition_point(|row| row.anchor <= ViewAnchor::text(offset))
             .checked_sub(1)
     }
 
@@ -91,18 +155,20 @@ impl<'a> Layout<'a> {
         search: &'a str,
         bytes: &Range<usize>,
         width: usize,
+        skip: usize,
     ) {
         let fresh_line = || Line::default().style(source.style);
         let mut line = fresh_line();
         let mut row = Row {
-            anchor: bytes.start,
+            anchor: ViewAnchor::text(bytes.start + skip),
             cells: Vec::new(),
         };
         let mut column = 0;
         let mut spans = source.spans.iter();
         let mut span_end = 0;
         let mut style = ratatui::style::Style::default();
-        for (relative, grapheme) in search[bytes.clone()].grapheme_indices(true) {
+        for (relative, grapheme) in search[bytes.start + skip..bytes.end].grapheme_indices(true) {
+            let relative = relative + skip;
             // 装飾の境界が書記素の途中なら、先頭のスタイルで一体として描く。
             while relative >= span_end {
                 let Some(span) = spans.next() else { break };
@@ -121,7 +187,7 @@ impl<'a> Layout<'a> {
                 self.rows.push(row);
                 line = fresh_line();
                 row = Row {
-                    anchor: start,
+                    anchor: ViewAnchor::text(start),
                     cells: Vec::new(),
                 };
                 column = 0;
@@ -205,7 +271,7 @@ mod tests {
         assert_eq!(columns(&narrow, 0), [2..4, 4..6]);
         assert_eq!(columns(&narrow, 1), [0..2, 2..4]);
         assert_eq!(columns(&wide, 0), [2..4, 4..6, 6..8, 8..10]);
-        let anchor = narrow.rows()[1].anchor;
+        let anchor = narrow.rows()[1].anchor.byte;
         assert_eq!(anchor, 9);
         assert_eq!(wide.row_for_offset(anchor), Some(0));
         assert_eq!(narrow.row_for_offset(anchor), Some(1));
@@ -240,7 +306,7 @@ mod tests {
                 .collect::<String>();
             assert_eq!(visible, phrase);
             assert_eq!(
-                wide.row_for_offset(narrow.rows()[last].anchor),
+                wide.row_for_offset(narrow.rows()[last].anchor.byte),
                 Some(wide_row)
             );
         }

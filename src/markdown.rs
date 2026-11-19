@@ -5,8 +5,17 @@ use ratatui::text::Text;
 pub mod tui_markdown;
 
 pub trait MarkdownRenderer {
-    fn render(&self, markdown: &str, width: u16) -> RenderedMarkdown;
-    fn links(&self, markdown: &str) -> Vec<MarkdownLink>;
+    #[cfg(test)]
+    fn render(&self, markdown: &str, width: u16) -> RenderedMarkdown {
+        self.render_document(markdown, width, &MarkdownResources::default())
+    }
+    fn render_document(
+        &self,
+        markdown: &str,
+        width: u16,
+        resources: &MarkdownResources,
+    ) -> RenderedMarkdown;
+    fn resources(&self, markdown: &str) -> MarkdownResources;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -15,12 +24,36 @@ pub struct MarkdownLink {
     pub target: String,
 }
 
+#[derive(Default)]
+pub struct MarkdownResources {
+    pub links: Vec<MarkdownLink>,
+    pub images: Vec<ImageReference>,
+    pub image_count: usize,
+}
+
+/// すべての画像開始イベントを数えた文書内通番。
+#[derive(Debug)]
+pub struct ImageReference {
+    pub ordinal: usize,
+    pub target: String,
+    pub has_alt: bool,
+}
+
+#[derive(Debug)]
+pub struct ImageLine {
+    pub line: usize,
+    pub image: usize,
+    pub prefix_bytes: usize,
+    pub has_alt: bool,
+}
+
 /// 幅に依存しない論理行と、検索テキスト上のUTF-8バイト範囲。
 /// 論理行の区切りはLF。各行の範囲に区切り自体は含まれない。
 pub struct RenderedMarkdown {
     text: Text<'static>,
     search_text: String,
     line_ranges: Vec<Range<usize>>,
+    pub images: Vec<ImageLine>,
     width: u16,
 }
 
@@ -44,6 +77,7 @@ impl RenderedMarkdown {
             text,
             search_text,
             line_ranges,
+            images: Vec::new(),
             width,
         }
     }

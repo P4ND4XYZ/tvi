@@ -1,4 +1,5 @@
 pub mod float;
+mod images;
 pub mod input;
 pub mod layout;
 
@@ -12,17 +13,18 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{
-    app::{App, Direction, Mode},
-    markdown::{MarkdownRenderer, RenderedMarkdown},
-};
+use crate::app::{App, Direction, Mode, ViewAnchor};
 use layout::Layout;
 
-pub fn prepare(renderer: &impl MarkdownRenderer, markdown: &str, width: u16) -> RenderedMarkdown {
+#[cfg(test)]
+use crate::markdown::{MarkdownRenderer, RenderedMarkdown};
+
+#[cfg(test)]
+fn prepare(renderer: &impl MarkdownRenderer, markdown: &str, width: u16) -> RenderedMarkdown {
     renderer.render(markdown, width)
 }
 
-pub fn anchors(layout: &Layout<'_>) -> Vec<usize> {
+pub fn anchors(layout: &Layout<'_>) -> Vec<ViewAnchor> {
     layout.rows().iter().map(|row| row.anchor).collect()
 }
 
@@ -53,6 +55,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, layout: &Layout<'_>, float_active:
             body,
         );
         highlight(frame, app, body, layout);
+        if !app.help_open() && !float_active {
+            layout.draw_images(frame, body, app.top_row());
+        }
     }
     if app.help_open() && !body.is_empty() {
         frame.render_widget(Clear, body);
@@ -150,7 +155,7 @@ fn highlight(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Layout<'_>) 
         let Some(last) = row.cells.last() else {
             continue;
         };
-        let start = matches.partition_point(|hit| hit.end <= row.anchor);
+        let start = matches.partition_point(|hit| hit.end <= row.anchor.byte);
         for hit in matches[start..]
             .iter()
             .take_while(|hit| hit.start < last.bytes.end)
@@ -293,6 +298,145 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(7, 1)].bg, Color::Yellow);
         assert_eq!(buffer[(0, 2)].bg, Color::Yellow);
+        Ok(())
+    }
+
+    #[test]
+    fn image_cells_scroll_clip_and_leave_caption_search_visible() -> Result<(), Infallible> {
+        use crate::app::{Action, Motion};
+
+        let source = "before same\n\n![same](red.png)\n\n![same](blue.jpg)\n\nafter";
+        let mut app = App::new("test.md".into(), source.into());
+        let resources = TuiMarkdown.resources(source);
+        let doc = TuiMarkdown.render_document(source, 16, &resources);
+        let solid = |rgb| Some(image::RgbImage::from_pixel(40, 80, image::Rgb(rgb)).into());
+        let loaded = [solid([255, 0, 0]), solid([0, 0, 255])];
+        let mut terminal = Terminal::new(TestBackend::new(16, 5))?;
+        let paint = |terminal: &mut Terminal<TestBackend>, app: &mut App, float| {
+            terminal
+                .draw(|frame| {
+                    let layout = Layout::with_images(
+                        &doc,
+                        frame.area().width,
+                        &loaded,
+                        crate::terminal::ImageMode::Halfblocks,
+                    );
+                    app.reflow(
+                        &anchors(&layout),
+                        usize::from(body_area(frame.area(), app.mode()).height),
+                    );
+                    draw(frame, app, &layout, float);
+                })
+                .map(|_| ())
+        };
+        let layout = Layout::with_images(&doc, 16, &loaded, crate::terminal::ImageMode::Halfblocks);
+        let locations = anchors(&layout);
+        let text = doc.search_text();
+        assert_eq!(text, TuiMarkdown.render(source, 16).search_text());
+        assert_eq!(layout.text().lines[6].to_string(), "same");
+        assert_eq!(layout.text().lines[12].to_string(), "same");
+        assert_eq!(
+            Layout::at_width(&doc, 16).text().lines[2].to_string(),
+            "[img] same"
+        );
+
+        paint(&mut terminal, &mut app, false)?;
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "b");
+        assert_eq!(
+            terminal.backend().buffer()[(0, 2)].bg,
+            Color::Rgb(255, 0, 0)
+        );
+        assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), "N");
+        for motion in [Motion::PageDown, Motion::LineDown] {
+            app.apply(Action::Move(motion), &locations, text);
+        }
+        paint(&mut terminal, &mut app, false)?;
+        assert_eq!(app.top_row(), 5);
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            Color::Rgb(255, 0, 0)
+        );
+        assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "s");
+        assert_eq!(
+            terminal.backend().buffer()[(0, 3)].bg,
+            Color::Rgb(0, 0, 255)
+        );
+        paint(&mut terminal, &mut app, true)?;
+        assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Reset);
+        app.apply(Action::Help, &locations, text);
+        paint(&mut terminal, &mut app, false)?;
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "H");
+        app.apply(Action::Cancel, &locations, text);
+        app.apply(Action::StartSearch(Direction::Forward), &locations, text);
+        for ch in "same".chars() {
+            app.apply(Action::Insert(ch), &locations, text);
+        }
+        paint(&mut terminal, &mut app, false)?;
+        assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), "/");
+        assert_eq!(terminal.backend().buffer()[(0, 4)].bg, Color::Reset);
+        app.apply(Action::Submit, &locations, text);
+        paint(&mut terminal, &mut app, false)?;
+        assert_eq!(app.search_selection(), Some((2, 3)));
+        assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Yellow);
+        terminal.backend_mut().resize(2, 5);
+        paint(&mut terminal, &mut app, false)?;
+        assert_eq!(app.search_selection(), Some((2, 3)));
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "s");
+        assert_eq!(terminal.backend().buffer()[(0, 1)].bg, Color::Yellow);
+        Ok(())
+    }
+
+    #[test]
+    fn kitty_layout_resize_preserves_caption_search() -> Result<(), Infallible> {
+        use crate::{app::Action, terminal::ImageMode};
+
+        let source = "above\n\n![label](fine.png)\n\nbelow\n\ntail";
+        let mut app = App::new("test.md".into(), source.into());
+        let resources = TuiMarkdown.resources(source);
+        let doc = TuiMarkdown.render_document(source, 12, &resources);
+        let loaded = [Some(image::DynamicImage::new_rgb8(80, 128))];
+        let text = doc.search_text();
+        let mut terminal = Terminal::new(TestBackend::new(12, 5))?;
+        let mut mode = ImageMode::Kitty {
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let initial = Layout::with_images(&doc, 12, &loaded, mode);
+        let locations = anchors(&initial);
+        app.reflow(&locations, 4);
+        app.apply(Action::StartSearch(Direction::Forward), &locations, text);
+        for ch in "label".chars() {
+            app.apply(Action::Insert(ch), &locations, text);
+        }
+        app.apply(Action::Submit, &locations, text);
+        let offset = text.find("label").unwrap_or_default();
+        assert_eq!(initial.row_for_offset(offset), Some(10));
+        for (width, height, caption_row) in [(12, 5, 10), (6, 4, 6)] {
+            terminal.backend_mut().resize(width, height);
+            if width == 6 {
+                mode = ImageMode::Kitty {
+                    cell_width: 10,
+                    cell_height: 24,
+                };
+            }
+            let layout = Layout::with_images(&doc, width, &loaded, mode);
+            assert_eq!(layout.row_for_offset(offset), Some(caption_row));
+            terminal.draw(|frame| {
+                app.reflow(
+                    &anchors(&layout),
+                    usize::from(body_area(frame.area(), app.mode()).height),
+                );
+                draw(frame, &app, &layout, false);
+            })?;
+            let buffer = terminal.backend().buffer();
+            let y = caption_row.saturating_sub(app.top_row()) as u16;
+            assert_eq!(
+                (buffer[(0, y)].symbol(), buffer[(0, y)].bg),
+                ("l", Color::Yellow)
+            );
+            assert!(!buffer[(0, height - 1)].symbol().contains('\u{10eeee}'));
+            assert_eq!(app.search_selection(), Some((1, 1)));
+        }
         Ok(())
     }
 

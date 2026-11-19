@@ -1,6 +1,7 @@
 use std::{env, io, path::Path, process::ExitCode};
 
 mod app;
+mod images;
 mod lua;
 mod markdown;
 mod session;
@@ -32,5 +33,5 @@ fn run() -> io::Result<()> {
         io::Error::new(io::ErrorKind::InvalidInput, "file path is not valid UTF-8")
     })?);
     let document = session::read_document(path)?;
-    terminal::with_screen(|screen| session::run(screen, document))
+    terminal::with_screen(|screen, input| session::run(screen, input, document))
 }

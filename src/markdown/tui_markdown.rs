@@ -1,15 +1,33 @@
-use std::{borrow::Cow, path::Path};
+use std::{
+    borrow::Cow,
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
-use ratatui::text::{Line, Span, Text};
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span, Text},
+};
 
-use super::{MarkdownLink, MarkdownRenderer, RenderedMarkdown};
+use super::{
+    ImageLine, ImageReference, MarkdownLink, MarkdownRenderer, MarkdownResources, RenderedMarkdown,
+};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TuiMarkdown;
 
 impl MarkdownRenderer for TuiMarkdown {
-    fn render(&self, markdown: &str, width: u16) -> RenderedMarkdown {
+    fn resources(&self, markdown: &str) -> MarkdownResources {
+        extract_resources(markdown)
+    }
+
+    fn render_document(
+        &self,
+        markdown: &str,
+        width: u16,
+        resources: &MarkdownResources,
+    ) -> RenderedMarkdown {
         // ANSIを経由するコードハイライトに、入力のESC等を渡さない。
         let source = if markdown.chars().any(is_unsafe_control) {
             Cow::Owned(markdown.replace(is_unsafe_control, "�"))
@@ -18,9 +36,37 @@ impl MarkdownRenderer for TuiMarkdown {
         };
         // 自然幅の表を論理行として保持する。表セルをライブラリ側で再配置すると、
         // 幅に応じてテキストと順序が変わるため、他の論理行と同様にレイアウトで折り返す。
-        let options = ::tui_markdown::Options::default()
-            .image_fallback(::tui_markdown::ImageFallback::AltText);
-        let text = ::tui_markdown::from_str_with_options(&source, &options);
+        let mut image_lines = Vec::new();
+        let text = if resources.images.is_empty() {
+            ::tui_markdown::from_str(&source)
+        } else {
+            let sheet = ImagePositions {
+                next: std::sync::Arc::new(AtomicUsize::new(0)),
+                ordinals: resources.images.iter().map(|image| image.ordinal).collect(),
+            };
+            let options = ::tui_markdown::Options::new(sheet.clone());
+            let mut text = ::tui_markdown::from_str_with_options(&source, &options);
+            for (index, line) in text.lines.iter_mut().enumerate() {
+                if let Some(prefix) = line.spans.first().filter(|span| {
+                    span.style.add_modifier.contains(IMAGE_POSITION)
+                        && matches!(span.content.as_ref(), "[img]" | "[img] ")
+                }) {
+                    image_lines.push((index, prefix.content.len()));
+                }
+                for span in &mut line.spans {
+                    span.style.add_modifier.remove(IMAGE_POSITION);
+                }
+            }
+            if image_lines.len() != resources.images.len()
+                || sheet.next.load(Ordering::Relaxed) != resources.image_count
+            {
+                // adapter と描画側のイベント対応が崩れた場合は本文を従来どおり表示する。
+                image_lines.clear();
+                ::tui_markdown::from_str(&source)
+            } else {
+                text
+            }
+        };
         let lines = text.lines.into_iter().map(|line| {
             let spans = line.spans.into_iter().map(|span| {
                 Span::styled(
@@ -36,76 +82,164 @@ impl MarkdownRenderer for TuiMarkdown {
         });
         let mut owned = lines.collect::<Text<'static>>().style(text.style);
         owned.alignment = text.alignment;
-        RenderedMarkdown::new(owned, width)
+        let mut document = RenderedMarkdown::new(owned, width);
+        document.images = image_lines
+            .into_iter()
+            .zip(&resources.images)
+            .enumerate()
+            .map(|(image, ((line, prefix_bytes), reference))| ImageLine {
+                line,
+                image,
+                prefix_bytes,
+                has_alt: reference.has_alt,
+            })
+            .collect();
+        document
     }
+}
 
-    fn links(&self, markdown: &str) -> Vec<MarkdownLink> {
-        // 描画側のパーサーと同じ拡張を有効にする。
-        let options = Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_HEADING_ATTRIBUTES
-            | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-            | Options::ENABLE_SUPERSCRIPT
-            | Options::ENABLE_SUBSCRIPT
-            | Options::ENABLE_MATH
-            | Options::ENABLE_FOOTNOTES
-            | Options::ENABLE_DEFINITION_LIST
-            | Options::ENABLE_GFM
-            | Options::ENABLE_TABLES;
-        let mut links = Vec::new();
-        let mut active: Option<MarkdownLink> = None;
-        let mut image_depth = 0;
-        for event in Parser::new_ext(markdown, options) {
-            match event {
-                Event::Start(Tag::Image { .. }) => image_depth += 1,
-                Event::End(TagEnd::Image) => image_depth -= 1,
-                Event::Start(Tag::Link {
-                    link_type,
-                    dest_url,
-                    ..
-                }) if image_depth == 0
-                    && !matches!(link_type, LinkType::Autolink | LinkType::Email) =>
+// image_alt は各画像開始時に呼ばれる。本文や代替文字列を照合せず、
+// pulldown-cmark と描画側で同じ出現順を使って、対象画像の論理行だけに印を付ける。
+const IMAGE_POSITION: Modifier = Modifier::HIDDEN;
+
+#[derive(Clone)]
+struct ImagePositions {
+    next: std::sync::Arc<AtomicUsize>,
+    ordinals: std::sync::Arc<[usize]>,
+}
+
+impl ::tui_markdown::StyleSheet for ImagePositions {
+    fn image_alt(&self) -> Style {
+        let ordinal = self.next.fetch_add(1, Ordering::Relaxed);
+        let style = Style::new().add_modifier(Modifier::DIM | Modifier::ITALIC);
+        if self.ordinals.binary_search(&ordinal).is_ok() {
+            style.add_modifier(IMAGE_POSITION)
+        } else {
+            style
+        }
+    }
+}
+
+fn extract_resources(markdown: &str) -> MarkdownResources {
+    // 描画側のパーサーと同じ拡張を有効にする。
+    let options = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_HEADING_ATTRIBUTES
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_SUPERSCRIPT
+        | Options::ENABLE_SUBSCRIPT
+        | Options::ENABLE_MATH
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_DEFINITION_LIST
+        | Options::ENABLE_GFM
+        | Options::ENABLE_TABLES;
+    let mut resources = MarkdownResources::default();
+    let mut active: Option<MarkdownLink> = None;
+    let mut image_depth = 0;
+    let mut depth = 0;
+    let mut paragraph = None;
+    let mut candidate = None::<ImageReference>;
+    for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
+        if matches!(&event, Event::End(_)) {
+            depth -= 1;
+        }
+        match &event {
+            Event::Start(Tag::Paragraph) if depth == 0 => paragraph = Some(range.clone()),
+            Event::End(TagEnd::Paragraph) if depth == 0 => {
+                if let Some(image) = candidate.take() {
+                    resources.images.push(image);
+                }
+                paragraph = None;
+            }
+            Event::Start(Tag::Image { dest_url, .. }) if depth == 1 => {
+                if let Some(block) = &paragraph
+                    && markdown[block.start..range.start].trim_ascii().is_empty()
+                    && markdown[range.end..block.end].trim_ascii().is_empty()
+                    && let Some(target) = local_relative_target(dest_url)
+                    && !target.is_empty()
+                    && !target.contains(':')
                 {
-                    active = local_markdown_target(&dest_url).map(|target| MarkdownLink {
-                        label: String::new(),
-                        target,
+                    candidate = Some(ImageReference {
+                        ordinal: resources.image_count,
+                        target: target.replace('\\', "/"),
+                        has_alt: false,
                     });
                 }
-                Event::End(TagEnd::Link) if image_depth == 0 => {
-                    if let Some(mut link) = active.take() {
-                        let label = link.label.trim();
-                        link.label = if label.is_empty() {
-                            link.target.clone()
-                        } else {
-                            label.to_owned()
-                        };
-                        links.push(link);
-                    }
+            }
+            Event::Text(_)
+            | Event::Code(_)
+            | Event::InlineHtml(_)
+            | Event::InlineMath(_)
+            | Event::DisplayMath(_)
+            | Event::FootnoteReference(_)
+            | Event::SoftBreak
+            | Event::HardBreak
+            | Event::End(TagEnd::Image | TagEnd::Link)
+                if depth >= 2 =>
+            {
+                if let Some(image) = &mut candidate {
+                    image.has_alt = true;
                 }
-                event => {
-                    if let Some(MarkdownLink { label, .. }) = &mut active {
-                        match event {
-                            Event::Text(text) | Event::Code(text) | Event::InlineHtml(text) => {
-                                label.push_str(&text);
-                            }
-                            Event::SoftBreak | Event::HardBreak => label.push(' '),
-                            Event::InlineMath(math) => {
-                                label.push('$');
-                                label.push_str(&math);
-                                label.push('$');
-                            }
-                            Event::FootnoteReference(reference) => {
-                                label.push('[');
-                                label.push_str(&reference);
-                                label.push(']');
-                            }
-                            _ => {}
-                        }
-                    }
+            }
+            _ => {}
+        }
+        if matches!(&event, Event::Start(_)) {
+            depth += 1;
+        }
+        match event {
+            Event::Start(Tag::Image { .. }) => {
+                image_depth += 1;
+                resources.image_count += 1;
+            }
+            Event::End(TagEnd::Image) => image_depth -= 1,
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                ..
+            }) if image_depth == 0
+                && !matches!(link_type, LinkType::Autolink | LinkType::Email) =>
+            {
+                active = local_markdown_target(&dest_url).map(|target| MarkdownLink {
+                    label: String::new(),
+                    target,
+                });
+            }
+            Event::End(TagEnd::Link) if image_depth == 0 => {
+                if let Some(mut link) = active.take() {
+                    let label = link.label.trim();
+                    link.label = if label.is_empty() {
+                        link.target.clone()
+                    } else {
+                        label.to_owned()
+                    };
+                    resources.links.push(link);
+                }
+            }
+            event => {
+                if let Some(MarkdownLink { label, .. }) = &mut active {
+                    append_link_label(label, &event);
                 }
             }
         }
-        links
+    }
+    resources
+}
+
+fn append_link_label(label: &mut String, event: &Event<'_>) {
+    match event {
+        Event::Text(text) | Event::Code(text) | Event::InlineHtml(text) => label.push_str(text),
+        Event::SoftBreak | Event::HardBreak => label.push(' '),
+        Event::InlineMath(math) => {
+            label.push('$');
+            label.push_str(math);
+            label.push('$');
+        }
+        Event::FootnoteReference(reference) => {
+            label.push('[');
+            label.push_str(reference);
+            label.push(']');
+        }
+        _ => {}
     }
 }
 
@@ -114,7 +248,15 @@ fn is_unsafe_control(ch: char) -> bool {
 }
 
 fn local_markdown_target(target: &str) -> Option<String> {
-    // エンコードされた区切り文字はファイル名の一部として扱う。
+    let target = local_relative_target(target)?;
+    let file_name = target.rsplit(['/', '\\']).next().unwrap_or_default();
+    Path::new(file_name)
+        .extension()
+        .is_some_and(|extension| extension == "md")
+        .then(|| target.into_owned())
+}
+
+fn local_relative_target(target: &str) -> Option<Cow<'_, str>> {
     if target.contains(['#', '?']) {
         return None;
     }
@@ -131,11 +273,7 @@ fn local_markdown_target(target: &str) -> Option<String> {
     }) {
         return None;
     }
-    let file_name = target.rsplit(['/', '\\']).next().unwrap_or_default();
-    Path::new(file_name)
-        .extension()
-        .is_some_and(|extension| extension == "md")
-        .then(|| target.into_owned())
+    Some(target)
 }
 
 fn decode_percent_encoding(target: &str) -> Option<Cow<'_, str>> {
@@ -186,7 +324,7 @@ break][guide]
 
 [guide]: ../guide.md
 "#;
-        let links = TuiMarkdown.links(source);
+        let links = TuiMarkdown.resources(source).links;
         let entries: Vec<_> = links
             .iter()
             .map(|link| (link.label.as_str(), link.target.as_str()))
@@ -232,7 +370,7 @@ Math $[Equation](math.md)$
     [Indented](indented.md)
 "#;
         assert_eq!(
-            TuiMarkdown.links(source),
+            TuiMarkdown.resources(source).links,
             [MarkdownLink {
                 label: "Image label".to_owned(),
                 target: "image-guide.md".to_owned(),
@@ -254,7 +392,8 @@ Math $[Equation](math.md)$
 [guide]: ../%E6%97%A5%E6%9C%AC%2emd
 ";
         let targets: Vec<_> = TuiMarkdown
-            .links(source)
+            .resources(source)
+            .links
             .into_iter()
             .map(|link| link.target)
             .collect();
@@ -269,6 +408,57 @@ Math $[Equation](math.md)$
                 "100%.md",
                 "A+B.md",
             ]
+        );
+    }
+
+    #[test]
+    fn only_single_top_level_images_with_local_relative_targets_are_placed() {
+        let source = r"
+before ![same](inline.png)
+
+| Heading |
+| --- |
+| ![same](table.png) |
+
+> ![same](quote.png)
+
+![same](one.png) ![same](two.png)
+
+![same](https://example.test/web.png)
+
+![same](/absolute.png)
+
+![same](C:drive.png)
+
+![same](%5C%5Cserver/share/unc.png)
+
+![same][ref]
+
+![](empty-alt.png)
+
+[ref]: ../first%20image.png
+";
+        let resources = TuiMarkdown.resources(source);
+        let references: Vec<_> = resources
+            .images
+            .iter()
+            .map(|image| (image.target.as_str(), image.has_alt))
+            .collect();
+        assert_eq!(
+            references,
+            [("../first image.png", true), ("empty-alt.png", false)]
+        );
+        assert!(resources.links.is_empty());
+        let document = TuiMarkdown.render_document(source, 30, &resources);
+        let lines: Vec<_> = document
+            .images
+            .iter()
+            .map(|placement| document.text().lines[placement.line].to_string())
+            .collect();
+        assert_eq!(lines, ["[img] same", "[img] empty-alt.png"]);
+        assert_eq!(
+            document.search_text(),
+            TuiMarkdown.render(source, 30).search_text()
         );
     }
 

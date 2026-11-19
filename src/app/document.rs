@@ -3,6 +3,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::markdown::MarkdownResources;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_id() -> u64 {
@@ -14,7 +16,8 @@ pub struct Document {
     pub(super) name: String,
     pub(super) markdown: String,
     pub(super) links: Vec<DocumentLink>,
-    path: PathBuf,
+    pub(super) path: PathBuf,
+    pub(super) resources: MarkdownResources,
 }
 
 pub struct DocumentLink {
@@ -43,7 +46,13 @@ impl Document {
                 })
                 .collect(),
             path,
+            resources: MarkdownResources::default(),
         }
+    }
+
+    pub fn with_resources(mut self, resources: MarkdownResources) -> Self {
+        self.resources = resources;
+        self
     }
 
     pub(super) fn resolve_link(&self, id: u64) -> Result<PathBuf, String> {
