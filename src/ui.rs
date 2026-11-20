@@ -176,7 +176,7 @@ const HELP: &str = "Help (Esc to close)\n\
     n/N  Next/reverse match   :noh / :nohlsearch Hide highlights\n\
     Ctrl-o  Return from a link jump\n\
     Backspace Edit   Enter Confirm   Esc Cancel\n\
-    F1 / :help Help   q / :q / :quit Quit";
+    F1 / :help Help   :q / :quit Quit";
 
 #[cfg(test)]
 mod tests {

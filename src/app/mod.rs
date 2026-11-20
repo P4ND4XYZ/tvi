@@ -45,7 +45,6 @@ pub enum Action {
     RepeatSearch { reverse: bool },
     JumpBack,
     Help,
-    Quit,
 }
 
 pub struct App {
@@ -326,7 +325,6 @@ impl App {
             }
             (Mode::Normal, Action::JumpBack) => self.jump_back(),
             (Mode::Normal, Action::Help) => self.help = true,
-            (Mode::Normal, Action::Quit) => self.quit = true,
             (Mode::Command | Mode::Search(_), Action::Insert(ch)) if !ch.is_control() => {
                 self.prompt.push(ch);
             }

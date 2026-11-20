@@ -129,7 +129,6 @@ const NORMAL_BINDINGS: &[(&[Chord], Action)] = &[
         &[Chord::plain(Char('N'))],
         Action::RepeatSearch { reverse: true },
     ),
-    (&[Chord::plain(Char('q'))], Action::Quit),
     (&[Chord::plain(F(1))], Action::Help),
 ];
 
@@ -588,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_characters_are_not_normal_bindings_and_control_c_is_unbound() {
+    fn q_is_only_prompt_text_and_control_c_is_unbound() {
         let mut input = Input::default();
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
@@ -608,7 +607,7 @@ mod tests {
             Some(Action::Insert('q'))
         );
         assert_eq!(input.action(q, Mode::Normal, true), None);
-        assert_eq!(input.action(q, Mode::Normal, false), Some(Action::Quit));
+        assert_eq!(input.action(q, Mode::Normal, false), None);
     }
 
     #[test]
