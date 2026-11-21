@@ -203,6 +203,7 @@ impl App {
         &self.document.name
     }
 
+    #[cfg(test)]
     pub fn markdown(&self) -> &str {
         &self.document.markdown
     }
@@ -211,8 +212,39 @@ impl App {
         &self.document.path
     }
 
+    #[cfg(test)]
     pub fn markdown_resources(&self) -> &MarkdownResources {
         &self.document.resources
+    }
+
+    pub(crate) fn display_input(&mut self) -> (&Path, &str, &mut MarkdownResources) {
+        self.document.display_input()
+    }
+
+    pub(crate) fn restore_display_positions(
+        &mut self,
+        text: &str,
+        expansions: &[Range<usize>],
+        uncertain: bool,
+    ) {
+        if expansions.is_empty() && !uncertain {
+            return;
+        }
+        // Each restored block replaces one empty line. Its new byte range is the
+        // number of bytes added, excluding the newline that already followed it.
+        let remap = |offset: usize| {
+            let mut added = 0;
+            for range in expansions {
+                if offset <= range.start - added {
+                    break;
+                }
+                added += range.len();
+            }
+            offset + added
+        };
+        let anchor = &mut self.viewport.anchor;
+        anchor.byte = remap(anchor.byte);
+        self.search.refresh(text, remap, anchor.byte);
     }
 
     pub fn document_id(&self) -> u64 {
@@ -228,6 +260,11 @@ impl App {
     }
 
     pub fn open_document(&mut self, document: Document) {
+        // A page left before its first draw (e.g. by Lua) must not convert on return.
+        self.document
+            .resources
+            .successful_diagrams
+            .get_or_insert_default();
         self.history.push(HistoryEntry {
             document: std::mem::replace(&mut self.document, document),
             search: std::mem::take(&mut self.search),

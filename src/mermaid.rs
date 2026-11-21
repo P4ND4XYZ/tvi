@@ -52,9 +52,14 @@ pub enum Stage {
 pub enum Failure {
     Unavailable,
     Prepare(io::ErrorKind),
-    Launch(io::ErrorKind),
+    Launch {
+        kind: io::ErrorKind,
+        os_code: Option<i32>,
+    },
     Wait(io::ErrorKind),
-    Exit { code: Option<i32> },
+    Exit {
+        code: Option<i32>,
+    },
     Timeout(TimeoutScope),
     MissingOutput,
     ReadOutput(io::ErrorKind),
@@ -66,7 +71,7 @@ impl Failure {
         match self {
             Self::Unavailable => Stage::Discovery,
             Self::Prepare(_) => Stage::Prepare,
-            Self::Launch(_) => Stage::Launch,
+            Self::Launch { .. } => Stage::Launch,
             Self::Wait(_) | Self::Exit { .. } | Self::Timeout(_) => Stage::Execute,
             Self::MissingOutput | Self::ReadOutput(_) | Self::InvalidPng => Stage::Output,
         }
@@ -114,6 +119,7 @@ impl Mermaid {
         }
     }
 
+    #[cfg(test)]
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
@@ -168,7 +174,32 @@ impl Deadline {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "the core is also compiled standalone for integration tests"
+)]
 impl Document<'_> {
+    pub(crate) fn available(&self) -> bool {
+        self.executable.is_some()
+    }
+
+    /// Read-only history lookup; never launches the renderer or modifies the cache.
+    pub(crate) fn cached_png(&self, source: &str) -> Result<Option<Vec<u8>>, CacheIssue> {
+        if !self.available() {
+            return Ok(None);
+        }
+        self.options.cache.as_ref().map_or(Ok(None), |store| {
+            store.lookup(&cache::key(source.as_bytes()))
+        })
+    }
+
+    pub(crate) fn timeout_limit(&self, scope: TimeoutScope) -> Duration {
+        match scope {
+            TimeoutScope::Diagram => self.options.limits.per_diagram,
+            TimeoutScope::Document => self.options.limits.per_document,
+        }
+    }
+
     /// Decode/validate the exact PNG bytes eligible for caching, returning an
     /// owned value. Synchronous filesystem and decode operations cannot be
     /// interrupted; their results are checked against the deadline afterward.
@@ -198,7 +229,7 @@ impl Document<'_> {
         let result = deadline
             .check()
             .and_then(|()| self.convert_inner(source, &mut decode, &deadline, &mut cache));
-        if matches!(result, Err(Failure::Launch(_))) {
+        if matches!(result, Err(Failure::Launch { .. })) {
             self.executable = None;
         }
         // This check also covers dropping the private workspace.

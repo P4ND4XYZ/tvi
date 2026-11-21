@@ -29,6 +29,19 @@ impl MarkdownRenderer for TuiMarkdown {
         width: u16,
         resources: &MarkdownResources,
     ) -> RenderedMarkdown {
+        self.render_with_diagrams(markdown, width, resources, &[])
+    }
+}
+
+impl TuiMarkdown {
+    // Diagram entries identify a block and either its image slot or a restored code block.
+    pub(crate) fn render_with_diagrams(
+        &self,
+        markdown: &str,
+        width: u16,
+        resources: &MarkdownResources,
+        diagrams: &[(usize, Option<usize>)],
+    ) -> RenderedMarkdown {
         // ANSIを経由するコードハイライトに、入力のESC等を渡さない。
         let source = if markdown.chars().any(is_unsafe_control) {
             Cow::Owned(markdown.replace(is_unsafe_control, "�"))
@@ -37,12 +50,24 @@ impl MarkdownRenderer for TuiMarkdown {
         };
         // 表の自然幅を検索用に保ち、折り返しに必要な罫線の位置だけを渡す。
         let mut image_lines = Vec::new();
+        let mut marker = String::from("\u{e000}tvi-diagram");
+        while source.contains(&marker) {
+            marker.push('\u{e000}');
+        }
         let sheet = PositionMarkers {
             next: std::sync::Arc::new(AtomicUsize::new(0)),
             ordinals: resources.images.iter().map(|image| image.ordinal).collect(),
+            fences: std::sync::Arc::new(AtomicUsize::new(0)),
+            diagrams: diagrams.into(),
+            marker: marker.as_str().into(),
         };
         let options = ::tui_markdown::Options::new(sheet.clone());
         let mut text = ::tui_markdown::from_str_with_options(&source, &options);
+        let Some((diagram_lines, expanded_lines)) = place_diagrams(&mut text, &marker, diagrams)
+        else {
+            // ライブラリ側のフェンス位置を確認できなければ、元のコードを描画する。
+            return self.render_document(markdown, width, resources);
+        };
         if !resources.images.is_empty() {
             for (index, line) in text.lines.iter_mut().enumerate() {
                 if let Some(prefix) = line.spans.first().filter(|span| {
@@ -99,6 +124,13 @@ impl MarkdownRenderer for TuiMarkdown {
         owned.alignment = text.alignment;
         let mut document = RenderedMarkdown::new(owned, width);
         document.tables = tables;
+        document.expanded_diagrams = expanded_lines
+            .into_iter()
+            .map(|lines| {
+                document.line_ranges()[*lines.start()].start
+                    ..document.line_ranges()[*lines.end()].end
+            })
+            .collect();
         document.images = image_lines
             .into_iter()
             .zip(&resources.images)
@@ -110,8 +142,65 @@ impl MarkdownRenderer for TuiMarkdown {
                 has_alt: reference.has_alt,
             })
             .collect();
+        document.images.extend(diagram_lines);
+        document.images.sort_unstable_by_key(|image| image.line);
         document
     }
+}
+
+// Replace only complete, marked logical blocks before calculating search offsets.
+fn place_diagrams(
+    text: &mut Text<'_>,
+    marker: &str,
+    diagrams: &[(usize, Option<usize>)],
+) -> Option<(Vec<ImageLine>, Vec<std::ops::RangeInclusive<usize>>)> {
+    if diagrams.is_empty() {
+        return Some((Vec::new(), Vec::new()));
+    }
+    let mut start = None;
+    let mut blocks = Vec::new();
+    for (index, line) in text.lines.iter().enumerate() {
+        if let [span] = line.spans.as_slice()
+            && let Some(suffix) = span.content.strip_prefix(marker)
+        {
+            match suffix {
+                "mermaid" if start.is_none() => start = Some(index),
+                "" => blocks.push(start.take()?..=index),
+                _ => return None,
+            }
+        }
+    }
+    if start.is_some() || blocks.len() != diagrams.len() {
+        return None;
+    }
+    let mut source = std::mem::take(&mut text.lines).into_iter();
+    let mut consumed = 0;
+    let mut placements = Vec::new();
+    let mut expansions = Vec::new();
+    for (block, &(_, image)) in blocks.into_iter().zip(diagrams) {
+        text.lines
+            .extend(source.by_ref().take(block.start() - consumed));
+        let start = text.lines.len();
+        let count = block.end() - block.start() + 1;
+        if let Some(image) = image {
+            source.by_ref().take(count).for_each(drop);
+            text.lines.push(Line::default());
+            placements.push(ImageLine {
+                line: start,
+                image,
+                prefix_bytes: 0,
+                has_alt: false,
+            });
+        } else {
+            text.lines.extend(source.by_ref().take(count));
+            text.lines[start].spans[0].content = Cow::Borrowed("```mermaid");
+            text.lines[start + count - 1].spans[0].content = Cow::Borrowed("```");
+            expansions.push(start..=start + count - 1);
+        }
+        consumed = block.end() + 1;
+    }
+    text.lines.extend(source);
+    Some((placements, expansions))
 }
 
 // image_alt は各画像開始時に呼ばれる。本文や代替文字列を照合せず、
@@ -122,9 +211,26 @@ const IMAGE_POSITION: Modifier = Modifier::HIDDEN;
 struct PositionMarkers {
     next: std::sync::Arc<AtomicUsize>,
     ordinals: std::sync::Arc<[usize]>,
+    fences: std::sync::Arc<AtomicUsize>,
+    diagrams: std::sync::Arc<[(usize, Option<usize>)]>,
+    marker: std::sync::Arc<str>,
 }
 
 impl ::tui_markdown::StyleSheet for PositionMarkers {
+    fn code_block_fence(&self) -> &str {
+        // tui-markdown calls this for the opening and closing line of each block.
+        let ordinal = self.fences.fetch_add(1, Ordering::Relaxed) / 2;
+        if self
+            .diagrams
+            .binary_search_by_key(&ordinal, |&(block, _)| block)
+            .is_ok()
+        {
+            &self.marker
+        } else {
+            "```"
+        }
+    }
+
     fn table_border(&self) -> Style {
         ::tui_markdown::StyleSheet::table_border(&::tui_markdown::DefaultStyleSheet)
             .add_modifier(BORDER_MARKER)
@@ -141,7 +247,7 @@ impl ::tui_markdown::StyleSheet for PositionMarkers {
     }
 }
 
-fn parser(markdown: &str) -> Parser<'_> {
+pub(super) fn parser(markdown: &str) -> Parser<'_> {
     // 描画側のパーサーと同じ拡張を有効にする。
     let options = Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS

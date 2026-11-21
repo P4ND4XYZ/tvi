@@ -40,6 +40,28 @@ impl Search {
         self.highlights = self.selected.is_some();
     }
 
+    pub(super) fn refresh(
+        &mut self,
+        text: &str,
+        remap: impl FnOnce(usize) -> usize,
+        anchor: usize,
+    ) {
+        if self.query.is_empty() {
+            return;
+        }
+        let target = self.current().map_or(anchor, |hit| remap(hit.start));
+        self.matches = text
+            .match_indices(&self.query)
+            .map(|(start, matched)| start..start + matched.len())
+            .collect();
+        let next = self.matches.partition_point(|hit| hit.start < target);
+        self.selected = [next.checked_sub(1), Some(next)]
+            .into_iter()
+            .flatten()
+            .filter(|index| *index < self.matches.len())
+            .min_by_key(|&index| self.matches[index].start.abs_diff(target));
+    }
+
     pub fn step(&mut self, reverse: bool) {
         if let (Some(index), Some(direction)) = (self.selected, self.direction) {
             let len = self.matches.len();

@@ -6,7 +6,6 @@ use crossterm::event::KeyEvent;
 
 use crate::{
     app::{App, Document, ViewRows},
-    images,
     logging::{self, Level},
     lua::{Host, LuaLink, Runtime},
     markdown::{MarkdownRenderer, tui_markdown::TuiMarkdown},
@@ -19,11 +18,19 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use crate::images;
+
+mod mermaid;
+
 const BODY_VIEW: u64 = 1;
 
 struct Session {
     app: App,
     floats: Floats,
+    image_mode: ImageMode,
+    renderer: Option<crate::mermaid::Mermaid>,
+    prepared: Option<(u64, Rc<mermaid::PreparedDisplay>)>,
 }
 
 #[derive(Default)]
@@ -33,11 +40,40 @@ struct InputQueue {
 }
 
 impl Session {
+    #[cfg(test)]
     fn new(document: Document) -> Self {
+        Self::with_images(document, ImageMode::Text, None)
+    }
+
+    fn with_images(
+        document: Document,
+        image_mode: ImageMode,
+        renderer: Option<crate::mermaid::Mermaid>,
+    ) -> Self {
         Self {
             app: App::from_document(document),
             floats: Floats::default(),
+            image_mode,
+            renderer,
+            prepared: None,
         }
+    }
+
+    fn display(&mut self) -> Rc<mermaid::PreparedDisplay> {
+        let id = self.app.document_id();
+        if let Some((current, prepared)) = &self.prepared
+            && *current == id
+        {
+            return Rc::clone(prepared);
+        }
+        self.prepared = None;
+        let prepared = Rc::new(mermaid::prepare(
+            &mut self.app,
+            self.image_mode,
+            self.renderer.as_ref(),
+        ));
+        self.prepared = Some((id, Rc::clone(&prepared)));
+        prepared
     }
 
     fn restore_after_init_error(&mut self, error: &str) {
@@ -192,7 +228,9 @@ impl Host for RefCell<Session> {
                 ReadDocumentError::Decode(error) => format!("not valid UTF-8: {error}"),
             }
         })?;
-        self.borrow_mut().app.open_document(document);
+        let mut session = self.borrow_mut();
+        session.prepared = None;
+        session.app.open_document(document);
         Ok(())
     }
 
@@ -223,7 +261,13 @@ pub fn run(
     terminal_input: &mut terminal::Input,
     document: Document,
 ) -> io::Result<()> {
-    let session = Rc::new(RefCell::new(Session::new(document)));
+    let mode = terminal_input.image_mode();
+    let session = Rc::new(RefCell::new(Session::with_images(
+        document,
+        mode,
+        (mode != ImageMode::Text).then(crate::mermaid::Mermaid::from_env),
+    )));
+    drop(session.borrow_mut().display());
     let (runtime, error) = Runtime::load(session.clone());
     if let Some(error) = error {
         session.borrow_mut().restore_after_init_error(&error);
@@ -244,24 +288,14 @@ fn run_document(
     keys: &mut InputQueue,
 ) -> io::Result<()> {
     let mut image_mode = terminal_input.image_mode();
-    let (document_id, document, images) = {
-        let session = session.borrow();
-        let app = &session.app;
-        let width = terminal::check(screen.size(), "size", Some(image_mode), "exit")?.width;
-        let resources = app.markdown_resources();
-        let images = if !resources.images.is_empty() && image_mode != ImageMode::Text {
-            images::load(app.document_path(), &resources.images)
-        } else {
-            Vec::new()
-        };
-        (
-            app.document_id(),
-            TuiMarkdown.render_document(app.markdown(), width, resources),
-            images,
-        )
+    let mut width = terminal::check(screen.size(), "size", Some(image_mode), "exit")?.width;
+    let (document_id, prepared) = {
+        let mut session = session.borrow_mut();
+        (session.app.document_id(), session.display())
     };
-    let mut width = document.width();
-    let mut layout = Layout::with_images(&document, width, &images, image_mode);
+    let document = &prepared.document;
+    let images = &prepared.images;
+    let mut layout = Layout::with_images(document, width, images, image_mode);
     let mut previous_size = None;
     let result = (|| loop {
         let size = terminal::check(screen.size(), "size", Some(image_mode), "exit")?;
@@ -281,14 +315,14 @@ fn run_document(
                 width = area.width;
                 image_mode = mode;
                 retired.extend(layout.transmitted_ids());
-                layout = Layout::with_images(&document, width, &images, image_mode);
+                layout = Layout::with_images(document, width, images, image_mode);
             }
             let mut session = session.borrow_mut();
-            if session.app.mode() == crate::app::Mode::Normal
-                && session.app.notice().is_none()
-                && logging::take_failure_notice()
-            {
-                session.app.set_notice("ログを保存できません".into());
+            if session.app.mode() == crate::app::Mode::Normal && session.app.notice().is_none() {
+                mermaid::show_notice(&mut session.app, &prepared);
+                if session.app.notice().is_none() && logging::take_failure_notice() {
+                    session.app.set_notice("ログを保存できません".into());
+                }
             }
             let body = ui::body_area(area, session.app.mode());
             session.app.reflow(&layout, usize::from(body.height));
@@ -468,7 +502,11 @@ mod tests {
         let read = || {
             let session = session.borrow();
             let app = &session.app;
-            images::load(app.document_path(), &app.markdown_resources().images)
+            images::load(
+                app.document_path(),
+                &app.markdown_resources().images,
+                &mut images::Budget::default(),
+            )
         };
         assert_eq!(
             read().iter().map(Option::is_some).collect::<Vec<_>>(),
@@ -569,7 +607,11 @@ error("startup failed")
 
             let session_ref = session.borrow();
             let app = &session_ref.app;
-            let images = images::load(app.document_path(), &app.markdown_resources().images);
+            let images = images::load(
+                app.document_path(),
+                &app.markdown_resources().images,
+                &mut images::Budget::default(),
+            );
             assert_eq!(images.len(), 1);
             assert!(images[0].is_none());
             drop(session_ref);

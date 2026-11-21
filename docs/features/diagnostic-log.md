@@ -16,7 +16,7 @@
 - ログは最初に記録するときに作成し、終了後も保持します。文書の隣やTUI表示中の標準エラーにはログを書きません。
 - UTCの日付が変わって最初に記録するとき、または次の記録で1ファイルの上限（1 MiB）を超えるときに、新しいファイルに切り替えます。起動や終了だけでは切り替えません。
 - 書き込み中の1本と過去5世代を保持します（合計最大6 MiB）。切り替え時に古い世代から削除します。保持単位は日数ではなくファイル数です。
-- 保存や切り替えに失敗しても閲覧を続け、状態欄に「ログを保存できません」と1回の起動につき一度だけ通知します。複数のtviが同時に動いても、ログの書き込み待ちで閲覧を止めません。
+- 保存や切り替えに失敗しても閲覧を続け、状態欄に「ログを保存できません」と1回の起動につき一度だけ通知します。複数のtviが同時に動いても、ログの書き込み待ちで閲覧を止めません。記録待ちの上限は64件で、空きがなければ記録を見送ります。終了時の待機は最大150ミリ秒で、未保存の記録が残ることがあります。
 
 ## 記録レベルの指定
 
@@ -41,7 +41,7 @@ TVI_LOG=debug tvi README.md
 UTF-8のJSON Lines（1行に1件のJSON）で保存します。全レコードに `ts`（UTCの日時、ミリ秒付き）、`level`（`ERROR` / `WARN` / `DEBUG`）、`event`（イベント名）、`pid`（プロセスID）を付けます。該当しない項目は省略します。文書名や設定ファイル名はファイル名だけとし、`line` はそのファイルの行番号（1始まり）です。
 
 ```json
-{"ts":"2026-08-24T09:41:23.184Z","level":"WARN","event":"mermaid.convert_failed","pid":1234,"document":"architecture.md","line":42,"stage":"convert","reason":"nonzero_exit","exit_code":1,"diagnostic":"syntax_error","elapsed_ms":812,"fallback":"code"}
+{"ts":"2026-08-24T09:41:23.184Z","level":"WARN","event":"mermaid.convert_failed","pid":1234,"document":"architecture.md","line":42,"stage":"convert","reason":"nonzero_exit","exit_code":1,"elapsed_ms":812,"fallback":"code"}
 ```
 
 1件の上限は4 KiBです。長い項目は短縮し、有効なJSONを1行で残します。Markdown・Mermaidの本文、検索語、入力キー、環境変数の値、絶対パス、外部コマンドの生の出力やLuaの未加工のエラー文字列は、デバッグ時も保存しません。
@@ -51,9 +51,9 @@ UTF-8のJSON Lines（1行に1件のJSON）で保存します。全レコード�
 | イベント | 記録する条件と内容（共通項目以外） |
 |---|---|
 | `document.open_failed` | 起動時またはリンク移動時に開けなかったとき。`document`、`trigger`（例：`startup` / `link`）、`stage` と `reason`（例：`read` / `not_found`、`decode` / `invalid_utf8`）。 |
-| `image.load_failed` | ローカル画像を読み込めなかったとき。`document`、`image_index`（文書内の出現番号）、`stage`、`reason`（例：ファイルなし、非対応形式、破損、サイズ上限）。再描画では繰り返しません。 |
+| `image.load_failed` | ローカル画像を読み込めなかったとき。`document`、`image_index`（元のMarkdown上の出現番号。生成した図は数えない）、`stage`、`reason`（例：ファイルなし、非対応形式、破損、サイズ上限）。再描画では繰り返しません。 |
 | `mermaid.launch_failed` | `mmdc` を検出したが起動できなかったとき。`document`、`reason`（例：`permission_denied`）、取得できた場合は `os_code`、`fallback: "code"`。文書を開く操作につき1件にまとめます。 |
-| `mermaid.convert_failed` | 変換の異常終了や、出力PNGの欠落・破損・サイズ超過。`document`、ブロックの開始 `line`、`stage`（例：`convert` / `validate_png`）、`reason`、`elapsed_ms`、`fallback: "code"`。異常終了時は取得できた `exit_code` を、原因を識別できた場合は `diagnostic`（例：`syntax_error`、ブラウザー起動失敗）を記録します。 |
+| `mermaid.convert_failed` | 変換の異常終了や、出力PNGの欠落・破損・サイズ超過。`document`、ブロックの開始 `line`、`stage`（例：`convert` / `validate_png`）、`reason`、`elapsed_ms`、`fallback: "code"`。異常終了時は取得できた `exit_code` を、外部コマンドの標準出力・標準エラーは破棄するため、生の診断内容は記録しません。 |
 | `mermaid.timeout` | 変換の時間上限に達したとき。`document`、`scope`（`diagram` / `document`）、`limit_ms`。図単位ならブロックの開始 `line`、文書全体なら未変換件数 `remaining`。 |
 | `mermaid.cache_failed` | キャッシュの読み込み・検証・保存・古いPNGの削除に失敗したとき。`operation`、`reason`、`action`（例：`regenerate` / `display_without_cache`）。通常のキャッシュミスや容量調整は記録しません。 |
 | `lua.failed` | Lua設定の読み込みやコールバックが失敗したとき。特定できた `source` と `line`、`stage`（設定・キーマップ・フロート）、`reason`（例：`syntax_error`）、`action`（例：`use_defaults`）。 |

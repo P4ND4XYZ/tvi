@@ -5,6 +5,7 @@ mod images;
 mod logging;
 mod lua;
 mod markdown;
+mod mermaid;
 mod session;
 mod terminal;
 mod ui;

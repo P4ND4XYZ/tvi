@@ -68,8 +68,10 @@ pub(super) fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut running =
-        platform::Running::spawn(&mut command).map_err(|error| Failure::Launch(error.kind()))?;
+    let mut running = platform::Running::spawn(&mut command).map_err(|error| Failure::Launch {
+        kind: error.kind(),
+        os_code: error.raw_os_error(),
+    })?;
 
     loop {
         let remaining = run_budget.saturating_sub(started.elapsed());

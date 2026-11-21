@@ -55,6 +55,10 @@ impl Document {
         self
     }
 
+    pub(super) fn display_input(&mut self) -> (&Path, &str, &mut MarkdownResources) {
+        (&self.path, &self.markdown, &mut self.resources)
+    }
+
     pub(super) fn resolve_link(&self, id: u64) -> Result<PathBuf, String> {
         let link = self
             .links

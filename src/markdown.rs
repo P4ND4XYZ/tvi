@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use ratatui::text::Text;
 
+pub(crate) mod mermaid;
 mod table;
 pub mod tui_markdown;
 
@@ -32,6 +33,8 @@ pub struct MarkdownResources {
     pub links: Vec<MarkdownLink>,
     pub images: Vec<ImageReference>,
     pub image_count: usize,
+    // None: newly opened. Some: only these block ordinals may be restored from cache.
+    pub(crate) successful_diagrams: Option<Vec<usize>>,
 }
 
 /// すべての画像開始イベントを数えた文書内通番。
@@ -58,13 +61,15 @@ pub struct RenderedMarkdown {
     line_ranges: Vec<Range<usize>>,
     pub images: Vec<ImageLine>,
     pub(crate) tables: Vec<Table>,
+    pub(crate) expanded_diagrams: Vec<Range<usize>>,
+    #[cfg(test)]
     width: u16,
 }
 
 impl RenderedMarkdown {
     /// 各 span は行内テキストとし、タブ・改行・制御文字は adapter で正規化する。
     #[must_use]
-    pub fn new(text: Text<'static>, width: u16) -> Self {
+    pub fn new(text: Text<'static>, _width: u16) -> Self {
         let mut search_text = String::new();
         let mut line_ranges = Vec::with_capacity(text.lines.len());
         for (index, line) in text.lines.iter().enumerate() {
@@ -83,7 +88,9 @@ impl RenderedMarkdown {
             line_ranges,
             images: Vec::new(),
             tables: Vec::new(),
-            width,
+            expanded_diagrams: Vec::new(),
+            #[cfg(test)]
+            width: _width,
         }
     }
 
@@ -102,6 +109,7 @@ impl RenderedMarkdown {
         &self.line_ranges
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn width(&self) -> u16 {
         self.width

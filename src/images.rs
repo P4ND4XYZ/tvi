@@ -16,25 +16,58 @@ const MAX_DIMENSION: u32 = 4096;
 const MAX_PIXELS: u64 = 4 * 1024 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
-pub fn load(document: &Path, references: &[ImageReference]) -> Vec<Option<DynamicImage>> {
+pub(crate) struct Budget(u64);
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self(MAX_DOCUMENT_BYTES)
+    }
+}
+
+impl Budget {
+    pub(crate) fn png(&self, bytes: &[u8]) -> Option<DynamicImage> {
+        self.cached_png(bytes).ok().flatten()
+    }
+
+    // A valid image that exceeds the remaining document budget is not corrupt.
+    pub(crate) fn cached_png(&self, bytes: &[u8]) -> Result<Option<DynamicImage>, ()> {
+        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err(());
+        }
+        match decode_bytes(bytes, ImageFormat::Png, self.0) {
+            Ok(image) => Ok(Some(image)),
+            Err(("limits", "document_budget")) => Ok(None),
+            Err(_) => Err(()),
+        }
+    }
+
+    pub(crate) fn charge(&mut self, image: &DynamicImage) {
+        self.0 -= image.as_bytes().len() as u64;
+    }
+}
+
+pub fn load(
+    document: &Path,
+    references: &[ImageReference],
+    budget: &mut Budget,
+) -> Vec<Option<DynamicImage>> {
     let parent = document.parent().unwrap_or_else(|| Path::new(""));
-    let mut budget = MAX_DOCUMENT_BYTES;
     references
         .iter()
         .map(|reference| {
             let target = Path::new(&reference.target);
-            let result = if budget == 0 {
+            let result = if budget.0 == 0 {
                 Err(("limits", "document_budget"))
             } else if target.has_root()
                 || matches!(target.components().next(), Some(Component::Prefix(_)))
             {
                 Err(("resolve", "non_relative_path"))
             } else {
-                decode(&parent.join(target), budget)
+                decode(&parent.join(target), budget.0)
             };
             match result {
                 Ok(image) => {
-                    budget -= image.as_bytes().len() as u64;
+                    budget.charge(&image);
                     Some(image)
                 }
                 Err((stage, reason)) => {
@@ -83,8 +116,19 @@ fn decode(path: &Path, budget: u64) -> Result<DynamicImage, (&'static str, &'sta
     if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
         return Err(("format", "unsupported_format"));
     }
+    decode_bytes(&bytes, format, budget)
+}
+
+fn decode_bytes(
+    bytes: &[u8],
+    format: ImageFormat,
+    budget: u64,
+) -> Result<DynamicImage, (&'static str, &'static str)> {
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(("limits", "file_size"));
+    }
     let reader = || {
-        let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
+        let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
         let mut limits = Limits::default();
         limits.max_image_width = Some(MAX_DIMENSION);
         limits.max_image_height = Some(MAX_DIMENSION);
@@ -97,13 +141,11 @@ fn decode(path: &Path, budget: u64) -> Result<DynamicImage, (&'static str, &'sta
         .map_err(|error| ("dimensions", decode_reason(&error)))?;
     let pixels = u64::from(width) * u64::from(height);
     // PNG RGBA16 is the largest supported decoded pixel (eight bytes).
-    if pixels == 0
-        || width > MAX_DIMENSION
-        || height > MAX_DIMENSION
-        || pixels > MAX_PIXELS
-        || pixels * 8 > budget
-    {
+    if pixels == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION || pixels > MAX_PIXELS {
         return Err(("limits", "image_size_or_budget"));
+    }
+    if pixels * 8 > budget {
+        return Err(("limits", "document_budget"));
     }
     reader()
         .decode()
