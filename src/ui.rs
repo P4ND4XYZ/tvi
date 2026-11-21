@@ -174,7 +174,7 @@ const HELP: &str = "Help (Esc to close)\n\
     Ctrl-d/u  Half page   Ctrl-f/b Page   PgDn/PgUp Page\n\
     gg/G  Start/end   : Command   / ? Search forward/backward\n\
     n/N  Next/reverse match   :noh / :nohlsearch Hide highlights\n\
-    Ctrl-o  Return from a link jump\n\
+    ff  Find Markdown files   Ctrl-o  Return from a file jump\n\
     Backspace Edit   Enter Confirm   Esc Cancel\n\
     F1 / :help Help   :q / :quit Quit";
 

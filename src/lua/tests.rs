@@ -8,7 +8,7 @@ use super::*;
 struct TestHost {
     view: Cell<u64>,
     floats: RefCell<Floats>,
-    opened_links: RefCell<Vec<(u64, u64)>>,
+    opened_files: RefCell<Vec<(u64, PathBuf)>>,
 }
 
 impl Host for TestHost {
@@ -16,12 +16,25 @@ impl Host for TestHost {
         Ok(self.view.get())
     }
 
+    fn notify(&self, _message: &str) {}
+
+    fn project_root(&self, _view: u64, _markers: &[String]) -> Result<PathBuf, String> {
+        Err("no document".into())
+    }
+
     fn links(&self, _view: u64) -> Result<Vec<LuaLink>, String> {
         Ok(Vec::new())
     }
 
-    fn open_link(&self, view: u64, id: u64) -> Result<(), String> {
-        self.opened_links.borrow_mut().push((view, id));
+    fn resolve_link(&self, view: u64, id: u64) -> Result<PathBuf, String> {
+        match (view, id) {
+            (0, 1) => Ok(std::env::temp_dir().join("resolved.md")),
+            _ => Err("unknown link".into()),
+        }
+    }
+
+    fn open_file(&self, view: u64, path: &Path) -> Result<(), String> {
+        self.opened_files.borrow_mut().push((view, path.to_owned()));
         Ok(())
     }
 
@@ -89,7 +102,8 @@ fn config_relative_module_can_register_a_mapping_that_uses_a_captured_view()
         r#"
         local view = tvi.ui.current_view()
         return function()
-            assert(view:open_link(1))
+            local path = assert(view:resolve_link(1))
+            assert(view:open_file(path))
         end
         "#,
     )?;
@@ -103,8 +117,11 @@ fn config_relative_module_can_register_a_mapping_that_uses_a_captured_view()
     let (runtime, diagnostic) = Runtime::load_from(host.clone(), Some(init));
     assert_eq!(diagnostic, None);
     host.view.set(17);
-    runtime.run_mapping(0)?;
-    assert_eq!(&*host.opened_links.borrow(), &[(0, 1)]);
+    runtime.run_mapping(1)?;
+    assert_eq!(
+        &*host.opened_files.borrow(),
+        &[(0, std::env::temp_dir().join("resolved.md"))]
+    );
     Ok(())
 }
 
@@ -128,7 +145,7 @@ fn broken_config_closes_its_float_and_discards_partial_mappings()
     assert!(diagnostic.contains("built-in mapping"));
     assert_eq!(host.floats.borrow().active(), None);
     assert_eq!(
-        runtime.run_mapping(0).err().as_deref(),
+        runtime.run_mapping(1).err().as_deref(),
         Some("key mapping has expired")
     );
     Ok(())
@@ -152,7 +169,7 @@ fn startup_and_callback_diagnostics_show_the_reason_before_source_details()
     assert_eq!(diagnostic, None);
     assert_eq!(
         runtime
-            .run_mapping(0)
+            .run_mapping(1)
             .err()
             .as_deref()
             .and_then(|text| text.lines().next()),
@@ -180,6 +197,90 @@ fn os_exit_reports_a_configuration_error_instead_of_terminating() -> io::Result<
         diagnostic.as_deref().and_then(|text| text.lines().next()),
         Some("init.lua: os.exit is unavailable while tvi is running")
     );
+    Ok(())
+}
+
+#[test]
+fn process_passes_literal_arguments_and_cwd_and_preserves_nul_stdout()
+-> Result<(), Box<dyn std::error::Error>> {
+    let scratch = Scratch::new()?;
+    let cwd = scratch.0.join("資料 space");
+    fs::create_dir(&cwd)?;
+    fs::write(cwd.join("cwd-marker"), "process fixture")?;
+
+    let runtime = Runtime::new(Rc::new(TestHost::default()));
+    runtime.install_api()?;
+    let exe = std::env::current_exe()?;
+    runtime
+        .lua
+        .globals()
+        .set("exe", exe.to_str().ok_or("non-UTF-8 test executable")?)?;
+    runtime
+        .lua
+        .globals()
+        .set("cwd", cwd.to_str().ok_or("non-UTF-8 scratch path")?)?;
+    runtime
+        .lua
+        .load(
+            r#"
+        local result = assert(tvi.process.run(exe, {
+            cwd = cwd,
+            args = { "--ignored", "--nocapture", "--exact", "lua::tests::process_fixture",
+                     "tvi-cwd-fixture", '資料 a "quoted" & |' },
+        }))
+        assert(result.ok and result.code == 0, result.stdout)
+        assert(result.stdout:find("TVI\0fixture", 1, true), result.stdout)
+    "#,
+        )
+        .exec()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "run in a child test harness as a process fixture"]
+fn process_fixture() -> io::Result<()> {
+    use std::io::Write as _;
+
+    let args: Vec<_> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "tvi-cwd-fixture") {
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("資料 a \"quoted\" & |")
+        );
+        assert_eq!(fs::read_to_string("cwd-marker")?, "process fixture");
+        io::stdout().write_all(b"TVI\0fixture")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn process_distinguishes_missing_executable_invalid_cwd_and_nonzero_exit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let scratch = Scratch::new()?;
+    let runtime = Runtime::new(Rc::new(TestHost::default()));
+    runtime.install_api()?;
+    let exe = std::env::current_exe()?;
+    let missing = scratch.0.join("missing.exe");
+    let bad_cwd = scratch.0.join("no-directory");
+    for (key, path) in [("exe", exe), ("missing", missing), ("bad_cwd", bad_cwd)] {
+        runtime
+            .lua
+            .globals()
+            .set(key, path.to_str().ok_or("non-UTF-8 test path")?)?;
+    }
+    runtime
+        .lua
+        .load(
+            r#"
+        local result, err = tvi.process.run(missing, {})
+        assert(result == nil and err.kind == "not_found")
+        result, err = tvi.process.run(exe, { cwd = bad_cwd })
+        assert(result == nil and err.kind == "cwd")
+        result, err = tvi.process.run(exe, { args = { "--tvi-invalid-argument" } })
+        assert(result and not result.ok and result.code ~= 0 and err == nil)
+    "#,
+        )
+        .exec()?;
     Ok(())
 }
 

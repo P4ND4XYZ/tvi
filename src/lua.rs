@@ -16,6 +16,7 @@ use crate::{
 };
 
 mod config;
+mod process;
 #[cfg(test)]
 mod tests;
 
@@ -27,8 +28,11 @@ pub struct LuaLink {
 
 pub trait Host {
     fn current_view(&self) -> Result<u64, String>;
+    fn notify(&self, message: &str);
+    fn project_root(&self, view: u64, markers: &[String]) -> Result<PathBuf, String>;
     fn links(&self, view: u64) -> Result<Vec<LuaLink>, String>;
-    fn open_link(&self, view: u64, id: u64) -> Result<(), String>;
+    fn resolve_link(&self, view: u64, id: u64) -> Result<PathBuf, String>;
+    fn open_file(&self, view: u64, path: &Path) -> Result<(), String>;
     fn open_float(&self, view: u64, options: FloatOptions) -> Result<u64, String>;
     fn update_float(&self, view: u64, float: u64, options: FloatOptions) -> Result<(), String>;
     fn close_float(&self, view: u64, float: u64) -> Result<(), String>;
@@ -71,8 +75,12 @@ impl Runtime {
     }
 
     pub(crate) fn load_from(host: Rc<dyn Host>, path: Option<PathBuf>) -> (Self, Option<String>) {
+        let (runtime, error) = Self::with_defaults(Rc::clone(&host));
+        if error.is_some() {
+            return (runtime, error);
+        }
         let Some(path) = path else {
-            return (Self::new(host), None);
+            return (runtime, None);
         };
         let filename = path
             .file_name()
@@ -80,7 +88,7 @@ impl Runtime {
             .to_string_lossy();
         let source = match config::read_source(&path) {
             Ok(source) => source,
-            Err(error) if error.kind() == ErrorKind::NotFound => return (Self::new(host), None),
+            Err(error) if error.kind() == ErrorKind::NotFound => return (runtime, None),
             Err(error) => {
                 logging::emit(
                     Level::Warn,
@@ -90,10 +98,9 @@ impl Runtime {
                         "action":"use_defaults",
                     }),
                 );
-                return (Self::new(host), Some(format!("{filename}: {error}")));
+                return (runtime, Some(format!("{filename}: {error}")));
             }
         };
-        let runtime = Self::new(Rc::clone(&host));
         match runtime.configure(&path, &source) {
             Ok(()) => (runtime, None),
             Err(error) => {
@@ -113,14 +120,53 @@ impl Runtime {
                     message.push_str("\ncannot close configuration float: ");
                     message.push_str(&error);
                 }
-                (Self::new(host), Some(message))
+                drop(runtime);
+                let (runtime, fallback_error) = Self::with_defaults(host);
+                if let Some(error) = fallback_error {
+                    message.push('\n');
+                    message.push_str(&error);
+                }
+                (runtime, Some(message))
             }
         }
     }
 
+    fn with_defaults(host: Rc<dyn Host>) -> (Self, Option<String>) {
+        let runtime = Self::new(host);
+        if let Err(error) = runtime
+            .install_api()
+            .and_then(|()| runtime.install_defaults())
+        {
+            log_failure("defaults", "continue", &error, None);
+            return (runtime, Some(lua_diagnostic(&error, None)));
+        }
+        (runtime, None)
+    }
+
+    fn install_defaults(&self) -> mlua::Result<()> {
+        let files: Table = config::source_chunk(
+            &self.lua,
+            Path::new("plugins/files.lua"),
+            include_bytes!("../plugins/files.lua"),
+        )
+        .eval()?;
+        let callback = self
+            .lua
+            .create_registry_value(files.get::<Function>("open")?)?;
+        let package: Table = self.lua.globals().get("package")?;
+        let loaded: Table = package.get("loaded")?;
+        loaded.set("plugins.files", files)?;
+        self.state
+            .keymap
+            .borrow_mut()
+            .register_default(KeymapMode::Normal, "ff", 0)
+            .map_err(Error::runtime)?;
+        self.state.mappings.borrow_mut().push(callback);
+        Ok(())
+    }
+
     fn configure(&self, path: &Path, source: &[u8]) -> mlua::Result<()> {
         config::install_searcher(&self.lua, path)?;
-        self.install_api()?;
         let filename = path.file_name().map_or(path, Path::new);
         config::source_chunk(&self.lua, filename, source).exec()
     }
@@ -182,7 +228,16 @@ impl Runtime {
                 })
             })?,
         )?;
+        let state = Rc::downgrade(&self.state);
+        ui.set(
+            "notify",
+            self.lua.create_function(move |_, message: String| {
+                live_state(&state)?.host.notify(&message);
+                Ok(())
+            })?,
+        )?;
         tvi.set("ui", ui)?;
+        process::install(&self.lua, &tvi)?;
         self.lua.globals().set("tvi", tvi)
     }
 
@@ -338,6 +393,25 @@ struct ViewHandle {
 
 impl UserData for ViewHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("project_root", |_, view, opts: Option<Table>| {
+            let markers = opts
+                .map(|opts| opts.get::<Option<Vec<String>>>("root_markers"))
+                .transpose()?
+                .flatten()
+                .unwrap_or_else(|| vec![".git".into()]);
+            let result = live_state(&view.state)?
+                .host
+                .project_root(view.id, &markers)
+                .and_then(|path| {
+                    path.into_os_string()
+                        .into_string()
+                        .map_err(|_| "project root is not valid UTF-8".into())
+                });
+            Ok(match result {
+                Ok(path) => (Some(path), None),
+                Err(error) => (None, Some(error)),
+            })
+        });
         methods.add_method("links", |lua, view, ()| {
             let links = live_state(&view.state)?
                 .host
@@ -353,8 +427,26 @@ impl UserData for ViewHandle {
             }
             Ok(list)
         });
-        methods.add_method("open_link", |_, view, id: u64| {
-            let result = live_state(&view.state)?.host.open_link(view.id, id);
+        methods.add_method("resolve_link", |_, view, id: u64| {
+            let result = live_state(&view.state)?
+                .host
+                .resolve_link(view.id, id)
+                .and_then(|path| {
+                    path.into_os_string()
+                        .into_string()
+                        .map_err(|_| "link path is not valid UTF-8".into())
+                });
+            Ok(match result {
+                Ok(path) => (Some(path), None),
+                Err(error) => (None, Some(error)),
+            })
+        });
+        methods.add_method("open_file", |_, view, path: mlua::String| {
+            let state = live_state(&view.state)?;
+            let result = match path.to_str() {
+                Ok(path) => state.host.open_file(view.id, Path::new(&*path)),
+                Err(_) => Err("file path is not valid UTF-8".into()),
+            };
             Ok(match result {
                 Ok(()) => (true, None),
                 Err(error) => (false, Some(error)),

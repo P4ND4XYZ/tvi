@@ -83,7 +83,13 @@ function M.open()
     if key.name == "Enter" then
       local link = candidates[selected]
       if link then
-        local ok, err = view:open_link(link.id)
+        local path, err = view:resolve_link(link.id)
+        if not path then
+          float:update(display(tostring(err or "Could not resolve link")))
+          return
+        end
+        local ok
+        ok, err = view:open_file(path)
         if ok then
           float:close()
         else

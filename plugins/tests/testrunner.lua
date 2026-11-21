@@ -1,5 +1,6 @@
 local suites = {
   "plugins.tests.links_test",
+  "plugins.tests.files_test",
 }
 
 for _, name in ipairs(suites) do

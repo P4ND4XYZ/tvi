@@ -50,7 +50,7 @@ UTF-8のJSON Lines（1行に1件のJSON）で保存します。全レコード�
 
 | イベント | 記録する条件と内容（共通項目以外） |
 |---|---|
-| `document.open_failed` | 起動時またはリンク移動時に開けなかったとき。`document`、`trigger`（例：`startup` / `link`）、`stage` と `reason`（例：`read` / `not_found`、`decode` / `invalid_utf8`）。 |
+| `document.open_failed` | 起動時やLuaから文書を開けなかったとき、またはリンク先を解決できなかったとき。`document`、`trigger`（`startup` / `open_file` / `link`）、`stage` と `reason`（例：`read` / `not_found`、`decode` / `invalid_utf8`）。 |
 | `image.load_failed` | ローカル画像を読み込めなかったとき。`document`、`image_index`（元のMarkdown上の出現番号。生成した図は数えない）、`stage`、`reason`（例：ファイルなし、非対応形式、破損、サイズ上限）。再描画では繰り返しません。 |
 | `mermaid.launch_failed` | `mmdc` を検出したが起動できなかったとき。`document`、`reason`（例：`permission_denied`）、取得できた場合は `os_code`、`fallback: "code"`。文書を開く操作につき1件にまとめます。 |
 | `mermaid.convert_failed` | 変換の異常終了や、出力PNGの欠落・破損・サイズ超過。`document`、ブロックの開始 `line`、`stage`（例：`convert` / `validate_png`）、`reason`、`elapsed_ms`、`fallback: "code"`。異常終了時は取得できた `exit_code` を、外部コマンドの標準出力・標準エラーは破棄するため、生の診断内容は記録しません。 |

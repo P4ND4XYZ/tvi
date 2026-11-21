@@ -404,7 +404,8 @@ mod tests {
         drop(current);
         drop(layout);
         drop(initial);
-        session.open_link(BODY_VIEW, id).unwrap();
+        let path = session.resolve_link(BODY_VIEW, id).unwrap();
+        session.open_file(BODY_VIEW, &path).unwrap();
         assert!(
             released.upgrade().is_none(),
             "history must not retain decoded pixels"
@@ -508,7 +509,8 @@ mod tests {
         assert!(current.app.highlights().0.is_empty());
         let id = current.app.links()[0].id;
         drop(current);
-        session.open_link(BODY_VIEW, id).unwrap();
+        let path = session.resolve_link(BODY_VIEW, id).unwrap();
+        session.open_file(BODY_VIEW, &path).unwrap();
         let mut entries = fs::read_dir(&cache)
             .unwrap()
             .map(|entry| entry.unwrap().path())

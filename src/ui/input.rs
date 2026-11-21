@@ -137,6 +137,7 @@ struct Binding {
     keys: Vec<Chord>,
     id: u64,
     _description: Option<String>,
+    is_default: bool,
 }
 
 #[derive(Default)]
@@ -174,6 +175,26 @@ impl Keymap {
         id: u64,
         desc: Option<String>,
     ) -> Result<(), String> {
+        self.register_binding(mode, keys, id, desc, false)
+    }
+
+    pub fn register_default(
+        &mut self,
+        mode: KeymapMode,
+        keys: &str,
+        id: u64,
+    ) -> Result<(), String> {
+        self.register_binding(mode, keys, id, None, true)
+    }
+
+    fn register_binding(
+        &mut self,
+        mode: KeymapMode,
+        keys: &str,
+        id: u64,
+        desc: Option<String>,
+        is_default: bool,
+    ) -> Result<(), String> {
         let sequence = parse_sequence(keys)?;
         if mode != KeymapMode::Normal && sequence.iter().any(|&key| prompt_key(key).is_some()) {
             return Err(format!(
@@ -193,11 +214,9 @@ impl Keymap {
                 "key sequence {keys:?} conflicts with a built-in mapping"
             ));
         }
-        if self
-            .bindings
-            .iter()
-            .any(|binding| binding.mode == mode && binding.keys == sequence)
-        {
+        if self.bindings.iter().any(|binding| {
+            binding.mode == mode && binding.keys == sequence && (is_default || !binding.is_default)
+        }) {
             return Err(format!(
                 "key sequence {keys:?} conflicts with a registered mapping"
             ));
@@ -207,6 +226,7 @@ impl Keymap {
             keys: sequence,
             id,
             _description: desc,
+            is_default,
         });
         Ok(())
     }

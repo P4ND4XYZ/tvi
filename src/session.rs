@@ -1,11 +1,17 @@
 use std::{
-    cell::RefCell, collections::VecDeque, fs, io, path::Path, rc::Rc, string::FromUtf8Error,
+    cell::RefCell,
+    collections::VecDeque,
+    fs, io,
+    path::{self, Path, PathBuf},
+    rc::Rc,
+    string::FromUtf8Error,
 };
 
 use crossterm::event::KeyEvent;
 
 use crate::{
     app::{App, Document, ViewRows},
+    files,
     logging::{self, Level},
     lua::{Host, LuaLink, Runtime},
     markdown::{MarkdownRenderer, tui_markdown::TuiMarkdown},
@@ -171,7 +177,7 @@ fn require_regular_file(path: &Path) -> io::Result<()> {
     } else {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "link target is not a regular file",
+            "target is not a regular file",
         ))
     }
 }
@@ -179,6 +185,17 @@ fn require_regular_file(path: &Path) -> io::Result<()> {
 impl Host for RefCell<Session> {
     fn current_view(&self) -> Result<u64, String> {
         Ok(BODY_VIEW)
+    }
+
+    fn notify(&self, message: &str) {
+        self.borrow_mut()
+            .app
+            .set_notice(message.replace(char::is_control, "�"));
+    }
+
+    fn project_root(&self, view: u64, markers: &[String]) -> Result<PathBuf, String> {
+        validate_view(view)?;
+        files::project_root(self.borrow().app.document_path(), markers)
     }
 
     fn links(&self, view: u64) -> Result<Vec<LuaLink>, String> {
@@ -196,33 +213,51 @@ impl Host for RefCell<Session> {
             .collect())
     }
 
-    fn open_link(&self, view: u64, id: u64) -> Result<(), String> {
-        let path = {
-            let session = self.borrow();
-            validate_view(view)
-                .and_then(|()| session.app.resolve_link(id))
-                .inspect_err(|_| {
-                    log_document_failure(
-                        session.app.document_path(),
-                        "link",
-                        "resolve",
-                        "invalid_link",
-                        None,
-                    );
-                })?
-        };
-        require_regular_file(&path).map_err(|error| {
+    fn resolve_link(&self, view: u64, id: u64) -> Result<PathBuf, String> {
+        validate_view(view)?;
+        let session = self.borrow();
+        let path = session.app.resolve_link(id).inspect_err(|_| {
             log_document_failure(
-                &path,
+                session.app.document_path(),
                 "link",
+                "resolve",
+                "invalid_link",
+                None,
+            );
+        })?;
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        path::absolute(path).map_err(|error| {
+            log_document_failure(
+                session.app.document_path(),
+                "link",
+                "resolve",
+                logging::io_reason(&error),
+                error.raw_os_error(),
+            );
+            format!("cannot resolve link path: {error}")
+        })
+    }
+
+    fn open_file(&self, view: u64, path: &Path) -> Result<(), String> {
+        validate_view(view)?;
+        if !path.is_absolute() {
+            log_document_failure(path, "open_file", "path", "relative_path", None);
+            return Err("file path must be an absolute path".into());
+        }
+        require_regular_file(path).map_err(|error| {
+            log_document_failure(
+                path,
+                "open_file",
                 "metadata",
                 logging::io_reason(&error),
                 error.raw_os_error(),
             );
             format!("cannot read: {error}")
         })?;
-        let document = load_document(&path).map_err(|error| {
-            error.log(&path, "link");
+        let document = load_document(path).map_err(|error| {
+            error.log(path, "open_file");
             match error {
                 ReadDocumentError::Read(error) => format!("cannot read: {error}"),
                 ReadDocumentError::Decode(error) => format!("not valid UTF-8: {error}"),
@@ -447,7 +482,6 @@ mod tests {
     use std::{
         env,
         error::Error,
-        path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -479,6 +513,93 @@ mod tests {
         fn drop(&mut self) {
             drop(fs::remove_dir_all(&self.0));
         }
+    }
+
+    #[test]
+    fn lua_notify_changes_only_notice_and_user_ff_overrides_default() -> Result<(), Box<dyn Error>>
+    {
+        let scratch = Scratch::new()?;
+        let source = scratch.0.join("source.md");
+        fs::write(&source, "# Source")?;
+        let init = scratch.init(
+            r#"
+            local view = tvi.ui.current_view()
+            local root, err = view:project_root({ root_markers = {} })
+            assert(root and err == nil)
+            local invalid, reason = view:project_root({ root_markers = { "../bad" } })
+            assert(invalid == nil and reason)
+            tvi.keymap.set("normal", "ff", function()
+                tvi.ui.notify("sample notice")
+            end)
+        "#,
+        )?;
+        let session = Rc::new(RefCell::new(Session::new(read_document(&source)?)));
+        let (runtime, diagnostic) = Runtime::load_from(session.clone(), Some(init));
+        assert_eq!(diagnostic, None);
+        let id = session.borrow().app.document_id();
+        let mut keys = InputQueue::default();
+        let f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert!(!keys.dispatch(Some(f), &session, &runtime, &[], ""));
+        assert!(keys.dispatch(Some(f), &session, &runtime, &[], ""));
+        let session = session.borrow();
+        assert_eq!(session.app.notice(), Some("sample notice"));
+        assert_eq!(session.app.mode(), Mode::Normal);
+        assert_eq!(session.app.document_id(), id);
+        assert_eq!(session.floats.active(), None);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires fd or fdfind on PATH"]
+    fn file_picker_opens_real_fd_results_and_ctrl_o_returns() -> Result<(), Box<dyn Error>> {
+        let scratch = Scratch::new()?;
+        let root = scratch.0.join("資料 project");
+        let docs = root.join("notes with space");
+        fs::create_dir_all(&docs)?;
+        fs::create_dir(root.join(".git"))?;
+        fs::write(root.join(".fdignore"), "ignored.md\n")?;
+        fs::write(root.join("a.md"), "# A")?;
+        fs::write(root.join("ignored.md"), "# Ignore")?;
+        fs::write(root.join(".hidden.md"), "# Hidden")?;
+        fs::write(root.join("other.txt"), "# Wrong extension")?;
+        fs::write(docs.join("資料 b.md"), "# Selected")?;
+        let source = docs.join("last.md");
+        fs::write(&source, "# Source")?;
+        let session = Rc::new(RefCell::new(Session::new(read_document(&source)?)));
+        let source_id = session.borrow().app.document_id();
+        let (runtime, diagnostic) = Runtime::load_from(session.clone(), None);
+        assert_eq!(diagnostic, None);
+        let mut keys = InputQueue::default();
+        let mut send = |code, modifiers| {
+            let key = KeyEvent::new(code, modifiers);
+            keys.dispatch(Some(key), &session, &runtime, &[], "")
+        };
+        let plain = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        let f = KeyCode::Char('f');
+        assert!(!send(f, plain));
+        assert!(send(f, plain));
+        assert!(
+            session.borrow().floats.active().is_some(),
+            "{:?}",
+            session.borrow().app.notice()
+        );
+        assert!(send(KeyCode::Esc, plain));
+        assert!(session.borrow().floats.active().is_none());
+        assert_eq!(session.borrow().app.document_id(), source_id);
+        assert!(!send(f, plain));
+        assert!(send(f, plain));
+        assert!(send(KeyCode::Char('n'), ctrl));
+        assert!(send(KeyCode::Char('n'), ctrl));
+        assert!(send(KeyCode::Char('n'), ctrl));
+        assert!(send(KeyCode::Char('p'), ctrl));
+        assert!(send(KeyCode::Char('n'), ctrl));
+        assert!(send(KeyCode::Enter, plain));
+        assert_eq!(session.borrow().app.name(), "資料 b.md");
+        assert!(session.borrow().floats.active().is_none());
+        assert!(send(KeyCode::Char('o'), ctrl));
+        assert_eq!(session.borrow().app.document_id(), source_id);
+        Ok(())
     }
 
     #[test]
@@ -514,7 +635,8 @@ mod tests {
         );
         let links = session.links(BODY_VIEW)?;
         assert_eq!(links.len(), 1);
-        session.open_link(BODY_VIEW, links[0].id)?;
+        let path = session.resolve_link(BODY_VIEW, links[0].id)?;
+        session.open_file(BODY_VIEW, &path)?;
         assert!(session.links(BODY_VIEW)?.is_empty());
         let loaded = read();
         assert_eq!(
@@ -532,36 +654,75 @@ mod tests {
     }
 
     #[test]
-    fn invalid_link_and_failed_init_leave_the_original_document() -> Result<(), Box<dyn Error>> {
+    fn resolve_link_returns_an_absolute_path_without_requiring_the_target()
+    -> Result<(), Box<dyn Error>> {
+        let session = RefCell::new(Session::new(Document::new(
+            "source.md".into(),
+            "[Missing](missing.md)".into(),
+            PathBuf::from("docs/source.md"),
+            vec![("Missing".into(), "missing.md".into())],
+        )));
+        let id = session.links(BODY_VIEW)?[0].id;
+        assert_eq!(
+            session.resolve_link(BODY_VIEW, id)?,
+            env::current_dir()?.join("docs").join("missing.md")
+        );
+        assert_eq!(session.borrow().app.name(), "source.md");
+        Ok(())
+    }
+
+    #[test]
+    fn open_file_failures_leave_the_original_document_and_history() -> Result<(), Box<dyn Error>> {
+        let scratch = Scratch::new()?;
+        let invalid = scratch.0.join("invalid.md");
+        let directory = scratch.0.join("directory.md");
+        fs::write(&invalid, [0xff])?;
+        fs::create_dir(&directory)?;
+        let source = scratch.0.join("source.md");
+        let next = scratch.0.join("next.md");
+        fs::write(&source, "# Source")?;
+        fs::write(&next, "# Next")?;
+        let session = RefCell::new(Session::new(read_document(&source)?));
+        let initial_id = session.borrow().app.document_id();
+        session.open_file(BODY_VIEW, &next)?;
+        assert_eq!(session.borrow().app.document_path(), next);
+        let next_id = session.borrow().app.document_id();
+        for (path, expected) in [
+            (invalid.as_path(), "not valid UTF-8"),
+            (directory.as_path(), "not a regular file"),
+            (Path::new("relative.md"), "must be an absolute path"),
+        ] {
+            assert!(matches!(
+                session.open_file(BODY_VIEW, path),
+                Err(reason) if reason.contains(expected)
+            ));
+            assert_eq!(session.borrow().app.document_id(), next_id);
+        }
+        session.borrow_mut().app.apply(Action::JumpBack, &[], "");
+        assert_eq!(session.borrow().app.document_id(), initial_id);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_init_restores_the_original_document_after_opening_a_link()
+    -> Result<(), Box<dyn Error>> {
         let scratch = Scratch::new()?;
         let docs = scratch.0.join("docs");
         fs::create_dir(&docs)?;
-        fs::write(scratch.0.join("invalid.md"), [0xff])?;
         fs::write(scratch.0.join("next.md"), "Next document")?;
-        fs::create_dir(scratch.0.join("directory.md"))?;
         let source = docs.join("source.md");
-        fs::write(
-            &source,
-            "[Invalid](../invalid.md) [Next](../next.md) [Directory](../directory.md)",
-        )?;
+        fs::write(&source, "[Next](../next.md)")?;
         let session = Rc::new(RefCell::new(Session::new(read_document(&source)?)));
         let initial_id = session.borrow().app.document_id();
-        let invalid_link = session.borrow().app.links()[0].id;
-        assert!(matches!(
-            session.open_link(BODY_VIEW, invalid_link),
-            Err(reason) if reason.contains("not valid UTF-8")
-        ));
-        let directory_link = session.borrow().app.links()[2].id;
-        assert!(matches!(
-            session.open_link(BODY_VIEW, directory_link),
-            Err(reason) if reason.contains("not a regular file")
-        ));
-        assert_eq!(session.borrow().app.document_id(), initial_id);
-
+        let link = session.links(BODY_VIEW)?[0].id;
         let init = scratch.init(
             r#"
 local view = tvi.ui.current_view()
-assert(view:open_link(view:links()[2].id))
+local id = view:links()[1].id
+local target = assert(view:resolve_link(id))
+assert(view:open_file(target))
+local path, err = view:resolve_link(id)
+assert(path == nil and err:find("current document", 1, true))
 error("startup failed")
 "#,
         )?;
@@ -572,7 +733,7 @@ error("startup failed")
         assert_eq!(session.app.name(), "next.md");
         session.restore_after_init_error(&error);
         assert_eq!(session.app.document_id(), initial_id);
-        assert_eq!(session.app.links()[0].id, invalid_link);
+        assert_eq!(session.app.links()[0].id, link);
         assert!(session.app.notice().is_some_and(|notice| {
             notice.contains("init.lua") && notice.contains("startup failed")
         }));
@@ -602,7 +763,10 @@ error("startup failed")
             assert!(error.is_none());
             assert!(!logs.exists());
             let id = session.borrow().app.links()[0].id;
-            assert!(session.open_link(BODY_VIEW, id).is_err());
+            let path = session
+                .resolve_link(BODY_VIEW, id)
+                .map_err(io::Error::other)?;
+            assert!(session.open_file(BODY_VIEW, &path).is_err());
             assert_eq!(session.borrow().app.name(), "source.md");
 
             let session_ref = session.borrow();
@@ -631,7 +795,7 @@ error("startup failed")
         assert_eq!(records.len(), 3);
         assert_eq!(records[0]["event"], "document.open_failed");
         assert_eq!(records[0]["document"], "missing.md");
-        assert_eq!(records[0]["trigger"], "link");
+        assert_eq!(records[0]["trigger"], "open_file");
         assert_eq!(records[0]["level"], "WARN");
         assert_eq!(records[0]["reason"], "not_found");
         assert_eq!(records[1]["event"], "image.load_failed");

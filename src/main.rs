@@ -1,11 +1,13 @@
 use std::{env, io, path::Path, process::ExitCode};
 
 mod app;
+mod files;
 mod images;
 mod logging;
 mod lua;
 mod markdown;
 mod mermaid;
+mod process;
 mod session;
 mod terminal;
 mod ui;

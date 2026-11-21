@@ -54,8 +54,8 @@ impl PlacedImage {
         if cw == 0 || ch == 0 || columns == 0 {
             return None;
         }
-        // 画像の面積とダイアクリティカルマークで参照するセル数を制限する。
-        let max_width = (u32::from(columns.min(160)) * cw).min(1600);
+        // ダイアクリティカルマークで参照するセル数と、画像の高さを制限する。
+        let max_width = u32::from(columns.min(160)) * cw;
         let max_height = (160 * ch).min(3200);
         let resized;
         let image = if image.width() > max_width || image.height() > max_height {
@@ -201,6 +201,20 @@ mod tests {
         assert_eq!(narrow.rows, 2..4);
         assert_ne!(narrow.kitty_id, placed.kitty_id);
         assert!(PlacedImage::new(&image, 5, 2, ImageMode::Text).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn kitty_preserves_images_wider_than_1600_pixels_when_they_fit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let image = DynamicImage::new_rgb8(1917, 64);
+        let mode = ImageMode::Kitty {
+            cell_width: 16,
+            cell_height: 16,
+        };
+        let placed = PlacedImage::new(&image, 128, 0, mode).ok_or("image placement failed")?;
+        assert!(matches!(placed.protocol, SlicedProtocol::Kitty(_)));
+        assert_eq!(placed.protocol.size(), Size::new(120, 4));
         Ok(())
     }
 
