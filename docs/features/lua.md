@@ -22,8 +22,6 @@ tvi.keymap.set("normal", "gl", links.open, { desc = "リンク一覧を開く" }
 
 旧版の `plugins/links.lua` をすでに設定ディレクトリにコピーしている場合は、更新時に[新しいファイル](../../plugins/links.lua)へ差し替えてください。旧APIの `view:open_link(id)` は使えません。自作Luaでは `view:resolve_link(id)` で絶対パスを取得し、成功した場合に `view:open_file(path)` へ渡してください。
 
-[ファイルピッカー](file-picker.md)は同梱されており、`require("plugins.files")` にコピーは不要です。NORMALの `ff` で起動し、`tvi.keymap.set` で同じキー列に別の操作を登録すると上書きできます。
-
 ## 公開API
 
 | API | 動作 |
@@ -41,7 +39,7 @@ tvi.keymap.set("normal", "gl", links.open, { desc = "リンク一覧を開く" }
 | `float:update(opts)` / `float:close()` | そのフロートの表示を更新・終了する |
 
 キーマップの `mode` は `normal`・`command`・`search` です。
-同じモードで、上書き可能な同梱プラグインを除き、既定操作や登録済みの操作と同じキー列は登録できません。`gg` と `gl` のように先頭キーを共有することはできます。
+同じモードでは、本体の既定操作や利用者が登録済みの操作と同じキー列は登録できません。`gg` と `gl` のように先頭キーを共有することはできます。
 キー列が操作に一致しても、より長いキー列の先頭なら、次のキーを最大300ミリ秒待ちます。長いキー列が成立しなければ、すでに一致した操作を実行します。
 COMMANDとSEARCHでは文字入力・編集・確定・キャンセル用のキーを変更せず、未使用のショートカットを登録できます。
 キー列には `gl` のように文字を並べます。修飾キーや特殊キーは `<C-x>`（Ctrl-x）、`<F2>` のように書きます。`<` 自体を割り当てる場合は `<lt>` と書きます。たとえば `tvi.keymap.set("search", "<C-x>", callback)` はSEARCHのショートカットを登録します。
