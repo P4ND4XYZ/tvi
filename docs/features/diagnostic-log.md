@@ -54,7 +54,7 @@ UTF-8のJSON Lines（1行に1件のJSON）で保存します。全レコード�
 | `document.watch_failed` | 表示中の文書を監視できなかったとき。`document` と `stage`（`register` / `receive`）。同じ文書の監視中に繰り返しません。 |
 | `image.load_failed` | ローカル画像を読み込めなかったとき。`document`、`image_index`（元のMarkdown上の出現番号。生成した図は数えない）、`stage`、`reason`（例：ファイルなし、非対応形式、破損、サイズ上限）。再描画では繰り返しません。 |
 | `mermaid.launch_failed` | `mmdc` を検出したが起動できなかったとき。`document`、`reason`（例：`permission_denied`）、取得できた場合は `os_code`、`fallback: "code"`。文書を開く操作につき1件にまとめます。 |
-| `mermaid.convert_failed` | 変換の異常終了や、出力PNGの欠落・破損・サイズ超過。`document`、ブロックの開始 `line`、`stage`（例：`convert` / `validate_png`）、`reason`、`elapsed_ms`、`fallback: "code"`。異常終了時は取得できた `exit_code` を、外部コマンドの標準出力・標準エラーは破棄するため、生の診断内容は記録しません。 |
+| `mermaid.convert_failed` | 変換の異常終了や、出力PNGの欠落・破損・サイズ超過。`document`、ブロックの開始 `line`、`stage`（例：`convert` / `validate_png`）、`reason`、`elapsed_ms`、`fallback: "code"`。異常終了時は、取得できた場合のみ `exit_code` を記録します。標準出力・標準エラーは記録しません。 |
 | `mermaid.timeout` | 変換の時間上限に達したとき。`document`、`scope`（`diagram` / `document`）、`limit_ms`。図単位ならブロックの開始 `line`、文書全体なら未変換件数 `remaining`。 |
 | `mermaid.cache_failed` | キャッシュの読み込み・検証・保存・古いPNGの削除に失敗したとき。`operation`、`reason`、`action`（例：`regenerate` / `display_without_cache`）。通常のキャッシュミスや容量調整は記録しません。 |
 | `lua.failed` | Lua設定の読み込みやコールバックが失敗したとき。特定できた `source` と `line`、`stage`（設定・キーマップ・フロート）、`reason`（例：`syntax_error`）、`action`（例：`use_defaults`）。 |
