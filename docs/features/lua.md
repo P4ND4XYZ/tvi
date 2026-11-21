@@ -29,6 +29,7 @@ tvi.keymap.set("normal", "gl", links.open, { desc = "リンク一覧を開く" }
 | API | 動作 |
 |---|---|
 | `tvi.keymap.set(mode, keys, callback, opts)` | モード別にキーを登録する。`opts.desc` は操作の説明 |
+| `tvi.colorscheme.set(styles)` | [カラースキーム](colorscheme.md)全体を置き換える |
 | `tvi.ui.current_view()` | フロートではなく現在の本文ビューを取得する |
 | `tvi.ui.notify(message)` | 状態欄の通知だけを更新する |
 | `view:project_root(opts?)` | 文書のディレクトリから上へ、`opts.root_markers` のいずれかを含む最も近いディレクトリを探す。未指定のマーカーは `{ ".git" }`。該当なしなら文書のディレクトリ。成功時は絶対パス、失敗時は `nil, err` |

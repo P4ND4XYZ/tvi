@@ -91,6 +91,20 @@ impl Session {
         prepared
     }
 
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>, layout: &Layout<'_>, runtime: &Runtime) {
+        let body = ui::body_area(frame.area(), self.app.mode());
+        self.app.reflow(layout, usize::from(body.height));
+        let scheme = runtime.colorscheme();
+        ui::draw(
+            frame,
+            &self.app,
+            layout,
+            self.floats.active().is_some(),
+            &scheme,
+        );
+        self.floats.draw(frame, body, &scheme);
+    }
+
     fn restore_after_init_error(&mut self, error: &str) {
         self.app.reset_to_initial_document();
         self.floats = Floats::default();
@@ -383,15 +397,7 @@ fn run_document(
                     session.app.set_notice("ログを保存できません".into());
                 }
             }
-            let body = ui::body_area(area, session.app.mode());
-            session.app.reflow(&layout, usize::from(body.height));
-            ui::draw(
-                frame,
-                &session.app,
-                &layout,
-                session.floats.active().is_some(),
-            );
-            session.floats.draw(frame, body);
+            session.draw(frame, &layout, runtime);
         });
         let draw_result = terminal::check(draw_result, "draw", Some(mode), "exit");
         let cleanup = terminal::check(
@@ -559,6 +565,107 @@ mod tests {
         fn drop(&mut self) {
             drop(fs::remove_dir_all(&self.0));
         }
+    }
+
+    #[test]
+    fn colorscheme_changes_on_redraw_without_resetting_search_prompt_or_float()
+    -> Result<(), Box<dyn Error>> {
+        use KeyCode::{Char, Enter, Esc, F};
+        use ratatui::{
+            Terminal,
+            backend::TestBackend,
+            style::{Color, Modifier},
+        };
+
+        let scratch = Scratch::new()?;
+        let source = scratch.0.join("source.md");
+        fs::write(
+            &source,
+            (0..20).map(|i| format!("row {i}\n\n")).collect::<String>(),
+        )?;
+        let init = scratch.init(
+            r#"
+            tvi.colorscheme.set({ ["document.normal"] = { bg = "red" } })
+            local view = tvi.ui.current_view()
+            tvi.keymap.set("search", "<F2>", function()
+                view:open_float({
+                    title = "title", header = "head", lines = {"focus"}, focus_line = 1,
+                    on_key = function()
+                        tvi.colorscheme.set({
+                            ["ui.status"] = { fg = "cyan", reverse = false },
+                            ["ui.prompt"] = { bg = "magenta" },
+                            ["float.normal"] = { bg = "blue", reverse = false },
+                            ["float.border"] = { fg = "yellow" },
+                        })
+                        tvi.ui.notify("ready")
+                    end,
+                })
+            end)
+        "#,
+        )?;
+        let session = Rc::new(RefCell::new(Session::new(read_document(&source)?)));
+        let (runtime, diagnostic) = Runtime::load_from(session.clone(), Some(init));
+        assert_eq!(diagnostic, None);
+        let prepared = session.borrow_mut().display();
+        let layout = Layout::at_width(&prepared.document, 30);
+        let mut terminal = Terminal::new(TestBackend::new(30, 10))?;
+        let mut keys = InputQueue::default();
+        let mut send = |code| {
+            assert!(keys.dispatch(
+                Some(KeyEvent::new(code, KeyModifiers::NONE)),
+                &session,
+                &runtime,
+                &layout,
+                prepared.document.search_text(),
+            ));
+        };
+        let mut draw = || {
+            terminal.draw(|frame| session.borrow_mut().draw(frame, &layout, &runtime))?;
+            Ok::<_, std::convert::Infallible>(terminal.backend().buffer().clone())
+        };
+
+        assert_eq!(draw()?[(29, 0)].bg, Color::Red);
+        for code in "/row 15"
+            .chars()
+            .map(Char)
+            .chain([Enter, Char('/'), Char('x'), F(2)])
+        {
+            send(code);
+        }
+        let before = draw()?;
+        let (handle, top, selected) = {
+            let session = session.borrow();
+            (
+                session.floats.active(),
+                session.app.top_row(),
+                session.app.search_selection(),
+            )
+        };
+        assert!(top > 0 && selected.is_some());
+        assert_eq!(before[(12, 4)].symbol(), "f");
+        assert!(before[(12, 4)].modifier.contains(Modifier::REVERSED));
+
+        send(Char('c'));
+        let after = draw()?;
+        assert_eq!(after[(12, 2)].symbol(), "t");
+        assert_eq!(after[(12, 2)].fg, Color::Yellow);
+        assert_eq!(after[(12, 3)].bg, Color::Blue);
+        assert!(after[(12, 3)].modifier.contains(Modifier::BOLD));
+        assert_eq!(after[(12, 4)].symbol(), "f");
+        assert_eq!(after[(12, 4)].bg, Color::Blue);
+        assert!(!after[(12, 4)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(after[(29, 0)].bg, Color::Reset);
+        assert_eq!(after[(0, 8)].fg, Color::Cyan);
+        assert!(!after[(0, 8)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(after[(1, 9)].symbol(), "x");
+        assert_eq!(after[(29, 9)].bg, Color::Magenta);
+        assert_eq!(session.borrow().floats.active(), handle);
+        assert_eq!(session.borrow().app.top_row(), top);
+        assert_eq!(session.borrow().app.search_selection(), selected);
+        assert_eq!(session.borrow().app.notice(), Some("ready"));
+        send(Esc);
+        assert_eq!(session.borrow().app.prompt(), "x");
+        Ok(())
     }
 
     #[test]

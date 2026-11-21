@@ -10,6 +10,8 @@ use ratatui::{
     text::{Line, Span, Text},
 };
 
+use crate::colorscheme::{Colorscheme, Group};
+
 use super::{
     ImageLine, ImageReference, MarkdownLink, MarkdownRenderer, MarkdownResources, RenderedMarkdown,
     table::{BORDER_MARKER, take_tables},
@@ -50,21 +52,15 @@ impl TuiMarkdown {
         };
         // 表の自然幅を検索用に保ち、折り返しに必要な罫線の位置だけを渡す。
         let mut image_lines = Vec::new();
-        let mut marker = String::from("\u{e000}tvi-diagram");
-        while source.contains(&marker) {
-            marker.push('\u{e000}');
-        }
         let sheet = PositionMarkers {
             next: std::sync::Arc::new(AtomicUsize::new(0)),
             ordinals: resources.images.iter().map(|image| image.ordinal).collect(),
             fences: std::sync::Arc::new(AtomicUsize::new(0)),
             diagrams: diagrams.into(),
-            marker: marker.as_str().into(),
         };
         let options = ::tui_markdown::Options::new(sheet.clone());
         let mut text = ::tui_markdown::from_str_with_options(&source, &options);
-        let Some((diagram_lines, expanded_lines)) = place_diagrams(&mut text, &marker, diagrams)
-        else {
+        let Some((diagram_lines, expanded_lines)) = place_diagrams(&mut text, diagrams) else {
             // ライブラリ側のフェンス位置を確認できなければ、元のコードを描画する。
             return self.render_document(markdown, width, resources);
         };
@@ -87,6 +83,7 @@ impl TuiMarkdown {
                 image_lines.clear();
             }
         }
+        mark_code_blocks(&mut text);
         let tables = take_tables(&mut text, || {
             use pulldown_cmark::Alignment::{Center, Right};
             use ratatui::layout::Alignment;
@@ -151,7 +148,6 @@ impl TuiMarkdown {
 // Replace only complete, marked logical blocks before calculating search offsets.
 fn place_diagrams(
     text: &mut Text<'_>,
-    marker: &str,
     diagrams: &[(usize, Option<usize>)],
 ) -> Option<(Vec<ImageLine>, Vec<std::ops::RangeInclusive<usize>>)> {
     if diagrams.is_empty() {
@@ -161,7 +157,7 @@ fn place_diagrams(
     let mut blocks = Vec::new();
     for (index, line) in text.lines.iter().enumerate() {
         if let [span] = line.spans.as_slice()
-            && let Some(suffix) = span.content.strip_prefix(marker)
+            && let Some(suffix) = span.content.strip_prefix(DIAGRAM_FENCE)
         {
             match suffix {
                 "mermaid" if start.is_none() => start = Some(index),
@@ -193,8 +189,8 @@ fn place_diagrams(
             });
         } else {
             text.lines.extend(source.by_ref().take(count));
-            text.lines[start].spans[0].content = Cow::Borrowed("```mermaid");
-            text.lines[start + count - 1].spans[0].content = Cow::Borrowed("```");
+            text.lines[start].spans[0].content = Cow::Owned(format!("{CODE_OPEN}mermaid"));
+            text.lines[start + count - 1].spans[0].content = Cow::Borrowed(CODE_CLOSE);
             expansions.push(start..=start + count - 1);
         }
         consumed = block.end() + 1;
@@ -207,27 +203,135 @@ fn place_diagrams(
 // pulldown-cmark と描画側で同じ出現順を使って、対象画像の論理行だけに印を付ける。
 const IMAGE_POSITION: Modifier = Modifier::HIDDEN;
 
+// Private adapter tags travel with styles through wrapping and table layout.
+// They are removed before rendering. Keep them disjoint from Ratatui's flags.
+const HEADING_SHIFT: u32 = 9;
+const HEADING: Modifier = Modifier::from_bits_retain(7 << HEADING_SHIFT);
+const QUOTE: Modifier = Modifier::from_bits_retain(1 << 12);
+const LINK: Modifier = Modifier::from_bits_retain(1 << 13);
+// CODE tags inline spans or an entire fenced/indented block line.
+const CODE: Modifier = Modifier::from_bits_retain(1 << 14);
+const IMAGE: Modifier = Modifier::from_bits_retain(1 << 15);
+
+// Markdown input cannot emit NUL: raw controls are sanitized before parsing.
+const CODE_OPEN: &str = "\0tvi-code-open:";
+const CODE_CLOSE: &str = "\0tvi-code-close:";
+const DIAGRAM_FENCE: &str = "\0tvi-diagram:";
+
+fn mark_code_blocks(text: &mut Text<'_>) {
+    let mut in_code = false;
+    for line in &mut text.lines {
+        let fence = line.spans.last_mut().and_then(|span| {
+            if let Some(info) = span.content.strip_prefix(CODE_OPEN) {
+                span.content = Cow::Owned(format!("```{info}"));
+                Some(true)
+            } else if span.content == CODE_CLOSE {
+                span.content = Cow::Borrowed("```");
+                Some(false)
+            } else {
+                None
+            }
+        });
+        if in_code || fence.is_some() {
+            line.style = line.style.add_modifier(CODE);
+        }
+        if let Some(open) = fence {
+            in_code = open;
+        }
+    }
+}
+
+fn take_tags(style: &mut Style) -> Modifier {
+    let tags = style.add_modifier & (HEADING | QUOTE | LINK | CODE | IMAGE);
+    style.add_modifier.remove(tags);
+    tags
+}
+
+/// Resolve adapter tags only on the visible copy; the cached layout is theme-independent.
+pub(crate) fn apply_colorscheme(line: &mut Line<'_>, scheme: &Colorscheme) {
+    let tags = take_tags(&mut line.style);
+    let original = line.style;
+    let code_block = tags.contains(CODE);
+    if code_block {
+        line.style = Style::reset().patch(original);
+    } else {
+        if tags.contains(QUOTE) {
+            line.style = scheme.apply(Group::Quote, line.style);
+        }
+        if let Some(heading) = Group::heading((tags & HEADING).bits() >> HEADING_SHIFT) {
+            line.style = scheme.apply(heading, line.style);
+        }
+    }
+    for span in &mut line.spans {
+        let tags = take_tags(&mut span.style);
+        if tags.contains(IMAGE) && !code_block {
+            span.style = Style::reset().patch(original).patch(span.style);
+        } else if !code_block {
+            // GFM alert labels carry the quote tag on their own styled span.
+            if tags.contains(QUOTE) {
+                span.style = scheme.apply(Group::Quote, span.style);
+            }
+            if tags.contains(LINK) {
+                span.style = scheme.apply(Group::Link, span.style);
+            }
+            if tags.contains(CODE) {
+                span.style = scheme.apply(Group::Code, span.style);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PositionMarkers {
     next: std::sync::Arc<AtomicUsize>,
     ordinals: std::sync::Arc<[usize]>,
     fences: std::sync::Arc<AtomicUsize>,
     diagrams: std::sync::Arc<[(usize, Option<usize>)]>,
-    marker: std::sync::Arc<str>,
 }
 
 impl ::tui_markdown::StyleSheet for PositionMarkers {
+    fn heading(&self, level: u8) -> Style {
+        ::tui_markdown::DefaultStyleSheet
+            .heading(level)
+            .add_modifier(Modifier::from_bits_retain(
+                u16::from(level) << HEADING_SHIFT,
+            ))
+    }
+
+    fn blockquote(&self) -> Style {
+        ::tui_markdown::DefaultStyleSheet
+            .blockquote()
+            .add_modifier(QUOTE)
+    }
+
+    fn alert(&self, kind: ::tui_markdown::AlertKind) -> Style {
+        ::tui_markdown::DefaultStyleSheet
+            .alert(kind)
+            .add_modifier(QUOTE)
+    }
+
+    fn link(&self) -> Style {
+        ::tui_markdown::DefaultStyleSheet.link().add_modifier(LINK)
+    }
+
+    fn code(&self) -> Style {
+        ::tui_markdown::DefaultStyleSheet.code().add_modifier(CODE)
+    }
+
     fn code_block_fence(&self) -> &str {
         // tui-markdown calls this for the opening and closing line of each block.
-        let ordinal = self.fences.fetch_add(1, Ordering::Relaxed) / 2;
+        let fence = self.fences.fetch_add(1, Ordering::Relaxed);
+        let ordinal = fence / 2;
         if self
             .diagrams
             .binary_search_by_key(&ordinal, |&(block, _)| block)
             .is_ok()
         {
-            &self.marker
+            DIAGRAM_FENCE
+        } else if fence.is_multiple_of(2) {
+            CODE_OPEN
         } else {
-            "```"
+            CODE_CLOSE
         }
     }
 
@@ -238,7 +342,7 @@ impl ::tui_markdown::StyleSheet for PositionMarkers {
 
     fn image_alt(&self) -> Style {
         let ordinal = self.next.fetch_add(1, Ordering::Relaxed);
-        let style = Style::new().add_modifier(Modifier::DIM | Modifier::ITALIC);
+        let style = Style::new().add_modifier(Modifier::DIM | Modifier::ITALIC | IMAGE);
         if self.ordinals.binary_search(&ordinal).is_ok() {
             style.add_modifier(IMAGE_POSITION)
         } else {

@@ -83,6 +83,70 @@ impl Drop for Scratch {
 }
 
 #[test]
+fn colorscheme_validates_atomically_and_replaces_overrides() -> mlua::Result<()> {
+    use crate::colorscheme::Group;
+    use ratatui::style::{Color, Modifier, Style};
+
+    let (runtime, diagnostic) = Runtime::with_defaults(Rc::new(TestHost::default()));
+    assert_eq!(diagnostic, None);
+    runtime
+        .lua
+        .load(
+            r##"
+        local set = tvi.colorscheme.set
+        set({ ["ui.status"] = { fg = "#1aB2c3", reverse = false } })
+        local invalid = {
+            { false, "styles" },
+            { { [1] = {} }, "group key" },
+            { { typo = {} }, "typo" },
+            { { ["ui.status"] = true }, "ui.status" },
+            { { ["ui.status"] = { [1] = false } }, "attribute key" },
+            { { ["ui.status"] = { bold = 1 } }, "ui.status.bold" },
+            { { ["ui.status"] = { fg = 1 } }, "ui.status.fg" },
+            { { ["ui.status"] = { fg = "cyan " } }, "ui.status.fg" },
+            { { ["ui.status"] = { fg = "#12" } }, "ui.status.fg" },
+            { { ["ui.status"] = { fg = "#+12345" } }, "ui.status.fg" },
+            { { ["ui.status"] = { fg = string.char(255) } }, "ui.status.fg" },
+            { { ["ui.status"] = { color = "cyan" } }, "ui.status.color" },
+        }
+        for _, case in ipairs(invalid) do
+            local ok, err = pcall(set, case[1])
+            assert(not ok and tostring(err):find(case[2], 1, true), tostring(err))
+        end
+    "##,
+        )
+        .exec()?;
+    let builtin = Style::new().add_modifier(Modifier::REVERSED);
+    assert_eq!(
+        runtime.colorscheme().apply(Group::Status, builtin),
+        Style::new()
+            .fg(Color::Rgb(0x1a, 0xb2, 0xc3))
+            .remove_modifier(Modifier::REVERSED)
+    );
+    runtime
+        .lua
+        .load(
+            r#"
+        tvi.colorscheme.set({ ["ui.prompt"] = { fg = "default", bg = "bright_red" } })
+    "#,
+        )
+        .exec()?;
+    assert_eq!(runtime.colorscheme().apply(Group::Status, builtin), builtin);
+    assert_eq!(
+        runtime
+            .colorscheme()
+            .apply(Group::Prompt, Style::new().fg(Color::Blue)),
+        Style::new().fg(Color::Reset).bg(Color::LightRed),
+    );
+    runtime.lua.load("tvi.colorscheme.set({})").exec()?;
+    assert_eq!(
+        runtime.colorscheme().apply(Group::Prompt, Style::new()),
+        Style::new()
+    );
+    Ok(())
+}
+
+#[test]
 fn plugin_tests() -> Result<(), Box<dyn std::error::Error>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runner = root.join("plugins/tests/testrunner.lua");

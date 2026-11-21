@@ -1,6 +1,7 @@
 use std::{env, io, path::Path, process::ExitCode};
 
 mod app;
+mod colorscheme;
 mod files;
 mod images;
 mod logging;

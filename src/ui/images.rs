@@ -5,6 +5,7 @@ use image::{DynamicImage, Pixel, RgbImage, Rgba};
 use ratatui::{
     Frame,
     layout::{Rect, Size},
+    style::Style,
 };
 
 use ratatui_image::{
@@ -148,6 +149,11 @@ impl PlacedImage {
             return;
         }
         let clip = Rect::new(body.x, body.y + y, body.width, height);
+        let bounds = Rect {
+            width: self.protocol.size().width.min(body.width),
+            ..clip
+        };
+        frame.buffer_mut().set_style(bounds, Style::reset());
         self.drawn.set(true);
         frame.render_widget(SlicedImage::new(&self.protocol, (0, -skip).into()), clip);
     }

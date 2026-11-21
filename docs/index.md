@@ -23,6 +23,7 @@ tviは、端末上でMarkdownファイルを読むための閲覧専用ビュー
 | [リンク先への移動](features/links.md) | ローカルリンクの一覧、文書間の移動と復帰 |
 | [ファイルピッカー](features/file-picker.md) | プロジェクト内のMarkdownファイルをパスで探して開く |
 | [Lua設定とプラグイン](features/lua.md) | 起動時の設定、キーマップ、文書の操作や外部コマンドの公開API |
+| [カラースキーム](features/colorscheme.md) | Luaからの配色変更、指定できる色と装飾 |
 
 ### 設計方針
 

@@ -8,6 +8,7 @@ use std::{
 use mlua::{Error, Function, Lua, RegistryKey, Table, UserData, UserDataMethods, Value};
 
 use crate::{
+    colorscheme::Colorscheme,
     logging::{self, Level},
     ui::{
         float::FloatOptions,
@@ -15,6 +16,7 @@ use crate::{
     },
 };
 
+mod colorscheme;
 mod config;
 mod process;
 #[cfg(test)]
@@ -47,6 +49,7 @@ pub struct Runtime {
 struct State {
     host: Rc<dyn Host>,
     keymap: RefCell<Keymap>,
+    colorscheme: RefCell<Colorscheme>,
     mappings: RefCell<Vec<RegistryKey>>,
     float: RefCell<Option<ActiveFloat>>,
 }
@@ -67,6 +70,7 @@ impl Runtime {
             state: Rc::new(State {
                 host,
                 keymap: RefCell::default(),
+                colorscheme: RefCell::default(),
                 mappings: RefCell::default(),
                 float: RefCell::default(),
             }),
@@ -238,11 +242,16 @@ impl Runtime {
         )?;
         tvi.set("ui", ui)?;
         process::install(&self.lua, &tvi)?;
+        colorscheme::install(&self.lua, &tvi, Rc::downgrade(&self.state))?;
         self.lua.globals().set("tvi", tvi)
     }
 
     pub fn keymap(&self) -> Ref<'_, Keymap> {
         self.state.keymap.borrow()
+    }
+
+    pub(crate) fn colorscheme(&self) -> Ref<'_, Colorscheme> {
+        self.state.colorscheme.borrow()
     }
 
     pub fn run_mapping(&self, id: u64) -> Result<(), String> {

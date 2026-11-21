@@ -9,11 +9,15 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Text},
-    widgets::{Clear, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::app::{App, Direction, Mode};
+use crate::{
+    app::{App, Direction, Mode},
+    colorscheme::{Colorscheme, Group},
+    markdown::tui_markdown::apply_colorscheme,
+};
 use layout::Layout;
 
 #[cfg(test)]
@@ -32,37 +36,49 @@ pub fn body_area(area: Rect, mode: Mode) -> Rect {
     }
 }
 
-pub fn draw(frame: &mut Frame<'_>, app: &App, layout: &Layout<'_>, float_active: bool) {
+pub fn draw(
+    frame: &mut Frame<'_>,
+    app: &App,
+    layout: &Layout<'_>,
+    float_active: bool,
+    scheme: &Colorscheme,
+) {
     let area = frame.area();
     if area.is_empty() {
         return;
     }
     let body = body_area(area, app.mode());
+    let normal = scheme.apply(Group::DocumentNormal, Style::default());
     let text = layout.text();
-    if !body.is_empty() && app.top_row() < text.lines.len() {
+    if app.help_open() && !body.is_empty() {
+        frame.render_widget(
+            Paragraph::new(HELP).style(normal).wrap(Wrap { trim: true }),
+            body,
+        );
+    } else if !body.is_empty() {
         let lines = text
             .lines
             .iter()
             .skip(app.top_row())
             .take(usize::from(body.height))
-            .cloned();
+            .cloned()
+            .map(|mut line| {
+                apply_colorscheme(&mut line, scheme);
+                line
+            });
         frame.render_widget(
-            Paragraph::new(lines.collect::<Text<'_>>().style(text.style)),
+            Paragraph::new(lines.collect::<Text<'_>>()).style(normal.patch(text.style)),
             body,
         );
-        highlight(frame, app, body, layout);
-        if !app.help_open() && !float_active {
+        highlight(frame, app, body, layout, scheme);
+        if !float_active {
             layout.draw_images(frame, body, app.top_row());
         }
-    }
-    if app.help_open() && !body.is_empty() {
-        frame.render_widget(Clear, body);
-        frame.render_widget(Paragraph::new(HELP).wrap(Wrap { trim: true }), body);
     }
     let status = Rect::new(area.x, body.bottom(), area.width, 1);
     frame.render_widget(
         Paragraph::new(status_line(app, layout.rows().len()))
-            .style(Style::new().add_modifier(Modifier::REVERSED)),
+            .style(scheme.apply(Group::Status, Style::new().add_modifier(Modifier::REVERSED))),
         status,
     );
 
@@ -71,7 +87,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, layout: &Layout<'_>, float_active:
         let prompt_area = Rect::new(area.x, prompt_y, area.width, 1);
         let (suffix, width) = prompt_suffix(app.prompt(), area.width - 1);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![prefix.into(), suffix.into()])),
+            Paragraph::new(Line::from(vec![prefix.into(), suffix.into()]))
+                .style(scheme.apply(Group::Prompt, Style::default())),
             prompt_area,
         );
         if !float_active && width < area.width - 1 {
@@ -133,7 +150,13 @@ fn status_line(app: &App, len: usize) -> String {
     text
 }
 
-fn highlight(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Layout<'_>) {
+fn highlight(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    layout: &Layout<'_>,
+    scheme: &Colorscheme,
+) {
     let (matches, current) = app.highlights();
     if matches.is_empty() {
         return;
@@ -150,9 +173,15 @@ fn highlight(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Layout<'_>) 
             .chain(current)
         {
             let style = if Some(hit) == current {
-                Style::new().bg(Color::Yellow).fg(Color::Black)
+                scheme.apply(
+                    Group::SearchCurrent,
+                    Style::new().bg(Color::Yellow).fg(Color::Black),
+                )
             } else {
-                Style::new().bg(Color::Blue).fg(Color::White)
+                scheme.apply(
+                    Group::SearchMatch,
+                    Style::new().bg(Color::Blue).fg(Color::White),
+                )
             };
             for cell in row.cells_for(hit.clone()) {
                 let (Ok(left), Ok(right)) = (
@@ -200,7 +229,7 @@ mod tests {
                 &layout,
                 usize::from(body_area(frame.area(), app.mode()).height),
             );
-            draw(frame, app, &layout, false);
+            draw(frame, app, &layout, false, &Colorscheme::default());
         })?;
         Ok(())
     }
@@ -219,6 +248,133 @@ mod tests {
                 app.apply(action, &locations, doc.search_text());
             }
         }
+    }
+
+    #[test]
+    fn colorscheme_layers_document_markdown_and_search_without_tinting_code_or_images()
+    -> Result<(), Infallible> {
+        use KeyCode::{Char, Enter};
+
+        let source = "# find second find\n\n[link](path) `inline` ![`alt`](x.png)\n\n> quote\n\n```\nfind code\n```\n\n```mermaid\ngraph TD\n```";
+        let mut app = App::new("test.md".into(), source.into());
+        let doc = prepare(&TuiMarkdown, source, 40);
+        let layout = Layout::at_width(&doc, 40);
+        let mut terminal = Terminal::new(TestBackend::new(40, 25))?;
+        let mut input = Input::default();
+        let mut scheme = Colorscheme::default();
+        scheme.set(
+            Group::DocumentNormal,
+            Style::new().fg(Color::Red).bg(Color::Green),
+        );
+        scheme.set(
+            Group::Heading1,
+            Style::new()
+                .bg(Color::Reset)
+                .remove_modifier(Modifier::UNDERLINED),
+        );
+        scheme.set(Group::Link, Style::new().fg(Color::Magenta));
+        scheme.set(
+            Group::Quote,
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+        );
+        scheme.set(Group::Code, Style::new().fg(Color::LightRed));
+        scheme.set(Group::SearchMatch, Style::new().bg(Color::LightBlue));
+        scheme.set(
+            Group::SearchCurrent,
+            Style::new()
+                .bg(Color::LightYellow)
+                .add_modifier(Modifier::REVERSED),
+        );
+
+        let row = |needle| -> u16 {
+            layout
+                .text()
+                .lines
+                .iter()
+                .position(|line| line.to_string().contains(needle))
+                .and_then(|row| u16::try_from(row).ok())
+                .unwrap_or_else(|| panic!("missing line: {needle}"))
+        };
+        app.reflow(&layout, 24);
+        press(
+            &mut input,
+            &mut app,
+            &doc,
+            40,
+            "/find".chars().map(Char).chain([Enter]),
+        );
+        terminal.draw(|frame| draw(frame, &app, &layout, false, &scheme))?;
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer[(9, 23)].bg, Color::Green);
+        assert_eq!(buffer[(0, 0)].fg, Color::Red);
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+        assert_eq!(buffer[(2, 0)].bg, Color::LightYellow);
+        assert_eq!(buffer[(14, 0)].bg, Color::LightBlue);
+        assert_eq!(buffer[(2, 0)].modifier, Modifier::BOLD | Modifier::REVERSED);
+        assert_eq!(buffer[(0, row("link"))].fg, Color::Magenta);
+        assert_eq!(buffer[(12, row("inline"))].fg, Color::LightRed);
+        assert_eq!(buffer[(20, row("[img]"))].bg, Color::Reset);
+        assert_eq!(buffer[(2, row("quote"))].modifier, Modifier::ITALIC);
+        assert_eq!(buffer[(0, row("find code"))].bg, Color::LightBlue);
+        assert_eq!(buffer[(5, row("find code"))].fg, Color::Reset);
+        assert_eq!(buffer[(5, row("find code"))].bg, Color::Reset);
+        assert_eq!(buffer[(0, row("graph TD"))].bg, Color::Reset);
+
+        press(&mut input, &mut app, &doc, 40, [KeyCode::F(1)]);
+        terminal.draw(|frame| draw(frame, &app, &layout, false, &scheme))?;
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            (buffer[(0, 0)].symbol(), buffer[(0, 0)].fg),
+            ("H", Color::Red)
+        );
+        assert_eq!(buffer[(39, 23)].bg, Color::Green);
+        Ok(())
+    }
+
+    #[test]
+    fn colorscheme_patches_only_explicit_quote_attributes_on_gfm_alert_labels()
+    -> Result<(), Infallible> {
+        let source = "> [!NOTE]\n> body";
+        let app = App::new("test.md".into(), source.into());
+        let doc = prepare(&TuiMarkdown, source, 40);
+        let layout = Layout::at_width(&doc, 40);
+        let mut terminal = Terminal::new(TestBackend::new(40, 5))?;
+        for (override_style, expected_fg, expected_modifier) in [
+            (None, Color::Blue, Modifier::BOLD),
+            (
+                Some(Style::new().fg(Color::Red)),
+                Color::Red,
+                Modifier::BOLD,
+            ),
+            (
+                Some(Style::new().remove_modifier(Modifier::BOLD)),
+                Color::Blue,
+                Modifier::empty(),
+            ),
+            (
+                Some(Style::new().fg(Color::Red).remove_modifier(Modifier::BOLD)),
+                Color::Red,
+                Modifier::empty(),
+            ),
+        ] {
+            let mut scheme = Colorscheme::default();
+            if let Some(style) = override_style {
+                scheme.set(Group::Quote, style);
+            }
+            terminal.draw(|frame| draw(frame, &app, &layout, false, &scheme))?;
+            let buffer = terminal.backend().buffer();
+            let x = (0..40)
+                .find(|&x| buffer[(x, 0)].symbol() == "N")
+                .unwrap_or_else(|| panic!("missing Note label"));
+            assert_eq!(buffer[(x, 0)].fg, expected_fg, "{override_style:?}");
+            assert_eq!(
+                buffer[(x, 0)].modifier,
+                expected_modifier,
+                "{override_style:?}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -339,6 +495,13 @@ mod tests {
         let doc = TuiMarkdown.render_document(source, 16, &resources);
         let solid = |rgb| Some(image::RgbImage::from_pixel(40, 80, image::Rgb(rgb)).into());
         let loaded = [solid([255, 0, 0]), solid([0, 0, 255])];
+        let mut scheme = Colorscheme::default();
+        scheme.set(
+            Group::DocumentNormal,
+            Style::new()
+                .bg(Color::Green)
+                .add_modifier(Modifier::REVERSED),
+        );
         let mut terminal = Terminal::new(TestBackend::new(16, 5))?;
         let paint = |terminal: &mut Terminal<TestBackend>, app: &mut App, float| {
             terminal
@@ -353,7 +516,7 @@ mod tests {
                         &layout,
                         usize::from(body_area(frame.area(), app.mode()).height),
                     );
-                    draw(frame, app, &layout, float);
+                    draw(frame, app, &layout, float, &scheme);
                 })
                 .map(|_| ())
         };
@@ -374,6 +537,12 @@ mod tests {
             terminal.backend().buffer()[(0, 2)].bg,
             Color::Rgb(255, 0, 0)
         );
+        assert!(
+            !terminal.backend().buffer()[(0, 2)]
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(terminal.backend().buffer()[(15, 2)].bg, Color::Green);
         assert_eq!(terminal.backend().buffer()[(0, 4)].symbol(), "N");
         for motion in [Motion::PageDown, Motion::LineDown] {
             app.apply(Action::Move(motion), locations, text);
@@ -390,7 +559,7 @@ mod tests {
             Color::Rgb(0, 0, 255)
         );
         paint(&mut terminal, &mut app, true)?;
-        assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Reset);
+        assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Green);
         app.apply(Action::Help, locations, text);
         paint(&mut terminal, &mut app, false)?;
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "H");
@@ -454,7 +623,7 @@ mod tests {
                     &layout,
                     usize::from(body_area(frame.area(), app.mode()).height),
                 );
-                draw(frame, &app, &layout, false);
+                draw(frame, &app, &layout, false, &Colorscheme::default());
             })?;
             let buffer = terminal.backend().buffer();
             let y = caption_row.saturating_sub(app.top_row()) as u16;

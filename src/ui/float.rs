@@ -8,6 +8,8 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::colorscheme::{Colorscheme, Group};
+
 #[derive(Default)]
 pub struct FloatOptions {
     pub title: Option<String>,
@@ -75,12 +77,12 @@ impl Floats {
         self.current.as_ref().map(|state| state.handle)
     }
 
-    pub fn draw(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    pub fn draw(&mut self, frame: &mut Frame<'_>, area: Rect, scheme: &Colorscheme) {
         let area = frame.area().intersection(area);
         if let Some(state) = &mut self.current
             && !area.is_empty()
         {
-            state.draw(frame, area);
+            state.draw(frame, area, scheme);
         }
     }
 }
@@ -115,7 +117,7 @@ impl Float {
         Ok(())
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>, bounds: Rect) {
+    fn draw(&mut self, frame: &mut Frame<'_>, bounds: Rect, scheme: &Colorscheme) {
         let header = self.header.as_deref();
         let framed = bounds.width >= 3
             && bounds.height >= 3 + u16::from(header.is_some() && !self.lines.is_empty());
@@ -140,19 +142,44 @@ impl Float {
         );
         clear_crossing_graphemes(frame.buffer_mut(), area);
         frame.render_widget(Clear, area);
+        let normal = scheme.apply(Group::FloatNormal, Style::default());
+        frame.buffer_mut().set_style(area, normal);
         let mut content = area;
         if framed {
-            let block = Block::bordered().title(clip(&self.title, area.width - border));
+            let border_style = scheme.apply(Group::FloatBorder, normal);
+            let block = Block::bordered()
+                .border_style(border_style)
+                .title_style(border_style)
+                .title(clip(&self.title, area.width - border));
             content = block.inner(area);
             frame.render_widget(block, area);
         }
 
         if let Some(header) = header.filter(|_| content.height > 1 || self.lines.is_empty()) {
-            draw_row(frame, content, header, Modifier::BOLD);
+            draw_row(
+                frame,
+                content,
+                header,
+                scheme.apply(
+                    Group::FloatNormal,
+                    Style::new().add_modifier(Modifier::BOLD),
+                ),
+            );
             content.y += 1;
             content.height -= 1;
         } else if !framed && self.lines.is_empty() {
-            draw_row(frame, content, &self.title, Modifier::BOLD);
+            draw_row(
+                frame,
+                content,
+                &self.title,
+                scheme.apply(
+                    Group::FloatBorder,
+                    scheme.apply(
+                        Group::FloatNormal,
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
+                ),
+            );
         }
         if content.is_empty() || self.lines.is_empty() {
             return;
@@ -175,7 +202,12 @@ impl Float {
             } else {
                 Modifier::empty()
             };
-            draw_row(frame, Rect { y, ..content }, line, modifier);
+            draw_row(
+                frame,
+                Rect { y, ..content },
+                line,
+                scheme.apply(Group::FloatNormal, Style::new().add_modifier(modifier)),
+            );
         }
     }
 }
@@ -225,10 +257,9 @@ fn clip(text: &str, mut width: u16) -> &str {
     text
 }
 
-fn draw_row(frame: &mut Frame<'_>, area: Rect, text: &str, modifier: Modifier) {
+fn draw_row(frame: &mut Frame<'_>, area: Rect, text: &str, style: Style) {
     frame.render_widget(
-        Paragraph::new(Line::from(clip(text, area.width)))
-            .style(Style::new().add_modifier(modifier)),
+        Paragraph::new(Line::from(clip(text, area.width))).style(style),
         Rect { height: 1, ..area },
     );
 }
@@ -339,7 +370,7 @@ mod tests {
                             ..area
                         },
                     );
-                    floats.draw(frame, body);
+                    floats.draw(frame, body, &Colorscheme::default());
                 })
                 .map(|_| ())
         };
@@ -400,7 +431,7 @@ mod tests {
                         },
                     );
                     frame.buffer_mut()[(14, 3)].set_bg(Color::Blue);
-                    floats.draw(frame, area);
+                    floats.draw(frame, area, &Colorscheme::default());
                 })
                 .map(|completed| completed.buffer[(14, 3)].bg)
         };
