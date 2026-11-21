@@ -27,6 +27,8 @@ local function setup(responses)
   model.press = function(name, input)
     model.on_key(model.float, { name = name, text = input })
   end
+  -- テストで使うAPIだけを差し替える。
+  ---@diagnostic disable-next-line: missing-fields
   _G.tvi = {
     ui = {
       current_view = function() return view end,

@@ -42,6 +42,8 @@ local function open_picker(candidates)
     on_key(float, { name = name, text = text })
   end
 
+  -- テストで使うAPIだけを差し替える。
+  ---@diagnostic disable-next-line: missing-fields
   _G.tvi = { ui = { current_view = function() return picker.current_view end } }
   links.open()
   return picker

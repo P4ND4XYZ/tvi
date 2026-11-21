@@ -2,8 +2,8 @@
 
 [目次に戻る](../index.md)
 
-[Lua設定とプラグイン](../features/lua.md)の公開APIを提供し、[リンク一覧](../features/links.md)と[ファイルピッカー](../features/file-picker.md)をLuaで組み立てます。
-Luaの組み込みには `mlua` の `lua54` と `vendored` を使い、既存のイベントループで実行します。
+[Lua設定とプラグイン](../features/lua.md)の公開APIを提供します。
+Luaの組み込みには `mlua` の `lua54` と `vendored` を使います。
 
 ## 責務と依存関係
 

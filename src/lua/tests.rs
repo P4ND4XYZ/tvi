@@ -150,9 +150,10 @@ fn colorscheme_validates_atomically_and_replaces_overrides() -> mlua::Result<()>
 fn plugin_tests() -> Result<(), Box<dyn std::error::Error>> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let runner = root.join("plugins/tests/testrunner.lua");
-    let lua = Lua::new();
-    config::install_searcher(&lua, &root.join("init.lua"))?;
-    config::source_chunk(&lua, &runner, &fs::read(&runner)?).exec()?;
+    let runtime = Runtime::new(Rc::new(TestHost::default()));
+    runtime.install_api()?;
+    config::install_searcher(&runtime.lua, &root.join("init.lua"))?;
+    config::source_chunk(&runtime.lua, &runner, &fs::read(&runner)?).exec()?;
     Ok(())
 }
 

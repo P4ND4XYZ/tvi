@@ -8,14 +8,16 @@ local function list_files(root)
   }
   local program = "fd"
   local result, err = tvi.process.run(program, opts)
-  if not result and err.kind == "not_found" then
+  -- run は結果がないときにエラーの詳細を返す。
+  if not result and (err --[[@as Tvi.ProcessError]]).kind == "not_found" then
     program = "fdfind"
     result, err = tvi.process.run(program, opts)
-    if not result and err.kind == "not_found" then
+    if not result and (err --[[@as Tvi.ProcessError]]).kind == "not_found" then
       return nil, "not found fd."
     end
   end
   if not result then
+    ---@cast err -nil
     return nil, program .. ": " .. err.message
   end
   if not result.ok then
@@ -94,12 +96,14 @@ function M.open()
   local view = tvi.ui.current_view()
   local root, err = view:project_root({ root_markers = M.root_markers })
   if not root then
+    ---@cast err -nil
     tvi.ui.notify(err)
     return
   end
   local files
   files, err = list_files(root)
   if not files then
+    ---@cast err -nil
     tvi.ui.notify(err)
     return
   end
@@ -132,6 +136,7 @@ function M.open()
         if ok then
           float:close()
         else
+          ---@cast reason -nil
           tvi.ui.notify(reason)
         end
       end

@@ -68,9 +68,3 @@ UTF-8のJSON Lines（1行に1件のJSON）で保存します。全レコード�
 | `mermaid.detect` | `mmdc` の検出結果 `available` と、それに応じた `action`（例：`show_code`）。 |
 | `mermaid.summary` | `document`、`cache_hits`（キャッシュ利用件数）、`converted`（変換成功件数）、`fallbacks`（コード表示に戻した件数）、`elapsed_ms`（所要時間）。 |
 | `terminal.image_mode` | 選んだ画像表示方式 `mode` と、その理由 `reason`（例：`kitty_not_detected`）。 |
-
-## 受け入れ条件
-
-- 既定と `TVI_LOG=debug` で記録範囲が切り替わり、ログは日時付きの有効なJSONとして1行ずつ読めます。ユーザー入力や外部コマンドの出力は混入しません。
-- UTCの日付変更とサイズ超過でそれぞれファイルが切り替わり、古いログも含めて6本を超えません。
-- ログを保存できない環境でも文書を読め、通知は一度だけ表示されます。
