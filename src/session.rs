@@ -7,6 +7,7 @@ use crossterm::event::KeyEvent;
 use crate::{
     app::{App, Document, ViewRows},
     images,
+    logging::{self, Level},
     lua::{Host, LuaLink, Runtime},
     markdown::{MarkdownRenderer, tui_markdown::TuiMarkdown},
     terminal::{self, ImageMode, Screen},
@@ -58,6 +59,7 @@ enum ReadDocumentError {
 
 pub fn read_document(path: &Path) -> io::Result<Document> {
     load_document(path).map_err(|error| {
+        error.log(path, "startup");
         let label = path.to_string_lossy();
         let label = label.escape_debug();
         match error {
@@ -70,6 +72,45 @@ pub fn read_document(path: &Path) -> io::Result<Document> {
             ),
         }
     })
+}
+
+impl ReadDocumentError {
+    fn log(&self, path: &Path, trigger: &'static str) {
+        match self {
+            Self::Read(error) => log_document_failure(
+                path,
+                trigger,
+                "read",
+                logging::io_reason(error),
+                error.raw_os_error(),
+            ),
+            Self::Decode(_) => log_document_failure(path, trigger, "decode", "invalid_utf8", None),
+        }
+    }
+}
+
+pub(crate) fn log_document_failure(
+    path: &Path,
+    trigger: &'static str,
+    stage: &'static str,
+    reason: &'static str,
+    os_code: Option<i32>,
+) {
+    let mut fields = serde_json::json!({
+        "document":logging::basename(path), "trigger":trigger, "stage":stage, "reason":reason,
+    });
+    if let Some(code) = os_code {
+        fields["os_code"] = code.into();
+    }
+    logging::emit(
+        if trigger == "startup" {
+            Level::Error
+        } else {
+            Level::Warn
+        },
+        "document.open_failed",
+        fields,
+    );
 }
 
 fn load_document(path: &Path) -> Result<Document, ReadDocumentError> {
@@ -120,12 +161,36 @@ impl Host for RefCell<Session> {
     }
 
     fn open_link(&self, view: u64, id: u64) -> Result<(), String> {
-        validate_view(view)?;
-        let path = self.borrow().app.resolve_link(id)?;
-        require_regular_file(&path).map_err(|error| format!("cannot read: {error}"))?;
-        let document = load_document(&path).map_err(|error| match error {
-            ReadDocumentError::Read(error) => format!("cannot read: {error}"),
-            ReadDocumentError::Decode(error) => format!("not valid UTF-8: {error}"),
+        let path = {
+            let session = self.borrow();
+            validate_view(view)
+                .and_then(|()| session.app.resolve_link(id))
+                .inspect_err(|_| {
+                    log_document_failure(
+                        session.app.document_path(),
+                        "link",
+                        "resolve",
+                        "invalid_link",
+                        None,
+                    );
+                })?
+        };
+        require_regular_file(&path).map_err(|error| {
+            log_document_failure(
+                &path,
+                "link",
+                "metadata",
+                logging::io_reason(&error),
+                error.raw_os_error(),
+            );
+            format!("cannot read: {error}")
+        })?;
+        let document = load_document(&path).map_err(|error| {
+            error.log(&path, "link");
+            match error {
+                ReadDocumentError::Read(error) => format!("cannot read: {error}"),
+                ReadDocumentError::Decode(error) => format!("not valid UTF-8: {error}"),
+            }
         })?;
         self.borrow_mut().app.open_document(document);
         Ok(())
@@ -182,7 +247,7 @@ fn run_document(
     let (document_id, document, images) = {
         let session = session.borrow();
         let app = &session.app;
-        let width = screen.size()?.width;
+        let width = terminal::check(screen.size(), "size", Some(image_mode), "exit")?.width;
         let resources = app.markdown_resources();
         let images = if !resources.images.is_empty() && image_mode != ImageMode::Text {
             images::load(app.document_path(), &resources.images)
@@ -199,7 +264,7 @@ fn run_document(
     let mut layout = Layout::with_images(&document, width, &images, image_mode);
     let mut previous_size = None;
     let result = (|| loop {
-        let size = screen.size()?;
+        let size = terminal::check(screen.size(), "size", Some(image_mode), "exit")?;
         if previous_size
             .replace(size)
             .is_some_and(|previous| previous != size)
@@ -219,6 +284,12 @@ fn run_document(
                 layout = Layout::with_images(&document, width, &images, image_mode);
             }
             let mut session = session.borrow_mut();
+            if session.app.mode() == crate::app::Mode::Normal
+                && session.app.notice().is_none()
+                && logging::take_failure_notice()
+            {
+                session.app.set_notice("ログを保存できません".into());
+            }
             let body = ui::body_area(area, session.app.mode());
             session.app.reflow(&layout, usize::from(body.height));
             ui::draw(
@@ -229,7 +300,13 @@ fn run_document(
             );
             session.floats.draw(frame, body);
         });
-        let cleanup = terminal::delete_images(retired);
+        let draw_result = terminal::check(draw_result, "draw", Some(mode), "exit");
+        let cleanup = terminal::check(
+            terminal::delete_images(retired),
+            "delete_images",
+            Some(mode),
+            "exit",
+        );
         draw_result?;
         cleanup?;
         loop {
@@ -243,14 +320,19 @@ fn run_document(
                 }
                 break;
             }
-            let size = screen.size()?;
+            let size = terminal::check(screen.size(), "size", Some(mode), "exit")?;
             if (size.width, size.height) != drawn_size || terminal_input.image_mode() != image_mode
             {
                 break;
             }
         }
     })();
-    result.and(terminal::delete_images(layout.transmitted_ids()))
+    result.and(terminal::check(
+        terminal::delete_images(layout.transmitted_ids()),
+        "delete_images",
+        Some(image_mode),
+        "exit",
+    ))
 }
 
 impl InputQueue {
@@ -458,6 +540,67 @@ error("startup failed")
         }));
         session.app.apply(Action::JumpBack, &[], "");
         assert_eq!(session.app.document_id(), initial_id);
+        Ok(())
+    }
+
+    #[test]
+    fn document_image_and_config_events_use_only_safe_fields() -> Result<(), Box<dyn Error>> {
+        use serde_json::Value;
+
+        let scratch = Scratch::new()?;
+        let docs = scratch.0.join("private-directory");
+        fs::create_dir(&docs)?;
+        let source = docs.join("source.md");
+        fs::write(
+            &source,
+            "[Missing](missing.md)\n\n![private-caption](private-target.png)",
+        )?;
+        let logs = scratch.0.join("logs");
+        let session = Rc::new(RefCell::new(Session::new(read_document(&source)?)));
+
+        logging::capture_for_test(&logs, || -> io::Result<()> {
+            let init = scratch.0.join("init.lua");
+            let (_, error) = Runtime::load_from(session.clone(), Some(init.clone()));
+            assert!(error.is_none());
+            assert!(!logs.exists());
+            let id = session.borrow().app.links()[0].id;
+            assert!(session.open_link(BODY_VIEW, id).is_err());
+            assert_eq!(session.borrow().app.name(), "source.md");
+
+            let session_ref = session.borrow();
+            let app = &session_ref.app;
+            let images = images::load(app.document_path(), &app.markdown_resources().images);
+            assert_eq!(images.len(), 1);
+            assert!(images[0].is_none());
+            drop(session_ref);
+
+            fs::write(&init, "error('private-lua-message')")?;
+            let (_, error) = Runtime::load_from(session.clone(), Some(init));
+            assert!(error.is_some_and(|error| error.contains("private-lua-message")));
+            Ok(())
+        })?;
+
+        let output = fs::read_to_string(logs.join("tvi.log"))?;
+        assert!(!output.contains("private-"));
+        let records: Vec<Value> = output
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["event"], "document.open_failed");
+        assert_eq!(records[0]["document"], "missing.md");
+        assert_eq!(records[0]["trigger"], "link");
+        assert_eq!(records[0]["level"], "WARN");
+        assert_eq!(records[0]["reason"], "not_found");
+        assert_eq!(records[1]["event"], "image.load_failed");
+        assert_eq!(records[1]["document"], "source.md");
+        assert_eq!(records[1]["image_index"], 1);
+        assert_eq!(records[1]["reason"], "not_found");
+        assert_eq!(records[2]["event"], "lua.failed");
+        assert_eq!(records[2]["source"], "init.lua");
+        assert_eq!(records[2]["stage"], "config");
+        assert_eq!(records[2]["reason"], "runtime_error");
+        assert_eq!(records[2]["action"], "use_defaults");
         Ok(())
     }
 

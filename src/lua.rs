@@ -7,9 +7,12 @@ use std::{
 
 use mlua::{Error, Function, Lua, RegistryKey, Table, UserData, UserDataMethods, Value};
 
-use crate::ui::{
-    float::FloatOptions,
-    input::{Keymap, KeymapMode, PluginKey},
+use crate::{
+    logging::{self, Level},
+    ui::{
+        float::FloatOptions,
+        input::{Keymap, KeymapMode, PluginKey},
+    },
 };
 
 mod config;
@@ -78,17 +81,35 @@ impl Runtime {
         let source = match config::read_source(&path) {
             Ok(source) => source,
             Err(error) if error.kind() == ErrorKind::NotFound => return (Self::new(host), None),
-            Err(error) => return (Self::new(host), Some(format!("{filename}: {error}"))),
+            Err(error) => {
+                logging::emit(
+                    Level::Warn,
+                    "lua.failed",
+                    serde_json::json!({
+                        "source":"init.lua", "stage":"config_read", "reason":logging::io_reason(&error),
+                        "action":"use_defaults",
+                    }),
+                );
+                return (Self::new(host), Some(format!("{filename}: {error}")));
+            }
         };
         let runtime = Self::new(Rc::clone(&host));
         match runtime.configure(&path, &source) {
             Ok(()) => (runtime, None),
             Err(error) => {
+                log_failure("config", "use_defaults", &error, Some("init.lua"));
                 let mut message = lua_diagnostic(&error, Some(&filename));
                 let active = runtime.state.float.borrow_mut().take();
                 if let Some(active) = active
                     && let Err(error) = host.close_float(active.view, active.id)
                 {
+                    logging::emit(
+                        Level::Warn,
+                        "lua.failed",
+                        serde_json::json!({
+                            "stage":"float_close", "reason":"host_error", "action":"reset_session",
+                        }),
+                    );
                     message.push_str("\ncannot close configuration float: ");
                     message.push_str(&error);
                 }
@@ -170,8 +191,10 @@ impl Runtime {
     }
 
     pub fn run_mapping(&self, id: u64) -> Result<(), String> {
-        self.call_mapping(id)
-            .map_err(|error| lua_diagnostic(&error, None))
+        self.call_mapping(id).map_err(|error| {
+            log_failure("key", "continue", &error, None);
+            lua_diagnostic(&error, None)
+        })
     }
 
     fn call_mapping(&self, id: u64) -> mlua::Result<()> {
@@ -187,8 +210,10 @@ impl Runtime {
     }
 
     pub fn run_float_key(&self, view: u64, float: u64, key: PluginKey) -> Result<(), String> {
-        self.call_float_key(view, float, key)
-            .map_err(|error| lua_diagnostic(&error, None))
+        self.call_float_key(view, float, key).map_err(|error| {
+            log_failure("float_key", "close_float", &error, None);
+            lua_diagnostic(&error, None)
+        })
     }
 
     fn call_float_key(&self, view: u64, id: u64, key: PluginKey) -> mlua::Result<()> {
@@ -219,6 +244,30 @@ impl Runtime {
         self.state.forget_float(float);
         self.lua.expire_registry_values();
     }
+}
+
+fn log_failure(stage: &str, action: &str, error: &Error, source: Option<&str>) {
+    let reason = match error {
+        Error::SyntaxError { .. } => "syntax_error",
+        Error::RuntimeError(_) => "runtime_error",
+        Error::CallbackError { .. } => "callback_error",
+        Error::MemoryError(_) => "memory_error",
+        _ => "lua_error",
+    };
+    let mut fields = serde_json::json!({"stage":stage, "reason":reason, "action":action});
+    if let Some(source) = source {
+        fields["source"] = source.into();
+        // Only use a numeric location attributed to the known configuration chunk by Lua's parser.
+        if let Error::SyntaxError { message, .. } = error
+            && let Some((name, rest)) = message.split_once(':')
+            && name == source
+            && let Some((line, _)) = rest.split_once(':')
+            && let Ok(line) = line.parse::<u32>()
+        {
+            fields["line"] = line.into();
+        }
+    }
+    logging::emit(Level::Warn, "lua.failed", fields);
 }
 
 fn lua_diagnostic(error: &Error, config_name: Option<&str>) -> String {

@@ -6,7 +6,10 @@ use std::{
 
 use image::{DynamicImage, ImageFormat, ImageReader, Limits};
 
-use crate::markdown::ImageReference;
+use crate::{
+    logging::{self, Level},
+    markdown::ImageReference,
+};
 
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 4096;
@@ -20,39 +23,65 @@ pub fn load(document: &Path, references: &[ImageReference]) -> Vec<Option<Dynami
         .iter()
         .map(|reference| {
             let target = Path::new(&reference.target);
-            if budget == 0
-                || target.has_root()
+            let result = if budget == 0 {
+                Err(("limits", "document_budget"))
+            } else if target.has_root()
                 || matches!(target.components().next(), Some(Component::Prefix(_)))
             {
-                return None;
+                Err(("resolve", "non_relative_path"))
+            } else {
+                decode(&parent.join(target), budget)
+            };
+            match result {
+                Ok(image) => {
+                    budget -= image.as_bytes().len() as u64;
+                    Some(image)
+                }
+                Err((stage, reason)) => {
+                    logging::emit(
+                        Level::Warn,
+                        "image.load_failed",
+                        serde_json::json!({
+                            "document":logging::basename(document), "image_index":reference.ordinal + 1,
+                            "stage":stage, "reason":reason,
+                        }),
+                    );
+                    None
+                }
             }
-            let image = decode(&parent.join(target), budget)?;
-            budget -= image.as_bytes().len() as u64;
-            Some(image)
         })
         .collect()
 }
 
-fn decode(path: &Path, budget: u64) -> Option<DynamicImage> {
+fn decode(path: &Path, budget: u64) -> Result<DynamicImage, (&'static str, &'static str)> {
     // Check before opening so a FIFO or directory is not read as an image.
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-        return None;
+    let metadata = fs::metadata(path).map_err(|error| ("metadata", logging::io_reason(&error)))?;
+    if !metadata.is_file() {
+        return Err(("metadata", "not_regular_file"));
     }
-    let file = File::open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(("limits", "file_size"));
+    }
+    let file = File::open(path).map_err(|error| ("open", logging::io_reason(&error)))?;
+    if !file
+        .metadata()
+        .map_err(|error| ("metadata", logging::io_reason(&error)))?
+        .is_file()
+    {
+        return Err(("metadata", "not_regular_file"));
     }
     // Bound input even if the file grows after the metadata check.
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ("read", logging::io_reason(&error)))?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
-        return None;
+        return Err(("limits", "file_size"));
     }
 
-    let format = image::guess_format(&bytes).ok()?;
+    let format = image::guess_format(&bytes).map_err(|_| ("format", "unsupported_format"))?;
     if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
-        return None;
+        return Err(("format", "unsupported_format"));
     }
     let reader = || {
         let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
@@ -63,7 +92,9 @@ fn decode(path: &Path, budget: u64) -> Option<DynamicImage> {
         reader.limits(limits);
         reader
     };
-    let (width, height) = reader().into_dimensions().ok()?;
+    let (width, height) = reader()
+        .into_dimensions()
+        .map_err(|error| ("dimensions", decode_reason(&error)))?;
     let pixels = u64::from(width) * u64::from(height);
     // PNG RGBA16 is the largest supported decoded pixel (eight bytes).
     if pixels == 0
@@ -72,7 +103,16 @@ fn decode(path: &Path, budget: u64) -> Option<DynamicImage> {
         || pixels > MAX_PIXELS
         || pixels * 8 > budget
     {
-        return None;
+        return Err(("limits", "image_size_or_budget"));
     }
-    reader().decode().ok()
+    reader()
+        .decode()
+        .map_err(|error| ("decode", decode_reason(&error)))
+}
+
+fn decode_reason(error: &image::ImageError) -> &'static str {
+    match error {
+        image::ImageError::Limits(_) => "image_limit",
+        _ => "invalid_image",
+    }
 }

@@ -12,6 +12,8 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
+use crate::logging::{self, Level};
+
 pub type Screen = Terminal<CrosstermBackend<Stdout>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,6 +21,58 @@ pub enum ImageMode {
     Text,
     Halfblocks,
     Kitty { cell_width: u16, cell_height: u16 },
+}
+
+impl ImageMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Halfblocks => "halfblocks",
+            Self::Kitty { .. } => "kitty",
+        }
+    }
+}
+
+fn failure(
+    operation: &'static str,
+    mode: Option<ImageMode>,
+    reason: &'static str,
+    action: &'static str,
+    os_code: Option<i32>,
+) {
+    let mut fields = serde_json::json!({"operation":operation, "reason":reason, "action":action});
+    if let Some(mode) = mode {
+        fields["image_mode"] = mode.label().into();
+    }
+    if let Some(code) = os_code {
+        fields["os_code"] = code.into();
+    }
+    logging::emit(
+        if action == "fallback" {
+            Level::Warn
+        } else {
+            Level::Error
+        },
+        "terminal.failed",
+        fields,
+    );
+}
+
+pub(crate) fn check<T>(
+    result: io::Result<T>,
+    operation: &'static str,
+    mode: Option<ImageMode>,
+    action: &'static str,
+) -> io::Result<T> {
+    result.inspect_err(|error| {
+        failure(
+            operation,
+            mode,
+            logging::io_reason(error),
+            action,
+            error.raw_os_error(),
+        );
+    })
 }
 
 pub fn next_image_id() -> u32 {
@@ -56,27 +110,43 @@ struct Restore {
     raw: bool,
     screen: bool,
     cursor: bool,
+    image_mode: Option<ImageMode>,
 }
 
 impl Restore {
     fn run(&mut self) -> io::Result<()> {
         let mut output = io::stdout();
         let screen = if self.screen {
-            let result = execute!(output, LeaveAlternateScreen);
+            let result = check(
+                execute!(output, LeaveAlternateScreen),
+                "leave_screen",
+                self.image_mode,
+                "restore",
+            );
             self.screen = result.is_err();
             result
         } else {
             Ok(())
         };
         let cursor = if self.cursor {
-            let result = execute!(output, Show);
+            let result = check(
+                execute!(output, Show),
+                "show_cursor",
+                self.image_mode,
+                "restore",
+            );
             self.cursor = result.is_err();
             result
         } else {
             Ok(())
         };
         let raw = if self.raw {
-            let result = terminal::disable_raw_mode();
+            let result = check(
+                terminal::disable_raw_mode(),
+                "disable_raw_mode",
+                self.image_mode,
+                "restore",
+            );
             self.raw = result.is_err();
             result
         } else {
@@ -95,6 +165,13 @@ impl Drop for Restore {
 
 pub fn with_screen(run: impl FnOnce(&mut Screen, &mut Input) -> io::Result<()>) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        failure(
+            "preflight",
+            None,
+            "interactive_terminal_required",
+            "exit",
+            None,
+        );
         return Err(io::Error::other("interactive terminal required"));
     }
 
@@ -102,14 +179,25 @@ pub fn with_screen(run: impl FnOnce(&mut Screen, &mut Input) -> io::Result<()>) 
     let mut diagnostic = None;
     let result = (|| {
         restore.raw = true;
-        terminal::enable_raw_mode()?;
+        check(terminal::enable_raw_mode(), "enable_raw_mode", None, "exit")?;
         let mut output = io::stdout();
         // 端末への書き込みが一部完了してからエラーになる場合も復元する。
         restore.screen = true;
         restore.cursor = true;
-        execute!(output, EnterAlternateScreen)?;
-        let mut screen = Terminal::new(CrosstermBackend::new(output))?;
+        check(
+            execute!(output, EnterAlternateScreen),
+            "enter_screen",
+            None,
+            "exit",
+        )?;
+        let mut screen = check(
+            Terminal::new(CrosstermBackend::new(output)),
+            "create_screen",
+            None,
+            "exit",
+        )?;
         let mut input = Input::new();
+        restore.image_mode = Some(input.image_mode());
         let result = run(&mut screen, &mut input);
         diagnostic = Some(input.image_mode());
         result
@@ -150,7 +238,7 @@ pub struct Input {
 
 impl Input {
     fn new() -> Self {
-        Self {
+        let input = Self {
             fallback: if supports_images() {
                 ImageMode::Halfblocks
             } else {
@@ -158,7 +246,21 @@ impl Input {
             },
             #[cfg(windows)]
             console: windows::ConsoleInput::probe(),
-        }
+        };
+        let mode = input.image_mode();
+        let reason = match mode {
+            ImageMode::Kitty { .. } => "kitty_probe_confirmed",
+            ImageMode::Halfblocks => "truecolor_supported",
+            ImageMode::Text => "image_capability_not_confirmed",
+        };
+        logging::emit(
+            Level::Debug,
+            "terminal.image_mode",
+            serde_json::json!({
+                "mode":mode.label(), "reason":reason,
+            }),
+        );
+        input
     }
 
     pub fn image_mode(&self) -> ImageMode {
@@ -179,11 +281,12 @@ impl Input {
     }
 
     pub fn poll_key(&mut self) -> io::Result<Option<KeyEvent>> {
+        let mode = Some(self.image_mode());
         #[cfg(windows)]
         if let Some(console) = &mut self.console {
-            return console.poll_key();
+            return check(console.poll_key(), "input", mode, "exit");
         }
-        poll_key(Duration::from_millis(100))
+        check(poll_key(Duration::from_millis(100)), "input", mode, "exit")
     }
 }
 
@@ -196,6 +299,16 @@ fn poll_key(timeout: Duration) -> io::Result<Option<KeyEvent>> {
         Event::Key(key) => Some(key),
         _ => None,
     })
+}
+
+#[cfg(windows)]
+fn report_console_error(operation: &'static str, mode: Option<ImageMode>, action: &'static str) {
+    drop(check(
+        Err::<(), _>(io::Error::last_os_error()),
+        operation,
+        mode,
+        action,
+    ));
 }
 
 // ReadConsoleInputW の合成 VT レコードを通常の Win32 キーと混ぜずに振り分ける。
@@ -268,10 +381,20 @@ mod windows {
                     || GetConsoleMode(output, &raw mut om) == 0
                     || SetConsoleMode(input, im | ENABLE_VIRTUAL_TERMINAL_INPUT) == 0
                 {
+                    if !input.is_null()
+                        && input != INVALID_HANDLE_VALUE
+                        && !output.is_null()
+                        && output != INVALID_HANDLE_VALUE
+                    {
+                        super::report_console_error("kitty_console_setup", None, "fallback");
+                    }
                     return None;
                 }
                 if SetConsoleMode(output, om | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
-                    SetConsoleMode(input, im);
+                    super::report_console_error("kitty_console_output", None, "fallback");
+                    if SetConsoleMode(input, im) == 0 {
+                        super::report_console_error("restore_console_input", None, "restore");
+                    }
                     return None;
                 }
                 (input, im, output, om)
@@ -295,11 +418,14 @@ mod windows {
             };
             // Even on partial write or timeout keep the demultiplexer alive: a response may
             // already be in flight. Only a timely, matching OK plus cell size selects Kitty.
-            if send(format_args!(
+            let sent = send(format_args!(
                 "\x1b_Gi={query_id},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\{CELL_QUERY}"
-            )) {
+            ));
+            if super::check(sent, "kitty_query", None, "fallback").is_ok() {
                 while Instant::now() < deadline && console.image_mode().is_none() {
-                    if console.pump(deadline).is_err() {
+                    if super::check(console.pump(deadline), "kitty_reply", None, "fallback")
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -328,7 +454,14 @@ mod windows {
             {
                 self.resize_pending = false;
                 self.last_resize_query = Some(now);
-                if send(format_args!("{CELL_QUERY}")) {
+                if super::check(
+                    send(format_args!("{CELL_QUERY}")),
+                    "query_cell_size",
+                    self.image_mode(),
+                    "fallback",
+                )
+                .is_ok()
+                {
                     self.resize_reply = Some(now + PROBE_BUDGET);
                 }
             }
@@ -416,18 +549,27 @@ mod windows {
             // SAFETY: handles are borrowed and valid for the duration of the screen session.
             // Restore even if probing or rendering did not succeed.
             unsafe {
-                SetConsoleMode(self.input, self.original_input_mode);
-                SetConsoleMode(self.output, self.original_output_mode);
+                if SetConsoleMode(self.input, self.original_input_mode) == 0 {
+                    super::report_console_error(
+                        "restore_console_input",
+                        self.image_mode(),
+                        "restore",
+                    );
+                }
+                if SetConsoleMode(self.output, self.original_output_mode) == 0 {
+                    super::report_console_error(
+                        "restore_console_output",
+                        self.image_mode(),
+                        "restore",
+                    );
+                }
             }
         }
     }
 
-    fn send(query: std::fmt::Arguments<'_>) -> bool {
+    fn send(query: std::fmt::Arguments<'_>) -> io::Result<()> {
         let mut output = io::stdout().lock();
-        output
-            .write_fmt(query)
-            .and_then(|()| output.flush())
-            .is_ok()
+        output.write_fmt(query).and_then(|()| output.flush())
     }
 
     fn virtual_candidate(
