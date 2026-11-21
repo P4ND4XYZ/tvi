@@ -35,6 +35,7 @@ pub trait Host {
     fn links(&self, view: u64) -> Result<Vec<LuaLink>, String>;
     fn resolve_link(&self, view: u64, id: u64) -> Result<PathBuf, String>;
     fn open_file(&self, view: u64, path: &Path) -> Result<(), String>;
+    fn scroll_to_line(&self, view: u64, line: i64) -> Result<(), String>;
     fn open_float(&self, view: u64, options: FloatOptions) -> Result<u64, String>;
     fn update_float(&self, view: u64, float: u64, options: FloatOptions) -> Result<(), String>;
     fn close_float(&self, view: u64, float: u64) -> Result<(), String>;
@@ -460,6 +461,16 @@ impl UserData for ViewHandle {
                 Ok(()) => (true, None),
                 Err(error) => (false, Some(error)),
             })
+        });
+        methods.add_method("scroll_to_line", |_, view, line: Value| {
+            let state = live_state(&view.state)?;
+            let Value::Integer(line) = line else {
+                return Err(Error::runtime("scroll_to_line: line must be an integer"));
+            };
+            state
+                .host
+                .scroll_to_line(view.id, line)
+                .map_err(Error::runtime)
         });
         methods.add_method("open_float", |lua, view, opts: Table| {
             let state = live_state(&view.state)?;

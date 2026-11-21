@@ -14,7 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::images::PlacedImage;
 use crate::{
     app::{ViewAnchor, ViewRows},
-    markdown::RenderedMarkdown,
+    markdown::{RenderedMarkdown, SourcePosition},
     terminal::ImageMode,
 };
 
@@ -51,6 +51,8 @@ pub struct Layout<'a> {
     #[cfg(test)]
     search_len: usize,
     reflowed: Vec<(Range<usize>, Range<usize>)>,
+    source_positions: &'a [Option<SourcePosition>],
+    logical_rows: Vec<usize>,
     images: Vec<PlacedImage>,
 }
 
@@ -80,6 +82,8 @@ impl<'a> Layout<'a> {
             #[cfg(test)]
             search_len: document.search_text().len(),
             reflowed: Vec::new(),
+            source_positions: &document.source_positions,
+            logical_rows: Vec::with_capacity(original.lines.len() + 1),
             images: Vec::new(),
         };
         if width != 0 {
@@ -107,10 +111,17 @@ impl<'a> Layout<'a> {
                     )
                     .is_some()
                     {
+                        let reflowed = layout.reflowed.len() - table.lines.len();
+                        layout.logical_rows.extend(
+                            layout.reflowed[reflowed..]
+                                .iter()
+                                .map(|(_, rows)| rows.start),
+                        );
                         table_end = end;
                         continue;
                     }
                 }
+                layout.logical_rows.push(layout.rows.len());
                 let placement = placements.next_if(|placement| placement.line == index);
                 let mut skip = 0;
                 if let Some(placement) = placement
@@ -142,7 +153,39 @@ impl<'a> Layout<'a> {
                 );
             }
         }
+        layout.logical_rows.push(layout.rows.len());
         layout
+    }
+
+    pub(crate) fn row_for_source_line(&self, line: usize) -> Option<usize> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let last = self.source_positions.len().checked_sub(1)?;
+        let line = line.min(last);
+        if let Some(position) = self.source_positions[line..].iter().flatten().next() {
+            let start = self.logical_rows[position.line];
+            let end = self.logical_rows[position.line + 1];
+            if self.rows[start].anchor.byte == position.byte {
+                return Some(start);
+            }
+            return Some(
+                self.rows[start..end]
+                    .iter()
+                    .position(|row| {
+                        row.cells_for(position.byte..position.byte + 1)
+                            .next()
+                            .is_some()
+                    })
+                    .map_or(start, |row| start + row),
+            );
+        }
+        self.source_positions[..line]
+            .iter()
+            .rev()
+            .flatten()
+            .next()
+            .map(|position| self.logical_rows[position.line + 1] - 1)
     }
 
     pub fn transmitted_ids(&self) -> impl Iterator<Item = u32> + '_ {
@@ -316,6 +359,89 @@ mod tests {
     };
 
     const EXAMPLE: &str = include_str!("../../tests/fixtures/rendering.md");
+
+    #[test]
+    fn source_lines_follow_content_through_wraps_and_hidden_lines() {
+        let source = "abcdefgh ijkl\nTARGET overlong\n\n[hidden]: /x\n\n# End\n\n[tail]: /y\n";
+        let document = TuiMarkdown.render(source, 8);
+        let narrow = Layout::new(&document);
+        let wide = Layout::at_width(&document, 16);
+        assert_eq!(narrow.row_for_source_line(0), Some(0));
+        assert_eq!(narrow.row_for_source_line(1), Some(1));
+        assert_eq!(wide.row_for_source_line(1), Some(0));
+        assert_eq!(narrow.text().lines[1].to_string(), " ijkl TA");
+        assert_eq!(narrow.row_for_source_line(3), Some(5));
+        assert_eq!(narrow.text().lines[5].to_string(), "# End");
+        assert_eq!(narrow.row_for_source_line(usize::MAX), Some(5));
+    }
+
+    #[test]
+    fn repeating_inline_code_is_located_on_its_own_physical_line() {
+        let document = TuiMarkdown.render("`again again\r\nagain`\n", 6);
+        let layout = Layout::new(&document);
+        assert_eq!(layout.text().lines[2].to_string().trim_start(), "again");
+        assert_eq!(layout.row_for_source_line(1), Some(2));
+    }
+
+    #[test]
+    fn source_line_can_target_a_decoded_multiline_link_destination() {
+        let document = TuiMarkdown.render("0123456789 [label](\nfoo&amp;bar\n)\n", 6);
+        let layout = Layout::new(&document);
+        assert_eq!(layout.text().lines[3].to_string(), "foo&ba");
+        assert_eq!(layout.row_for_source_line(1), Some(3));
+    }
+
+    #[test]
+    fn source_lines_do_not_count_a_final_newline_as_a_new_line() {
+        for source in ["alphabet soup", "alphabet soup\n", "alphabet soup\r\n"] {
+            let document = TuiMarkdown.render(source, 5);
+            let layout = Layout::new(&document);
+            assert_eq!(layout.text().lines.len(), 3);
+            assert_eq!(layout.row_for_source_line(usize::MAX), Some(0));
+        }
+        for source in ["", "\r\n", "[hidden]: /url\n"] {
+            let document = TuiMarkdown.render(source, 5);
+            assert_eq!(Layout::new(&document).row_for_source_line(0), None);
+        }
+    }
+
+    #[test]
+    fn source_lines_distinguish_mermaid_image_from_code() {
+        let source = "Before\n\n```mermaid\r\nflowchart TD\r\n A --> B\r\n```\n\nAfter\n";
+        let resources = TuiMarkdown.resources(source);
+        let diagram = TuiMarkdown.render_with_diagrams(source, 40, &resources, &[(0, Some(0))]);
+        let images = [Some(image::DynamicImage::new_rgb8(10, 60))];
+        let layout = Layout::with_images(&diagram, 40, &images, ImageMode::Halfblocks);
+        assert_eq!(layout.images.len(), 1);
+        assert_eq!(layout.images[0].rows, 2..5);
+        for line in 2..=5 {
+            assert_eq!(layout.row_for_source_line(line), Some(2));
+        }
+        let code = TuiMarkdown.render_with_diagrams(source, 40, &resources, &[(0, None)]);
+        let layout = Layout::new(&code);
+        for line in 2..=5 {
+            assert_eq!(layout.row_for_source_line(line), Some(line));
+        }
+        assert_eq!(layout.text().lines[4].to_string(), " A --> B");
+    }
+
+    #[test]
+    fn source_lines_target_table_rows_and_keep_caption_search_offsets() {
+        let source =
+            "| Header | B |\n| --- | --- |\n| Long first cell | C |\n\n![caption](photo.png)\n";
+        let document = TuiMarkdown.render_document(source, 12, &TuiMarkdown.resources(source));
+        let images = [Some(image::DynamicImage::new_rgb8(10, 60))];
+        let layout = Layout::with_images(&document, 12, &images, ImageMode::Halfblocks);
+        let header = layout.row_for_source_line(0).unwrap();
+        let body = layout.row_for_source_line(2).unwrap();
+        assert_eq!(header, 1);
+        assert!(layout.text().lines[body].to_string().contains("Long"));
+        assert_eq!(layout.row_for_source_line(1), Some(body));
+        let image = layout.row_for_source_line(4).unwrap();
+        assert_eq!(image, layout.images[0].rows.start);
+        let caption = document.search_text().find("caption").unwrap();
+        assert_eq!(layout.row_for_offset(caption), Some(image + 3));
+    }
 
     #[test]
     fn adapter_renders_literal_html_image_fallback_and_fenced_code() {

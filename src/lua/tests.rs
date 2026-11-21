@@ -9,6 +9,7 @@ struct TestHost {
     view: Cell<u64>,
     floats: RefCell<Floats>,
     opened_files: RefCell<Vec<(u64, PathBuf)>>,
+    source_lines: RefCell<Vec<i64>>,
 }
 
 impl Host for TestHost {
@@ -38,6 +39,14 @@ impl Host for TestHost {
         Ok(())
     }
 
+    fn scroll_to_line(&self, view: u64, line: i64) -> Result<(), String> {
+        if view != 0 {
+            return Err("view is closed".into());
+        }
+        self.source_lines.borrow_mut().push(line);
+        Ok(())
+    }
+
     fn open_float(&self, view: u64, options: FloatOptions) -> Result<u64, String> {
         self.floats.borrow_mut().open(view, options)
     }
@@ -49,6 +58,41 @@ impl Host for TestHost {
     fn close_float(&self, view: u64, float: u64) -> Result<(), String> {
         self.floats.borrow_mut().close(view, float)
     }
+}
+
+#[test]
+fn scroll_to_line_accepts_only_lua_integers_and_returns_nothing() -> mlua::Result<()> {
+    let host = Rc::new(TestHost::default());
+    let runtime = Runtime::new(host.clone());
+    runtime.install_api()?;
+    runtime.lua.load(r##"
+        local view = tvi.ui.current_view()
+        for _, line in ipairs({ "120", 120.0, 120.5, {}, true, function() end }) do
+            local ok, err = pcall(view.scroll_to_line, view, line)
+            assert(not ok and tostring(err):find("scroll_to_line: line must be an integer", 1, true))
+        end
+        for _, args in ipairs({table.pack(), table.pack(nil)}) do
+            local ok, err = pcall(view.scroll_to_line, view, table.unpack(args, 1, args.n))
+            assert(not ok and tostring(err):find("scroll_to_line: line must be an integer", 1, true))
+        end
+        for _, line in ipairs({0, math.mininteger, math.maxinteger}) do
+            assert(select("#", view:scroll_to_line(line)) == 0)
+        end
+    "##).exec()?;
+    assert_eq!(*host.source_lines.borrow(), [0, i64::MIN, i64::MAX]);
+
+    host.view.set(1);
+    runtime
+        .lua
+        .load(
+            r#"
+        local ok, err = pcall(function() tvi.ui.current_view():scroll_to_line(1) end)
+        assert(not ok and tostring(err):find("view is closed", 1, true))
+    "#,
+        )
+        .exec()?;
+    assert_eq!(host.source_lines.borrow().len(), 3);
+    Ok(())
 }
 
 struct Scratch(PathBuf);

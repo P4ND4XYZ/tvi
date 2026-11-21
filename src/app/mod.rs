@@ -360,6 +360,11 @@ impl App {
         self.viewport.reflow(rows, height);
     }
 
+    pub(crate) fn center_row(&mut self, rows: &impl ViewRows, row: usize) {
+        let top = row.saturating_sub(self.viewport.height / 2);
+        self.viewport.show(top, rows);
+    }
+
     pub fn apply(&mut self, action: Action, rows: &impl ViewRows, text: &str) {
         if self.help {
             if action == Action::Cancel {

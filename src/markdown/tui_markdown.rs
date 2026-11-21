@@ -64,6 +64,10 @@ impl TuiMarkdown {
             // ライブラリ側のフェンス位置を確認できなければ、元のコードを描画する。
             return self.render_document(markdown, width, resources);
         };
+        let source_positions = super::source_lines::collect(&source, &text);
+        for diagram in &diagram_lines {
+            text.lines[diagram.line] = Line::default();
+        }
         if !resources.images.is_empty() {
             for (index, line) in text.lines.iter_mut().enumerate() {
                 if let Some(prefix) = line.spans.first().filter(|span| {
@@ -121,6 +125,21 @@ impl TuiMarkdown {
         owned.alignment = text.alignment;
         let mut document = RenderedMarkdown::new(owned, width);
         document.tables = tables;
+        let mut seen = vec![false; document.line_ranges().len()];
+        document.source_positions = source_positions
+            .into_iter()
+            .map(|position| {
+                position.map(|(line, byte)| super::SourcePosition {
+                    line,
+                    byte: document.line_ranges()[line].start
+                        + if std::mem::replace(&mut seen[line], true) {
+                            byte
+                        } else {
+                            0
+                        },
+                })
+            })
+            .collect();
         document.expanded_diagrams = expanded_lines
             .into_iter()
             .map(|lines| {
@@ -180,7 +199,7 @@ fn place_diagrams(
         let count = block.end() - block.start() + 1;
         if let Some(image) = image {
             source.by_ref().take(count).for_each(drop);
-            text.lines.push(Line::default());
+            text.lines.push(Line::from(DIAGRAM_FENCE));
             placements.push(ImageLine {
                 line: start,
                 image,
@@ -207,16 +226,16 @@ const IMAGE_POSITION: Modifier = Modifier::HIDDEN;
 // They are removed before rendering. Keep them disjoint from Ratatui's flags.
 const HEADING_SHIFT: u32 = 9;
 const HEADING: Modifier = Modifier::from_bits_retain(7 << HEADING_SHIFT);
-const QUOTE: Modifier = Modifier::from_bits_retain(1 << 12);
+pub(super) const QUOTE: Modifier = Modifier::from_bits_retain(1 << 12);
 const LINK: Modifier = Modifier::from_bits_retain(1 << 13);
 // CODE tags inline spans or an entire fenced/indented block line.
 const CODE: Modifier = Modifier::from_bits_retain(1 << 14);
 const IMAGE: Modifier = Modifier::from_bits_retain(1 << 15);
 
 // Markdown input cannot emit NUL: raw controls are sanitized before parsing.
-const CODE_OPEN: &str = "\0tvi-code-open:";
-const CODE_CLOSE: &str = "\0tvi-code-close:";
-const DIAGRAM_FENCE: &str = "\0tvi-diagram:";
+pub(super) const CODE_OPEN: &str = "\0tvi-code-open:";
+pub(super) const CODE_CLOSE: &str = "\0tvi-code-close:";
+pub(super) const DIAGRAM_FENCE: &str = "\0tvi-diagram:";
 
 fn mark_code_blocks(text: &mut Text<'_>) {
     let mut in_code = false;

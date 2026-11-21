@@ -40,6 +40,7 @@ struct Session {
     renderer: Option<crate::mermaid::Mermaid>,
     prepared: Option<(u64, Rc<mermaid::PreparedDisplay>)>,
     reload_positions: Option<u64>,
+    source_scroll: Option<(u64, usize)>,
 }
 
 #[derive(Default)]
@@ -67,6 +68,7 @@ impl Session {
             renderer,
             prepared: None,
             reload_positions: None,
+            source_scroll: None,
         }
     }
 
@@ -94,6 +96,12 @@ impl Session {
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>, layout: &Layout<'_>, runtime: &Runtime) {
         let body = ui::body_area(frame.area(), self.app.mode());
         self.app.reflow(layout, usize::from(body.height));
+        if let Some((id, line)) = self.source_scroll.take()
+            && id == self.app.document_id()
+            && let Some(row) = layout.row_for_source_line(line)
+        {
+            self.app.center_row(layout, row);
+        }
         let scheme = runtime.colorscheme();
         ui::draw(
             frame,
@@ -106,6 +114,7 @@ impl Session {
     }
 
     fn restore_after_init_error(&mut self, error: &str) {
+        self.source_scroll = None;
         self.app.reset_to_initial_document();
         self.floats = Floats::default();
         self.show_lua_error(error);
@@ -292,7 +301,18 @@ impl Host for RefCell<Session> {
         })?;
         let mut session = self.borrow_mut();
         session.prepared = None;
+        session.source_scroll = None;
         session.app.open_document(document);
+        Ok(())
+    }
+
+    fn scroll_to_line(&self, view: u64, line: i64) -> Result<(), String> {
+        validate_view(view)?;
+        let mut session = self.borrow_mut();
+        if !session.app.markdown().is_empty() {
+            let line = usize::try_from(line.max(1)).unwrap_or(usize::MAX);
+            session.source_scroll = Some((session.app.document_id(), line - 1));
+        }
         Ok(())
     }
 
@@ -565,6 +585,105 @@ mod tests {
         fn drop(&mut self) {
             drop(fs::remove_dir_all(&self.0));
         }
+    }
+
+    #[test]
+    fn lua_scroll_centers_the_new_document_and_keeps_the_float_and_search()
+    -> Result<(), Box<dyn Error>> {
+        use KeyCode::{Char, Enter, Esc, F};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let scratch = Scratch::new()?;
+        let source = scratch.0.join("source.md");
+        let markup: String = (0..20).map(|i| format!("item {i}\r\n\r\n")).collect();
+        fs::write(&source, &markup)?;
+        fs::write(scratch.0.join("next.md"), &markup)?;
+        fs::write(scratch.0.join("later.md"), &markup)?;
+        fs::write(scratch.0.join("empty.md"), "")?;
+        let init = scratch.init(
+            r#"
+            local view = tvi.ui.current_view()
+            local root = assert(view:project_root({ root_markers = {} }))
+            local sep = root:find("\\", 1, true) and "\\" or "/"
+            tvi.keymap.set("normal", "<F2>", function()
+                assert(view:open_file(root .. sep .. "next.md"))
+                view:scroll_to_line(math.mininteger)
+                view:scroll_to_line(21)
+                assert(not pcall(view.scroll_to_line, view, "5"))
+            end)
+            tvi.keymap.set("normal", "<F3>", function()
+                assert(not pcall(view.scroll_to_line, view, 2.0))
+                view:open_float({
+                    lines = {"body scroll test"},
+                    on_key = function(_, key)
+                        view:scroll_to_line(key.text == "b" and math.maxinteger or math.mininteger)
+                    end,
+                })
+            end)
+            tvi.keymap.set("normal", "<F4>", function()
+                view:scroll_to_line(21)
+                assert(view:open_file(root .. sep .. "empty.md"))
+                view:scroll_to_line(500)
+                assert(view:open_file(root .. sep .. "later.md"))
+            end)
+        "#,
+        )?;
+        let session = Rc::new(RefCell::new(Session::new(read_document(&source)?)));
+        let (runtime, diagnostic) = Runtime::load_from(session.clone(), Some(init));
+        assert_eq!(diagnostic, None);
+        let mut terminal = Terminal::new(TestBackend::new(30, 10))?;
+        let mut keys = InputQueue::default();
+        let mut send = |code| {
+            let prepared = session.borrow_mut().display();
+            let layout = Layout::at_width(&prepared.document, 30);
+            assert!(keys.dispatch(
+                Some(KeyEvent::new(code, KeyModifiers::NONE)),
+                &session,
+                &runtime,
+                &layout,
+                prepared.document.search_text(),
+            ));
+        };
+        let draw =
+            |terminal: &mut Terminal<TestBackend>| -> Result<usize, std::convert::Infallible> {
+                let prepared = session.borrow_mut().display();
+                let layout = Layout::at_width(&prepared.document, 30);
+                terminal.draw(|frame| session.borrow_mut().draw(frame, &layout, &runtime))?;
+                Ok(session.borrow().app.top_row())
+            };
+
+        send(F(2));
+        assert!(
+            session.borrow().app.document_path().ends_with("next.md"),
+            "{:?}",
+            session.borrow().app.notice()
+        );
+        assert_eq!(draw(&mut terminal)?, 16);
+        terminal.backend_mut().resize(30, 8);
+        assert_eq!(draw(&mut terminal)?, 16);
+        terminal.backend_mut().resize(30, 10);
+
+        for code in "/item 10".chars().map(Char).chain([Enter]) {
+            send(code);
+        }
+        let before = draw(&mut terminal)?;
+        let selected = session.borrow().app.search_selection();
+        assert!(selected.is_some());
+        send(F(3));
+        assert_eq!(draw(&mut terminal)?, before);
+        let float = session.borrow().floats.active();
+        assert!(float.is_some());
+        send(Char('b'));
+        assert_eq!(draw(&mut terminal)?, 30);
+        send(Char('a'));
+        assert_eq!(draw(&mut terminal)?, 0);
+        assert_eq!(session.borrow().floats.active(), float);
+        assert_eq!(session.borrow().app.search_selection(), selected);
+        send(Esc);
+        send(F(4));
+        assert!(session.borrow().app.document_path().ends_with("later.md"));
+        assert_eq!(draw(&mut terminal)?, 0);
+        Ok(())
     }
 
     #[test]

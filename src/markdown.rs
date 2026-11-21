@@ -3,6 +3,7 @@ use std::ops::Range;
 use ratatui::text::Text;
 
 pub(crate) mod mermaid;
+mod source_lines;
 mod table;
 pub mod tui_markdown;
 
@@ -62,8 +63,15 @@ pub struct RenderedMarkdown {
     pub images: Vec<ImageLine>,
     pub(crate) tables: Vec<Table>,
     pub(crate) expanded_diagrams: Vec<Range<usize>>,
+    pub(crate) source_positions: Vec<Option<SourcePosition>>,
     #[cfg(test)]
     width: u16,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SourcePosition {
+    pub line: usize,
+    pub byte: usize,
 }
 
 impl RenderedMarkdown {
@@ -89,6 +97,7 @@ impl RenderedMarkdown {
             images: Vec::new(),
             tables: Vec::new(),
             expanded_diagrams: Vec::new(),
+            source_positions: Vec::new(),
             #[cfg(test)]
             width: _width,
         }

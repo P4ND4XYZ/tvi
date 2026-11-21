@@ -25,6 +25,7 @@
 ---@field links fun(self: Tvi.View): Tvi.Link[] 対象のリンクを出現順に返します。
 ---@field resolve_link fun(self: Tvi.View, id: integer): string?, string? リンク先の絶対パス、または nil, err を返します。存在は確認しません。
 ---@field open_file fun(self: Tvi.View, path: string): boolean, string? 絶対パスのファイルを開き、true, nil または false, err を返します。
+---@field scroll_to_line fun(self: Tvi.View, line: integer) 現在の元ファイルの1始まりの行へ本文をスクロールします。
 ---@field open_float fun(self: Tvi.View, opts: Tvi.OpenFloatOptions): Tvi.Float フロートを開きます。すでに開いている場合は Lua エラーになります。
 
 ---@class Tvi.FloatDisplayOptions
