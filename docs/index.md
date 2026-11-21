@@ -13,7 +13,7 @@ tviは、端末上でMarkdownファイルを読むための閲覧専用ビュー
 
 | 文書 | 説明 |
 |---|---|
-| [Markdown表示](features/markdown.md) | UTF-8ファイルの読み込み、折り返し、ローカル画像・Mermaidの図の表示、起動時のエラー |
+| [Markdown表示](features/markdown.md) | UTF-8ファイルの読み込み・自動再読み込み、折り返し、ローカル画像・Mermaidの図の表示、起動時のエラー |
 | [文書内の移動](features/navigation.md) | 行・ページ単位の移動とリサイズ時の閲覧位置の保持 |
 | [動作モードと入力](features/modes.md) | NORMAL、COMMAND、SEARCHの役割と切り替え |
 | [検索](features/search.md) | 検索条件、一致箇所への移動、ハイライトの解除と再表示 |

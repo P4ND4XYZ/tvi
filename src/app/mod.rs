@@ -203,8 +203,7 @@ impl App {
         &self.document.name
     }
 
-    #[cfg(test)]
-    pub fn markdown(&self) -> &str {
+    pub(crate) fn markdown(&self) -> &str {
         &self.document.markdown
     }
 
@@ -259,6 +258,16 @@ impl App {
         self.document.resolve_link(id)
     }
 
+    pub(crate) fn replace_document(&mut self, document: Document) {
+        self.document = document;
+    }
+
+    pub(crate) fn refresh_reloaded_positions(&mut self, text: &str) {
+        self.viewport.anchor.byte = self.viewport.anchor.byte.min(text.len());
+        self.search
+            .refresh(text, |offset| offset, self.viewport.anchor.byte);
+    }
+
     pub fn open_document(&mut self, document: Document) {
         // A page left before its first draw (e.g. by Lua) must not convert on return.
         self.document
@@ -309,6 +318,14 @@ impl App {
 
     pub fn set_notice(&mut self, message: String) {
         self.notice = Some(message);
+    }
+
+    pub(crate) fn clear_notice_if(&mut self, message: &str) -> bool {
+        if self.notice() != Some(message) {
+            return false;
+        }
+        self.notice = None;
+        true
     }
 
     pub fn help_open(&self) -> bool {

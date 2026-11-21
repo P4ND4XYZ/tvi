@@ -5,9 +5,10 @@ use std::{
     path::{self, Path, PathBuf},
     rc::Rc,
     string::FromUtf8Error,
+    time::{Duration, Instant},
 };
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::{
     app::{App, Document, ViewRows},
@@ -28,6 +29,7 @@ use crate::{
 use crate::images;
 
 mod mermaid;
+mod watch;
 
 const BODY_VIEW: u64 = 1;
 
@@ -37,12 +39,14 @@ struct Session {
     image_mode: ImageMode,
     renderer: Option<crate::mermaid::Mermaid>,
     prepared: Option<(u64, Rc<mermaid::PreparedDisplay>)>,
+    reload_positions: Option<u64>,
 }
 
 #[derive(Default)]
 struct InputQueue {
     input: Input,
     replay: VecDeque<KeyEvent>,
+    undecided_key: Option<Instant>,
 }
 
 impl Session {
@@ -62,6 +66,7 @@ impl Session {
             image_mode,
             renderer,
             prepared: None,
+            reload_positions: None,
         }
     }
 
@@ -78,6 +83,10 @@ impl Session {
             self.image_mode,
             self.renderer.as_ref(),
         ));
+        if self.reload_positions.take() == Some(id) {
+            self.app
+                .refresh_reloaded_positions(prepared.document.search_text());
+        }
         self.prepared = Some((id, Rc::clone(&prepared)));
         prepared
     }
@@ -158,6 +167,10 @@ pub(crate) fn log_document_failure(
 fn load_document(path: &Path) -> Result<Document, ReadDocumentError> {
     let bytes = fs::read(path).map_err(ReadDocumentError::Read)?;
     let markdown = String::from_utf8(bytes).map_err(ReadDocumentError::Decode)?;
+    Ok(document_from_markdown(path, markdown))
+}
+
+fn document_from_markdown(path: &Path, markdown: String) -> Document {
     let name = path
         .file_name()
         .unwrap_or(path.as_os_str())
@@ -168,7 +181,7 @@ fn load_document(path: &Path) -> Result<Document, ReadDocumentError> {
         .into_iter()
         .map(|link| (link.label, link.target))
         .collect();
-    Ok(Document::new(name, markdown, path.to_owned(), links).with_resources(resources))
+    Document::new(name, markdown, path.to_owned(), links).with_resources(resources)
 }
 
 fn require_regular_file(path: &Path) -> io::Result<()> {
@@ -309,8 +322,18 @@ pub fn run(
     }
 
     let mut keys = InputQueue::default();
+    let mut reload = watch::Reload::default();
     while !session.borrow().app.should_quit() {
-        run_document(screen, terminal_input, &session, &runtime, &mut keys)?;
+        let now = Instant::now();
+        reload.poll(&mut session.borrow_mut(), now, keys.busy(now));
+        run_document(
+            screen,
+            terminal_input,
+            &session,
+            &runtime,
+            &mut keys,
+            &mut reload,
+        )?;
     }
     Ok(())
 }
@@ -321,6 +344,7 @@ fn run_document(
     session: &RefCell<Session>,
     runtime: &Runtime,
     keys: &mut InputQueue,
+    reload: &mut watch::Reload,
 ) -> io::Result<()> {
     let mut image_mode = terminal_input.image_mode();
     let mut width = terminal::check(screen.size(), "size", Some(image_mode), "exit")?.width;
@@ -382,12 +406,20 @@ fn run_document(
             let key = keys
                 .pop_replayed()
                 .map_or_else(|| terminal_input.poll_key(), |key| Ok(Some(key)))?;
-            if keys.dispatch(key, session, runtime, &layout, document.search_text()) {
-                let app = &session.borrow().app;
-                if app.should_quit() || app.document_id() != document_id {
+            let redraw = keys.dispatch(key, session, runtime, &layout, document.search_text());
+            {
+                let mut session = session.borrow_mut();
+                if session.app.should_quit() || session.app.document_id() != document_id {
                     return Ok(());
                 }
-                break;
+                let now = Instant::now();
+                let reload_redraw = reload.poll(&mut session, now, keys.busy(now));
+                if session.app.document_id() != document_id {
+                    return Ok(());
+                }
+                if redraw || reload_redraw {
+                    break;
+                }
             }
             let size = terminal::check(screen.size(), "size", Some(mode), "exit")?;
             if (size.width, size.height) != drawn_size || terminal_input.image_mode() != image_mode
@@ -409,6 +441,15 @@ impl InputQueue {
         self.replay.pop_front()
     }
 
+    fn busy(&self, now: Instant) -> bool {
+        // Let an ambiguous key sequence resolve before synchronous display preparation.
+        // Pure prefixes have no input deadline and can survive a reload.
+        !self.replay.is_empty()
+            || self
+                .undecided_key
+                .is_some_and(|key| now.duration_since(key) < Duration::from_millis(350))
+    }
+
     fn dispatch(
         &mut self,
         key: Option<KeyEvent>,
@@ -420,6 +461,7 @@ impl InputQueue {
         let active_float = session.borrow().floats.active();
         if let Some((view, float)) = active_float {
             self.input.reset();
+            self.undecided_key = None;
             let Some(key) = key else { return false };
             if is_escape(key) {
                 close_active_float(session, runtime);
@@ -441,8 +483,12 @@ impl InputQueue {
             self.input.expire()
         };
         let Some(dispatch) = dispatch else {
+            if key.is_some_and(|key| key.kind == KeyEventKind::Press) {
+                self.undecided_key = Some(Instant::now());
+            }
             return false;
         };
+        self.undecided_key = None;
         for key in dispatch.replay.into_iter().rev() {
             self.replay.push_front(key);
         }
