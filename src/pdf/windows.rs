@@ -17,14 +17,14 @@ const MAX_PNG_BYTES: u64 = 16 * 1024 * 1024;
 const LOAD: &str = "Could not open the PDF document (invalid or password-protected PDF)";
 const RENDER: &str = "Could not render the PDF page";
 
-struct Apartment;
+pub(super) struct Apartment;
 
 impl Apartment {
     #[allow(
         unsafe_code,
         reason = "WinRT initialization for the dedicated native renderer thread"
     )]
-    fn initialize() -> Result<Self, Failure> {
+    pub(super) fn initialize() -> Result<Self, Failure> {
         // SAFETY: Called on the current worker thread. Both successful initialization
         // statuses must be paired with RoUninitialize on this same thread.
         unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
@@ -39,7 +39,7 @@ impl Drop for Apartment {
         reason = "paired with the renderer thread's successful RoInitialize"
     )]
     fn drop(&mut self) {
-        // SAFETY: This guard is private to the synchronous native call that created it.
+        // SAFETY: The renderer owns this guard and is created and dropped on the same worker.
         unsafe { RoUninitialize() };
     }
 }
@@ -58,37 +58,63 @@ fn native(
     }
 }
 
-pub(super) fn open(path: &Path) -> Result<Page, Failure> {
-    let metadata = fs::metadata(path).map_err(|error| Failure::io("metadata", &error))?;
-    if !metadata.is_file() {
-        return Err(Failure::new(
-            "metadata",
-            "not_regular_file",
-            "PDF path is not a regular file",
-        ));
-    }
-    let absolute = std::path::absolute(path).map_err(|error| Failure::io("pdf_load", &error))?;
-    let _apartment = Apartment::initialize()?;
-    let load_error = |error| native("pdf_load", "invalid_or_password_protected", LOAD, &error);
-    let file = open_stream(&absolute)?;
-    let document = PdfDocument::LoadFromStreamAsync(&file)
-        .and_then(|op| op.join())
-        .map_err(load_error)?;
-    if document.IsPasswordProtected().map_err(load_error)? {
-        return Err(Failure::new(
-            "pdf_load",
-            "password_protected",
-            "Password-protected PDFs are not supported",
-        ));
-    }
-    let count = document.PageCount().map_err(load_error)?;
-    render_page(
-        Source {
-            native: document,
+pub(super) struct Document {
+    native: PdfDocument,
+    // Keep the input readable for lazy page loads; release it after the document.
+    _stream: IRandomAccessStream,
+    pub count: u32,
+}
+
+impl Document {
+    pub(super) fn open(path: &Path) -> Result<Self, Failure> {
+        let metadata = fs::metadata(path).map_err(|error| Failure::io("metadata", &error))?;
+        if !metadata.is_file() {
+            return Err(Failure::new(
+                "metadata",
+                "not_regular_file",
+                "PDF path is not a regular file",
+            ));
+        }
+        let absolute =
+            std::path::absolute(path).map_err(|error| Failure::io("pdf_load", &error))?;
+        let load_error = |error| native("pdf_load", "invalid_or_password_protected", LOAD, &error);
+        let stream = open_stream(&absolute)?;
+        let native = PdfDocument::LoadFromStreamAsync(&stream)
+            .and_then(|op| op.join())
+            .map_err(load_error)?;
+        if native.IsPasswordProtected().map_err(load_error)? {
+            return Err(Failure::new(
+                "pdf_load",
+                "password_protected",
+                "Password-protected PDFs are not supported",
+            ));
+        }
+        let count = native.PageCount().map_err(load_error)?;
+        Ok(Self {
+            native,
+            _stream: stream,
             count,
-        },
-        0,
-    )
+        })
+    }
+
+    pub(super) fn render(&self, source: Source, index: u32) -> Result<Page, Failure> {
+        if index >= self.count {
+            return Err(Failure::new("pdf_render", "page_out_of_range", RENDER));
+        }
+        let render_error = |error| native("pdf_render", "winrt", RENDER, &error);
+        let png_error = |error| native("pdf_png", "stream", RENDER, &error);
+        let page = self.native.GetPage(index).map_err(render_error)?;
+        let result = render_png(&page, render_error, png_error);
+        let close = page.Close().map_err(render_error);
+        let (png, aspect_height) = result?;
+        close?;
+        Ok(Page {
+            source,
+            index,
+            png,
+            aspect_height,
+        })
+    }
 }
 
 #[allow(
@@ -106,30 +132,6 @@ fn open_stream(path: &Path) -> Result<IRandomAccessStream, Failure> {
             "Could not read the PDF document",
             &error,
         )
-    })
-}
-
-pub(super) fn render(source: Source, index: u32) -> Result<Page, Failure> {
-    let _apartment = Apartment::initialize()?;
-    render_page(source, index)
-}
-
-fn render_page(source: Source, index: u32) -> Result<Page, Failure> {
-    if index >= source.count {
-        return Err(Failure::new("pdf_render", "page_out_of_range", RENDER));
-    }
-    let render_error = |error| native("pdf_render", "winrt", RENDER, &error);
-    let png_error = |error| native("pdf_png", "stream", RENDER, &error);
-    let page = source.native.GetPage(index).map_err(render_error)?;
-    let result = render_png(&page, render_error, png_error);
-    let close = page.Close().map_err(render_error);
-    let (png, aspect_height) = result?;
-    close?;
-    Ok(Page {
-        source,
-        index,
-        png,
-        aspect_height,
     })
 }
 
@@ -211,15 +213,34 @@ mod tests {
     use image::GenericImageView as _;
 
     use super::*;
+    use crate::pdf::{Renderer, Worker};
+    use std::{io, time::Duration};
+
+    fn native_error(failure: Failure) -> io::Error {
+        io::Error::other(format!("{failure:?}"))
+    }
+
+    fn request(
+        worker: &mut Worker,
+        job: impl FnOnce(&mut Renderer) -> Result<Page, Failure> + Send + 'static,
+    ) -> Result<Page, Box<dyn std::error::Error>> {
+        Ok(worker
+            .submit(job)
+            .map_err(native_error)?
+            .recv_timeout(Duration::from_secs(15))?
+            .map_err(native_error)?)
+    }
 
     #[test]
     fn rotated_pdf_page_uses_its_display_aspect_ratio() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("rotation.pdf");
         fs::write(&path, crate::test_pdf::rotated_second_page())?;
-        let native_error = |failure: Failure| std::io::Error::other(format!("{failure:?}"));
-        let first = Page::open(&path).map_err(native_error)?;
-        let rotated = Page::render(first.source, 1).map_err(native_error)?;
+        let mut worker = Worker::default();
+        let first = request(&mut worker, move |renderer| renderer.open(&path))?;
+        let rotated = request(&mut worker, move |renderer| {
+            renderer.render(first.source, 1)
+        })?;
         let raster = rotated.decode().map_err(native_error)?;
         let (w, h) = raster.dimensions();
         assert!(w.abs_diff(h * 2) <= 2, "rotated raster is {w} x {h}");
@@ -233,10 +254,11 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("資料.PDF");
         fs::write(&path, crate::test_pdf::two_pages())?;
-        let native_error = |failure: Failure| std::io::Error::other(format!("{failure:?}"));
-        let first = Page::open(&path).map_err(native_error)?;
+        let mut worker = Worker::default();
+        let first = request(&mut worker, move |renderer| renderer.open(&path))?;
         assert_eq!(first.source.count, 2);
-        let second = Page::render(first.source.clone(), 1).map_err(native_error)?;
+        let source = first.source.clone();
+        let second = request(&mut worker, move |renderer| renderer.render(source, 1))?;
         for (page, index, height_ratio, bottom) in [
             (first, 0, 4, [255, 0, 0, 255]),
             (second, 1, 2, [0, 0, 255, 255]),

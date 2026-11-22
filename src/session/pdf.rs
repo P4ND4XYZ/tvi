@@ -1,9 +1,9 @@
 use std::{
+    cell::RefCell,
     io,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::mpsc::{self, Receiver, TryRecvError},
-    thread,
+    sync::mpsc::{Receiver, TryRecvError},
 };
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -11,7 +11,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crate::{
     app::{App, Document, Mode, Motion, ViewRows},
     logging::{self, Level},
-    pdf::{Failure, Page, Source},
+    pdf::{Failure, Page, Renderer, Source, Worker},
     terminal::{self, ImageMode, Screen},
     ui::{
         float::Floats,
@@ -68,23 +68,14 @@ enum Work {
 }
 
 impl Work {
-    fn place(self, geometry: Geometry) -> ResultPage {
+    fn place(self, renderer: &mut Renderer, geometry: Geometry) -> ResultPage {
         let page = match self {
-            Self::Open(path) => Page::open(&path)?,
-            Self::Turn(source, index) => Page::render(source, index)?,
+            Self::Open(path) => renderer.open(&path)?,
+            Self::Turn(source, index) => renderer.render(source, index)?,
             Self::Fit(page) => page,
         };
         let layout = fit(&page, geometry);
         Ok((page, layout))
-    }
-
-    fn spawn(self, geometry: Geometry) -> Result<Receiver<ResultPage>, Failure> {
-        let (send, receive) = mpsc::channel();
-        thread::Builder::new()
-            .name("tvi-pdf".into())
-            .spawn(move || drop(send.send(self.place(geometry))))
-            .map_err(|_| Failure::worker())?;
-        Ok(receive)
     }
 }
 
@@ -155,6 +146,7 @@ pub(super) struct Jobs {
     placed: Option<Placement>,
     failed_fit: Option<((u64, u32), Geometry)>,
     deferred_motion: Option<((u64, u32), Motion)>,
+    worker: Rc<RefCell<Worker>>,
 }
 
 struct Placement {
@@ -168,6 +160,28 @@ fn page_key(app: &App) -> Option<(u64, u32)> {
 }
 
 impl Jobs {
+    pub(super) fn with_screen(
+        run: impl FnOnce(&mut Screen, &mut terminal::Input, Self) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let jobs = Self::default();
+        // Restore the terminal before waiting for any in-flight native operation at exit.
+        let _worker = Rc::clone(&jobs.worker);
+        terminal::with_screen(|screen, input| run(screen, input, jobs))
+    }
+
+    fn submit(&self, work: Work, geometry: Geometry) -> Result<Receiver<ResultPage>, Failure> {
+        self.worker
+            .borrow_mut()
+            .submit(move |renderer| work.place(renderer, geometry))
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.cancel_if(|_| true);
+        self.placed = None;
+        self.failed_fit = None;
+        self.deferred_motion = None;
+    }
+
     pub(super) fn placed(&self, app: &App) -> Option<PlacedPage> {
         self.placed
             .as_ref()
@@ -401,7 +415,7 @@ impl Jobs {
             && let Some(Request { intent, work }) = self.queued.take()
         {
             match geometry
-                .and_then(|geometry| work.spawn(geometry).map(|result| (geometry, result)))
+                .and_then(|geometry| self.submit(work, geometry).map(|result| (geometry, result)))
             {
                 Ok((geometry, result)) => {
                     self.running = Some(Running {
@@ -481,17 +495,6 @@ impl Jobs {
             close_float: None,
         }
     }
-
-    fn initial(app: &App, geometry: Geometry, layout: Layout<'static>) -> Self {
-        Self {
-            placed: page_key(app).map(|key| Placement {
-                key,
-                geometry,
-                layout: Rc::new(layout),
-            }),
-            ..Self::default()
-        }
-    }
 }
 
 const TURN_NOTICE: &str = "Could not display the requested PDF page";
@@ -524,13 +527,14 @@ pub(super) fn startup(
     screen: &mut Screen,
     input: &mut terminal::Input,
     path: PathBuf,
+    mut jobs: Jobs,
 ) -> io::Result<Option<(App, Jobs)>> {
     let mode = input.image_mode();
     let mut size = terminal::check(screen.size(), "size", Some(mode), "exit")?;
     let report = |failure: &Failure| log_open_failure(&path, "startup", *failure);
     let mut placed_at = geometry(size.width, mode).inspect_err(report)?;
-    let mut receiver = Work::Open(path.clone())
-        .spawn(placed_at)
+    let mut receiver = jobs
+        .submit(Work::Open(path.clone()), placed_at)
         .inspect_err(report)?;
 
     loop {
@@ -546,12 +550,18 @@ pub(super) fn startup(
             if placed_at == latest {
                 let layout = layout.inspect_err(report)?;
                 let app = App::from_document(Document::pdf(path, page));
-                let jobs = Jobs::initial(&app, placed_at, layout);
+                jobs.placed = page_key(&app).map(|key| Placement {
+                    key,
+                    geometry: placed_at,
+                    layout: Rc::new(layout),
+                });
                 return Ok(Some((app, jobs)));
             }
             // Keep the native raster; only the placement needs to match the new width.
             placed_at = latest;
-            receiver = Work::Fit(page).spawn(placed_at).inspect_err(report)?;
+            receiver = jobs
+                .submit(Work::Fit(page), placed_at)
+                .inspect_err(report)?;
         }
         terminal::check(
             screen.draw(|frame| {
@@ -577,6 +587,8 @@ pub(super) fn startup(
 mod tests {
     use std::{
         fs,
+        sync::mpsc,
+        thread,
         time::{Duration, Instant},
     };
 
@@ -587,7 +599,6 @@ mod tests {
         ui::float::FloatOptions,
     };
     use crossterm::event::KeyEvent;
-    use std::cell::RefCell;
 
     use super::*;
 
@@ -694,6 +705,58 @@ mod tests {
     }
 
     #[test]
+    fn async_pdf_turns_render_pixels_after_open_and_history_restore()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use image::GenericImageView as _;
+
+        let demo = Demo::open()?;
+        let check = |index, color| -> Result<PlacedPage, Box<dyn std::error::Error>> {
+            let layout = demo.page()?;
+            let session = demo.session.borrow();
+            let page = session.app.pdf().ok_or("expected PDF")?;
+            assert_eq!(page.index, index);
+            let raster = page.decode().map_err(io::Error::from)?;
+            let (w, h) = raster.dimensions();
+            assert_eq!(
+                raster.get_pixel(w / 2, 3 * h / 4).0,
+                color,
+                "page {} content",
+                index + 1
+            );
+            Ok(layout)
+        };
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+
+        let first = check(0, red)?;
+        let pdf_id = demo.session.borrow().app.document_id();
+        demo.move_by(Motion::End, &first);
+        demo.move_by(Motion::LineDown, &first);
+        let second = check(1, blue)?;
+        demo.move_by(Motion::LineUp, &second);
+        check(0, red)?;
+
+        let other = demo.directory.path().join("other.md");
+        fs::write(&other, "Other Markdown")?;
+        assert!(matches!(
+            demo.session.open_file(BODY_VIEW, &other)?,
+            FileOpen::Opened
+        ));
+        {
+            let mut state = demo.session.borrow_mut();
+            assert!(state.app.pdf().is_none());
+            state.pdf.depart(pdf_id);
+        }
+        wait(&demo.session, &demo.runtime)?;
+        demo.session.borrow_mut().apply(Action::JumpBack, &[], "");
+        let restored = check(0, red)?;
+        demo.move_by(Motion::End, &restored);
+        demo.move_by(Motion::LineDown, &restored);
+        check(1, blue)?;
+        Ok(())
+    }
+
+    #[test]
     fn scroll_during_width_refit_cannot_turn_from_the_old_layout()
     -> Result<(), Box<dyn std::error::Error>> {
         let narrow = Geometry {
@@ -731,9 +794,14 @@ mod tests {
                 let mut state = demo.session.borrow_mut();
                 let request = state.pdf.queued.take().ok_or("expected turn")?;
                 assert!(matches!(request.intent, Intent::Turn { .. }));
-                // Deliver an already prepared result to make this race deterministic.
+                // Wait without polling, then deliver the completed result to make this race deterministic.
+                let completed = state
+                    .pdf
+                    .submit(request.work, narrow)
+                    .map_err(io::Error::from)?
+                    .recv_timeout(Duration::from_secs(15))?;
                 let (send, result) = mpsc::channel();
-                assert!(send.send(request.work.place(narrow)).is_ok());
+                assert!(send.send(completed).is_ok());
                 state.pdf.running = Some(Running {
                     intent: Some(request.intent),
                     geometry: narrow,

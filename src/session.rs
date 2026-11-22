@@ -175,7 +175,7 @@ impl Session {
 
     fn restore_after_init_error(&mut self, error: &str) {
         self.source_scroll = None;
-        self.pdf = pdf::Jobs::default();
+        self.pdf.reset();
         self.app.reset_to_initial_document();
         self.floats = Floats::default();
         self.show_lua_error(error);
@@ -443,8 +443,8 @@ pub fn start_pdf(path: PathBuf) -> io::Result<()> {
         pdf::log_open_failure(&path, "startup", failure);
         return Err(failure.into());
     }
-    terminal::with_screen(|screen, input| {
-        if let Some((app, jobs)) = pdf::startup(screen, input, path)? {
+    pdf::Jobs::with_screen(|screen, input, jobs| {
+        if let Some((app, jobs)) = pdf::startup(screen, input, path, jobs)? {
             run_app(screen, input, app, jobs)
         } else {
             Ok(())
@@ -452,17 +452,10 @@ pub fn start_pdf(path: PathBuf) -> io::Result<()> {
     })
 }
 
-pub fn run(
-    screen: &mut Screen,
-    terminal_input: &mut terminal::Input,
-    document: Document,
-) -> io::Result<()> {
-    run_app(
-        screen,
-        terminal_input,
-        App::from_document(document),
-        pdf::Jobs::default(),
-    )
+pub fn run(document: Document) -> io::Result<()> {
+    pdf::Jobs::with_screen(|screen, input, jobs| {
+        run_app(screen, input, App::from_document(document), jobs)
+    })
 }
 
 fn run_app(

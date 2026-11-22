@@ -58,6 +58,5 @@ fn run() -> io::Result<()> {
     if pdf::is_pdf(path) {
         return session::start_pdf(file.into());
     }
-    let document = session::read_document(path)?;
-    terminal::with_screen(|screen, input| session::run(screen, input, document))
+    session::run(session::read_document(path)?)
 }
