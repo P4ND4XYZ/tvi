@@ -1,6 +1,8 @@
 mod command;
 mod document;
 mod search;
+#[cfg(test)]
+mod test_support;
 
 use std::{
     ops::Range,
@@ -181,12 +183,6 @@ impl Viewport {
 }
 
 impl App {
-    #[cfg(test)]
-    pub fn new(name: String, markdown: String) -> Self {
-        let path = PathBuf::from(&name);
-        Self::from_document(Document::new(name, markdown, path, Vec::new()))
-    }
-
     pub fn from_document(document: Document) -> Self {
         Self {
             document,
@@ -272,14 +268,6 @@ impl App {
 
     pub fn document_path(&self) -> &Path {
         &self.document.path
-    }
-
-    #[cfg(test)]
-    pub fn markdown_resources(&self) -> &MarkdownResources {
-        match &self.document.content {
-            Content::Markdown(markdown) => &markdown.resources,
-            Content::Pdf { .. } => panic!("expected Markdown resources"),
-        }
     }
 
     pub(crate) fn display_input(&mut self) -> Option<(&Path, &str, &mut MarkdownResources)> {
@@ -554,7 +542,7 @@ mod tests {
 
     #[test]
     fn motions_clamp_to_a_full_final_viewport_and_anchor_reflows() {
-        let mut app = App::new("test.md".into(), String::new());
+        let mut app = App::from_test_markdown("test.md".into(), String::new());
         let anchors = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27].map(ViewAnchor::text);
         app.reflow(&anchors, 4);
         for (motion, row) in [
@@ -581,7 +569,7 @@ mod tests {
 
     #[test]
     fn missing_or_empty_search_does_not_move_the_view() {
-        let mut app = App::new("test.md".into(), "猫\n犬".into());
+        let mut app = App::from_test_markdown("test.md".into(), "猫\n犬".into());
         let anchors = [0, 4].map(ViewAnchor::text);
         let text = "猫\n犬";
         app.reflow(&anchors, 1);
@@ -609,7 +597,7 @@ mod tests {
 
     #[test]
     fn command_backspace_cancel_and_errors_keep_normal_interaction() {
-        let mut app = App::new("test.md".into(), String::new());
+        let mut app = App::from_test_markdown("test.md".into(), String::new());
         let mut apply = |action| {
             app.apply(action, &[], "");
             (app.mode(), app.should_quit(), app.notice().is_some())
@@ -665,7 +653,7 @@ mod tests {
 
     #[test]
     fn resetting_startup_discards_document_jumps() {
-        let mut app = App::new("initial.md".into(), String::new());
+        let mut app = App::from_test_markdown("initial.md".into(), String::new());
         let original = app.document_id();
         for path in ["first.md", "second.md"] {
             app.open_document(Document::new(
@@ -685,7 +673,7 @@ mod tests {
     fn jump_back_restores_the_logical_position_and_hidden_search() {
         let text = "hit\none\nhit\ntwo\nhit\nend";
         let anchors = [0, 4, 8, 12, 16, 20].map(ViewAnchor::text);
-        let mut app = App::new("test.md".into(), text.into());
+        let mut app = App::from_test_markdown("test.md".into(), text.into());
         app.reflow(&anchors, 1);
         for action in [
             Action::Move(Motion::End),

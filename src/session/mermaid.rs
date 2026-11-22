@@ -318,7 +318,10 @@ mod tests {
             .save(dir.join("blue.png"))
             .unwrap();
         let logs = dir.join("logs");
-        let mode = ImageMode::Halfblocks;
+        let mode = ImageMode::Kitty {
+            cell_width: 10,
+            cell_height: 20,
+        };
         let session = RefCell::new(Session::with_images(
             read_document(&file).unwrap(),
             mode,
@@ -367,9 +370,9 @@ mod tests {
             .draw(|frame| layout.draw_images(frame, frame.area(), 0))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        use ratatui::style::Color;
-        assert_eq!(buffer[(0, rows[0] as u16)].bg, Color::Rgb(255, 0, 0));
-        assert_eq!(buffer[(0, rows[1] as u16)].bg, Color::Rgb(0, 0, 255));
+        for row in rows {
+            assert!(buffer[(0, row as u16)].symbol().contains('\u{10eeee}'));
+        }
         let collapsed = Layout::with_images(&initial.document, 0, &initial.images, mode);
         assert_eq!(collapsed.len(), 0);
 
@@ -484,7 +487,10 @@ mod tests {
         let file = dir.join("source.md");
         fs::write(&file, "```mermaid\nfind missing\n```\n\n```mermaid\nfind corrupt\n```\n\n[next](next.md)\n\nfind after").unwrap();
         fs::write(dir.join("next.md"), "next").unwrap();
-        let mode = ImageMode::Halfblocks;
+        let mode = ImageMode::Kitty {
+            cell_width: 10,
+            cell_height: 20,
+        };
         let session = RefCell::new(Session::with_images(
             read_document(&file).unwrap(),
             mode,
@@ -573,7 +579,10 @@ mod tests {
         let prepared = logging::capture_for_test(&logs, || {
             Session::with_images(
                 read_document(&file).unwrap(),
-                ImageMode::Halfblocks,
+                ImageMode::Kitty {
+                    cell_width: 10,
+                    cell_height: 20,
+                },
                 Some(renderer),
             )
             .display()
@@ -593,6 +602,46 @@ mod tests {
     }
 
     #[test]
+    fn text_mode_skips_available_images_and_renderer() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        install_fake(dir);
+        let renderer = Mermaid::isolated(
+            env::join_paths([dir]).unwrap(),
+            dir.into(),
+            dir.join("cache"),
+            4096,
+        );
+        image::RgbImage::new(1, 1)
+            .save(dir.join("image.png"))
+            .unwrap();
+        let file = dir.join("source.md");
+        fs::write(
+            &file,
+            "![diagram](image.png)\n\n```mermaid\nrecord_launch\n```",
+        )
+        .unwrap();
+        let prepared = Session::with_images(
+            read_document(&file).unwrap(),
+            ImageMode::Text,
+            Some(renderer),
+        )
+        .display();
+        assert!(prepared.images.is_empty());
+        let text = prepared.document.search_text();
+        assert!(text.contains("diagram") && text.contains("record_launch"));
+        assert!(
+            prepared
+                .document
+                .text()
+                .lines
+                .iter()
+                .any(|line| line.to_string() == "[img] diagram")
+        );
+        assert!(!dir.join("renderer-launched").exists());
+    }
+
+    #[test]
     fn text_mode_and_missing_renderer_keep_the_code_without_notice() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path();
@@ -606,7 +655,13 @@ mod tests {
                 4096,
             )
         };
-        for mode in [ImageMode::Text, ImageMode::Halfblocks] {
+        for mode in [
+            ImageMode::Text,
+            ImageMode::Kitty {
+                cell_width: 10,
+                cell_height: 20,
+            },
+        ] {
             let mut session =
                 Session::with_images(read_document(&file).unwrap(), mode, Some(missing()));
             let prepared = session.display();

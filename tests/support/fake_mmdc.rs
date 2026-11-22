@@ -25,8 +25,14 @@ fn main() {
         hold("descendant-running", "descendant-ready");
         return;
     }
-    assert_eq!(args, ["-i", "input.mmd", "-o", "output.png"]);
+    assert_eq!(
+        args,
+        ["-i", "input.mmd", "-o", "output.png", "--scale", "2"]
+    );
     let marker = fs::read_to_string("input.mmd").unwrap();
+    if marker.trim_end() == "record_launch" {
+        fs::write("../renderer-launched", b"started").unwrap();
+    }
     match marker.as_str() {
         "exit" => {
             eprintln!("private renderer data");

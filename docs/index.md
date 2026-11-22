@@ -24,6 +24,6 @@ tviは端末上で文書を読むための閲覧専用ビューアです。Markd
 
 ### 設計方針
 
-- [モジュール構成と依存関係](design/architecture.md): 各モジュールの責務、Markdown adapterの境界、PDF描画・検索の分離と文書の保持期間
+- [モジュール構成と依存関係](design/architecture.md): 各モジュールの責務、Markdown adapterの境界、[PDFワーカーの処理の流れ](design/architecture.md#pdfワーカーの処理の流れ)と文書の保持期間
 - [Lua連携の設計](design/lua-integration.md): RustとLuaの責務、入力と状態の管理
 - [Mermaid表示の設計](design/mermaid.md): 変換プロセスと既存の画像表示の境界、PNGキャッシュ、検証方針

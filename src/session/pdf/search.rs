@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn supersession_keeps_the_extraction_slot_until_the_cancelled_worker_finishes() {
-        let mut app = App::new("test".into(), String::new());
+        let mut app = App::from_test_markdown("test".into(), String::new());
         let mut jobs = SearchJobs::default();
         let from = (app.document_id(), 0);
         jobs.start(&mut app, from, "first".into(), Direction::Forward, None);

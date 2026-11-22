@@ -264,7 +264,7 @@ mod tests {
         use KeyCode::{Char, Enter};
 
         let source = "# find second find\n\n[link](path) `inline` ![`alt`](x.png)\n\n> quote\n\n```\nfind code\n```\n\n```mermaid\ngraph TD\n```";
-        let mut app = App::new("test.md".into(), source.into());
+        let mut app = App::from_test_markdown("test.md".into(), source.into());
         let doc = prepare(&TuiMarkdown, source, 40);
         let layout = Layout::at_width(&doc, 40);
         let mut terminal = Terminal::new(TestBackend::new(40, 25))?;
@@ -344,7 +344,7 @@ mod tests {
     fn colorscheme_patches_only_explicit_quote_attributes_on_gfm_alert_labels()
     -> Result<(), Infallible> {
         let source = "> [!NOTE]\n> body";
-        let app = App::new("test.md".into(), source.into());
+        let app = App::from_test_markdown("test.md".into(), source.into());
         let doc = prepare(&TuiMarkdown, source, 40);
         let layout = Layout::at_width(&doc, 40);
         let mut terminal = Terminal::new(TestBackend::new(40, 5))?;
@@ -390,7 +390,8 @@ mod tests {
     {
         use KeyCode::{Char, Enter, Esc};
 
-        let mut app = App::new("test.md".into(), "first\n\nabcdefgMATCH tail".into());
+        let mut app =
+            App::from_test_markdown("test.md".into(), "first\n\nabcdefgMATCH tail".into());
         let doc = prepare(&TuiMarkdown, app.markdown(), 8);
         let mut terminal = Terminal::new(TestBackend::new(8, 5))?;
         let mut input = Input::default();
@@ -455,7 +456,7 @@ mod tests {
     #[test]
     fn table_highlights_both_columns_across_cell_wraps() -> Result<(), Infallible> {
         let source = "| L | R |\n| --- | ---: |\n| **abcdef** | │XYZUV |\n| **abcdef** | │XYZUV |";
-        let mut app = App::new("test.md".into(), source.into());
+        let mut app = App::from_test_markdown("test.md".into(), source.into());
         let doc = prepare(&TuiMarkdown, app.markdown(), 13);
         let mut terminal = Terminal::new(TestBackend::new(13, 10))?;
         let mut input = Input::default();
@@ -498,7 +499,7 @@ mod tests {
         use crate::app::{Action, Motion};
 
         let source = "before same\n\n![same](red.png)\n\n![same](blue.jpg)\n\nafter";
-        let mut app = App::new("test.md".into(), source.into());
+        let mut app = App::from_test_markdown("test.md".into(), source.into());
         let resources = TuiMarkdown.resources(source);
         let doc = TuiMarkdown.render_document(source, 16, &resources);
         let solid = |rgb| Some(image::RgbImage::from_pixel(40, 80, image::Rgb(rgb)).into());
@@ -511,15 +512,14 @@ mod tests {
                 .add_modifier(Modifier::REVERSED),
         );
         let mut terminal = Terminal::new(TestBackend::new(16, 5))?;
+        let mode = crate::terminal::ImageMode::Kitty {
+            cell_width: 10,
+            cell_height: 20,
+        };
         let paint = |terminal: &mut Terminal<TestBackend>, app: &mut App, float| {
             terminal
                 .draw(|frame| {
-                    let layout = Layout::with_images(
-                        &doc,
-                        frame.area().width,
-                        &loaded,
-                        crate::terminal::ImageMode::Halfblocks,
-                    );
+                    let layout = Layout::with_images(&doc, frame.area().width, &loaded, mode);
                     app.reflow(
                         &layout,
                         usize::from(body_area(frame.area(), app.mode()).height),
@@ -528,7 +528,7 @@ mod tests {
                 })
                 .map(|_| ())
         };
-        let layout = Layout::with_images(&doc, 16, &loaded, crate::terminal::ImageMode::Halfblocks);
+        let layout = Layout::with_images(&doc, 16, &loaded, mode);
         let locations = &layout;
         let text = doc.search_text();
         assert_eq!(text, TuiMarkdown.render(source, 16).search_text());
@@ -541,9 +541,10 @@ mod tests {
 
         paint(&mut terminal, &mut app, false)?;
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "b");
-        assert_eq!(
-            terminal.backend().buffer()[(0, 2)].bg,
-            Color::Rgb(255, 0, 0)
+        assert!(
+            terminal.backend().buffer()[(0, 2)]
+                .symbol()
+                .contains('\u{10eeee}')
         );
         assert!(
             !terminal.backend().buffer()[(0, 2)]
@@ -557,14 +558,16 @@ mod tests {
         }
         paint(&mut terminal, &mut app, false)?;
         assert_eq!(app.top_row(), 5);
-        assert_eq!(
-            terminal.backend().buffer()[(0, 0)].bg,
-            Color::Rgb(255, 0, 0)
+        assert!(
+            terminal.backend().buffer()[(0, 0)]
+                .symbol()
+                .contains('\u{10eeee}')
         );
         assert_eq!(terminal.backend().buffer()[(0, 1)].symbol(), "s");
-        assert_eq!(
-            terminal.backend().buffer()[(0, 3)].bg,
-            Color::Rgb(0, 0, 255)
+        assert!(
+            terminal.backend().buffer()[(0, 3)]
+                .symbol()
+                .contains('\u{10eeee}')
         );
         paint(&mut terminal, &mut app, true)?;
         assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Green);
@@ -596,7 +599,7 @@ mod tests {
         use crate::{app::Action, terminal::ImageMode};
 
         let source = "above\n\n![label](fine.png)\n\nbelow\n\ntail";
-        let mut app = App::new("test.md".into(), source.into());
+        let mut app = App::from_test_markdown("test.md".into(), source.into());
         let resources = TuiMarkdown.resources(source);
         let doc = TuiMarkdown.render_document(source, 12, &resources);
         let loaded = [Some(image::DynamicImage::new_rgb8(80, 128))];
@@ -647,7 +650,7 @@ mod tests {
 
     #[test]
     fn help_is_an_overlay_closed_by_escape() -> Result<(), Infallible> {
-        let mut app = App::new("test.md".into(), "body".into());
+        let mut app = App::from_test_markdown("test.md".into(), "body".into());
         let doc = prepare(&TuiMarkdown, app.markdown(), 42);
         let mut terminal = Terminal::new(TestBackend::new(42, 10))?;
         let mut input = Input::default();

@@ -10,6 +10,8 @@ use std::{
 
 use super::{Deadline, Failure, INPUT, OUTPUT};
 
+pub(super) const RENDER_ARGS: [&str; 6] = ["-i", INPUT, "-o", OUTPUT, "--scale", "2"];
+
 #[cfg(unix)]
 #[path = "process/unix.rs"]
 mod unix;
@@ -62,7 +64,7 @@ pub(super) fn run(
     // dispatches Windows batch files; no application-built shell command.
     let mut command = Command::new(executable);
     command
-        .args(["-i", INPUT, "-o", OUTPUT])
+        .args(RENDER_ARGS)
         .current_dir(work)
         .env("PATH", path)
         .stdin(Stdio::null())

@@ -648,7 +648,15 @@ mod tests {
         let resources = TuiMarkdown.resources(source);
         let diagram = TuiMarkdown.render_with_diagrams(source, 40, &resources, &[(0, Some(0))]);
         let images = [Some(image::DynamicImage::new_rgb8(10, 60))];
-        let layout = Layout::with_images(&diagram, 40, &images, ImageMode::Halfblocks);
+        let layout = Layout::with_images(
+            &diagram,
+            40,
+            &images,
+            ImageMode::Kitty {
+                cell_width: 10,
+                cell_height: 20,
+            },
+        );
         assert_eq!(layout.images.len(), 1);
         assert_eq!(layout.images[0].rows, 2..5);
         for line in 2..=5 {
@@ -668,7 +676,15 @@ mod tests {
             "| Header | B |\n| --- | --- |\n| Long first cell | C |\n\n![caption](photo.png)\n";
         let document = TuiMarkdown.render_document(source, 12, &TuiMarkdown.resources(source));
         let images = [Some(image::DynamicImage::new_rgb8(10, 60))];
-        let layout = Layout::with_images(&document, 12, &images, ImageMode::Halfblocks);
+        let layout = Layout::with_images(
+            &document,
+            12,
+            &images,
+            ImageMode::Kitty {
+                cell_width: 10,
+                cell_height: 20,
+            },
+        );
         let header = layout.row_for_source_line(0).unwrap();
         let body = layout.row_for_source_line(2).unwrap();
         assert_eq!(header, 1);

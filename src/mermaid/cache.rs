@@ -8,7 +8,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use super::{CacheIssue, Failure, read_png};
+use super::{CacheIssue, Failure, process::RENDER_ARGS, read_png};
 
 const CAPACITY: u64 = 128 * 1024 * 1024;
 const STAGING_PREFIX: &str = ".staging-";
@@ -37,9 +37,13 @@ pub(super) fn from_env() -> Option<Cache> {
 
 pub(super) fn key(source: &[u8]) -> String {
     let mut hash = Sha256::new();
-    // Bump the recipe identifier when any application-controlled rendering
-    // settings change. The workspace filenames are part of this recipe.
-    hash.update(b"tvi-mermaid/png/v1\0-i\0input.mmd\0-o\0output.png\0");
+    // Include the exact arguments so changes to the render command cannot
+    // reuse PNGs from an earlier recipe. Bump v1 if the recipe format changes.
+    hash.update(b"tvi-mermaid/png/v1\0");
+    for arg in RENDER_ARGS {
+        hash.update(arg.as_bytes());
+        hash.update(b"\0");
+    }
     hash.update(source);
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut name = String::with_capacity(68);

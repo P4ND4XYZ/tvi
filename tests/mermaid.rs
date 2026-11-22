@@ -320,6 +320,40 @@ fn assert_process_stopped(work: &Path, lock_name: &str, ready_name: &str) {
 }
 
 #[test]
+fn scaled_render_ignores_legacy_cache_and_saves_with_the_scaled_key() {
+    // SHA-256 of the v1 recipe, NUL-delimited arguments, and source "red",
+    // before and after appending the scale arguments to the recipe.
+    const LEGACY: &str = "911839a21040f30fd2548d4179e7ece06841603afa5f4559285c6655048e7b7c.png";
+    const SCALED: &str = "97e8e2b6f294aae2cd2d96f7a288dfeb375c01a53706e07412b76f152354b107.png";
+
+    let fixture = Fixture::new(true);
+    fs::create_dir(&fixture.cache).unwrap();
+    image::RgbImage::from_pixel(1, 1, image::Rgb(BLUE))
+        .save(fixture.cache.join(LEGACY))
+        .unwrap();
+
+    let options = fixture.options(4096);
+    let mut document = options.start_document();
+    assert!(document.cached_png("red").unwrap().is_none());
+    let conversion = document.convert("red", pixel);
+    assert_eq!(conversion.result, Ok(RED));
+    assert!(conversion.cache.saved && !conversion.cache.hit);
+    assert_eq!(
+        pixel(&fs::read(fixture.cache.join(SCALED)).unwrap()),
+        Some(RED)
+    );
+    assert_eq!(
+        document
+            .cached_png("red")
+            .unwrap()
+            .as_deref()
+            .and_then(pixel),
+        Some(RED)
+    );
+    fixture.assert_clean();
+}
+
+#[test]
 fn cache_hits_across_sessions_and_regenerates_invalid_entries() {
     let fixture = Fixture::new(true);
     let first = fixture.options(4096).start_document().convert("red", pixel);

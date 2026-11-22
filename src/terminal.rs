@@ -19,7 +19,6 @@ pub type Screen = Terminal<CrosstermBackend<Stdout>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageMode {
     Text,
-    Halfblocks,
     Kitty { cell_width: u16, cell_height: u16 },
 }
 
@@ -27,7 +26,6 @@ impl ImageMode {
     fn label(self) -> &'static str {
         match self {
             Self::Text => "text",
-            Self::Halfblocks => "halfblocks",
             Self::Kitty { .. } => "kitty",
         }
     }
@@ -219,19 +217,7 @@ pub fn with_screen(run: impl FnOnce(&mut Screen, &mut Input) -> io::Result<()>) 
     }
 }
 
-/// 色の能力が不明な端末には画像セルを送らない。端末への問い合わせや設定変更はしない。
-pub fn supports_images() -> bool {
-    if std::env::var("TERM").is_ok_and(|term| term == "dumb") {
-        return false;
-    }
-    std::env::var("COLORTERM").is_ok_and(|color| {
-        color.eq_ignore_ascii_case("truecolor") || color.eq_ignore_ascii_case("24bit")
-    }) || std::env::var("TERM").is_ok_and(|term| term.ends_with("-direct"))
-        || (cfg!(windows) && std::env::var_os("WT_SESSION").is_some_and(|id| !id.is_empty()))
-}
-
 pub struct Input {
-    fallback: ImageMode,
     #[cfg(windows)]
     console: Option<windows::ConsoleInput>,
 }
@@ -239,18 +225,12 @@ pub struct Input {
 impl Input {
     fn new() -> Self {
         let input = Self {
-            fallback: if supports_images() {
-                ImageMode::Halfblocks
-            } else {
-                ImageMode::Text
-            },
             #[cfg(windows)]
             console: windows::ConsoleInput::probe(),
         };
         let mode = input.image_mode();
         let reason = match mode {
             ImageMode::Kitty { .. } => "kitty_probe_confirmed",
-            ImageMode::Halfblocks => "truecolor_supported",
             ImageMode::Text => "image_capability_not_confirmed",
         };
         logging::emit(
@@ -270,7 +250,7 @@ impl Input {
         {
             return mode;
         }
-        self.fallback
+        ImageMode::Text
     }
 
     pub fn refresh_cell_size(&mut self) {
@@ -292,6 +272,29 @@ impl Input {
         }
         check(poll_key(timeout), "input", mode, "exit")
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn truecolor_without_kitty_uses_text() {
+    const CHILD: &str = "TVI_TEST_TRUECOLOR_WITHOUT_KITTY";
+    if std::env::var_os(CHILD).is_some() {
+        assert_eq!(Input::new().image_mode(), ImageMode::Text);
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "terminal::truecolor_without_kitty_uses_text"])
+        .env(CHILD, "1")
+        .env("TERM", "xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 fn poll_key(timeout: Duration) -> io::Result<Option<KeyEvent>> {
