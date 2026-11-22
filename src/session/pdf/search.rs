@@ -107,7 +107,9 @@ impl SearchJobs {
     ) {
         self.cancel();
         let reuse = app
-            .pdf_search()
+            .document()
+            .as_pdf()
+            .and_then(crate::app::PdfDocument::search)
             .filter(|previous| input.is_empty() || *previous.query == input);
         let (query, hits) = if let Some(previous) = reuse {
             (previous.query.clone(), Some(previous.hits.clone()))

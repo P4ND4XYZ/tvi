@@ -9,7 +9,7 @@ use std::{
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::{
-    app::{App, Direction, Document, Mode, Motion, PdfSearch, ViewRows},
+    app::{App, Direction, Document, Mode, Motion, PdfDocument, PdfSearch, ScrollEdge, ViewRows},
     logging::{self, Level},
     pdf::{Failure, Page, Renderer, Source, Worker},
     terminal::{self, ImageMode, Screen},
@@ -181,8 +181,33 @@ struct Placement {
     layout: PlacedPage,
 }
 
+fn active_page(app: &App) -> Option<&Page> {
+    app.document().as_pdf().map(PdfDocument::page)
+}
+
+fn pdf_search(app: &App) -> Option<&PdfSearch> {
+    app.document().as_pdf().and_then(PdfDocument::search)
+}
+
+fn publish_search(app: &mut App, result: PdfSearch) {
+    let no_matches = result.current().is_none();
+    if Document::publish_pdf_search(app, result) {
+        if no_matches {
+            app.set_notice("No matches".into());
+        } else {
+            app.clear_notice();
+        }
+    }
+}
+
+fn turn_target(app: &App, motion: Motion, rows: &impl ViewRows) -> Option<(u32, bool)> {
+    let edge = app.scroll_edge(motion, rows)?;
+    let target = app.document().as_pdf()?.turn_target(edge)?;
+    Some((target, matches!(edge, ScrollEdge::Start)))
+}
+
 fn page_key(app: &App) -> Option<(u64, u32)> {
-    app.pdf().map(|page| (app.document_id(), page.index))
+    active_page(app).map(|page| (app.document_id(), page.index))
 }
 
 fn can_navigate(from: (u64, u32), app: &App, floats: &Floats) -> bool {
@@ -300,7 +325,7 @@ impl Jobs {
         }
         let result = match self.pending() {
             Some(Intent::Search { result, .. }) => Some(result),
-            _ => app.pdf_search(),
+            _ => pdf_search(app),
         };
         let Some(mut result) = result.cloned() else {
             app.set_notice("No previous search".into());
@@ -322,11 +347,11 @@ impl Jobs {
         geometry: Result<Geometry, Failure>,
         result: PdfSearch,
     ) {
-        let Some((from, page)) = page_key(app).zip(app.pdf()) else {
+        let Some((from, page)) = page_key(app).zip(active_page(app)) else {
             return;
         };
         let Some(hit) = result.current() else {
-            app.set_pdf_search(result);
+            publish_search(app, result);
             return;
         };
         let work = if hit.page == page.index {
@@ -336,7 +361,7 @@ impl Jobs {
             }
             if let Some(layout) = self.matching_layout(app, geometry) {
                 app.center_row(layout.as_ref(), layout.pdf_row(hit.from_top));
-                app.set_pdf_search(result);
+                publish_search(app, result);
                 return;
             }
             Work::Fit(page.clone())
@@ -390,7 +415,10 @@ impl Jobs {
             app.reflow_current_height(layout.as_ref());
             Origin::new(from.1, app.top_row(), &layout)
         });
-        match self.search.poll(app.pdf().map(|page| &page.source), origin) {
+        match self
+            .search
+            .poll(active_page(app).map(|page| &page.source), origin)
+        {
             Ok(Some(result)) => self.reveal_search(app, geometry, result),
             Err(failure) => search::fail(app, failure),
             Ok(None) => return false,
@@ -435,8 +463,8 @@ impl Jobs {
     }
 
     fn apply_motion(&mut self, app: &mut App, motion: Motion, rows: &impl ViewRows) {
-        let Some(page) = app.pdf() else { return };
-        let Some((target, previous)) = app.pdf_turn(motion, rows) else {
+        let Some(page) = active_page(app) else { return };
+        let Some((target, previous)) = turn_target(app, motion, rows) else {
             self.cancel_if(|intent| matches!(intent, Intent::Turn { .. }));
             app.apply(crate::app::Action::Move(motion), rows, "");
             return;
@@ -466,7 +494,7 @@ impl Jobs {
             previous,
         }) = self.pending()
             && layout.as_ref().is_none_or(|layout| {
-                app.pdf_turn(motion, layout.as_ref()) != Some((target, previous))
+                turn_target(app, motion, layout.as_ref()) != Some((target, previous))
             })
         {
             self.cancel_if(|intent| matches!(intent, Intent::Turn { .. }));
@@ -567,7 +595,7 @@ impl Jobs {
                 // A same-page search or :noh can change the desired tiles while
                 // a refit is in progress. Do not publish the old marks.
                 if let Intent::Fit { from } = &intent
-                    && marks != Marks::for_page(app.pdf_search(), from.1)
+                    && marks != Marks::for_page(pdf_search(app), from.1)
                 {
                     return Update::default();
                 }
@@ -600,8 +628,9 @@ impl Jobs {
 
     fn queue_fit(&mut self, app: &App, geometry: Result<Geometry, Failure>) {
         if self.pending().is_none()
-            && let (Some(key), Some(page), Ok(geometry)) = (page_key(app), app.pdf(), geometry)
-            && let marks = Marks::for_page(app.pdf_search(), key.1)
+            && let (Some(key), Some(page), Ok(geometry)) =
+                (page_key(app), active_page(app), geometry)
+            && let marks = Marks::for_page(pdf_search(app), key.1)
             && !self.placed.as_ref().is_some_and(|placed| {
                 placed.key == key && placed.geometry == geometry && placed.marks == marks
             })
@@ -628,7 +657,7 @@ impl Jobs {
         let Request { intent, work } = self.queued.take()?;
         let search = match &intent {
             Intent::Search { result, .. } => Some(result),
-            _ => app.pdf_search(),
+            _ => pdf_search(app),
         };
         let marks = work.marks(search);
         match geometry.and_then(|geometry| {
@@ -663,7 +692,8 @@ impl Jobs {
                 float
             }
             Intent::Turn { previous, .. } => {
-                app.turn_pdf_page(page, previous);
+                Document::replace_pdf_page(app, page);
+                app.reset_viewport(PdfDocument::arrival_anchor(previous));
                 app.clear_notice_if(TURN_NOTICE);
                 None
             }
@@ -679,9 +709,9 @@ impl Jobs {
                         close_float: None,
                     };
                 };
-                app.replace_pdf_page(page);
+                Document::replace_pdf_page(app, page);
                 app.center_row(&layout, layout.pdf_row(hit.from_top));
-                app.set_pdf_search(result);
+                publish_search(app, result);
                 None
             }
         };
@@ -953,7 +983,7 @@ mod tests {
         let check = |index, color| -> Result<PlacedPage, Box<dyn std::error::Error>> {
             let layout = demo.page()?;
             let session = demo.session.borrow();
-            let page = session.app.pdf().ok_or("expected PDF")?;
+            let page = active_page(&session.app).ok_or("expected PDF")?;
             assert_eq!(page.index, index);
             let raster = page.decode().map_err(io::Error::from)?;
             let (w, h) = raster.dimensions();
@@ -984,7 +1014,7 @@ mod tests {
         ));
         {
             let mut state = demo.session.borrow_mut();
-            assert!(state.app.pdf().is_none());
+            assert!(active_page(&state.app).is_none());
             state.pdf.depart(pdf_id);
         }
         wait(&demo.session, &demo.runtime)?;
@@ -1304,7 +1334,7 @@ mod tests {
             state.borrow().app.document_path().canonicalize()?,
             path.canonicalize()?
         );
-        assert!(state.borrow().app.pdf().is_some());
+        assert!(active_page(&state.borrow().app).is_some());
         // Run another Lua mapping to make sure cleanup also released the Lua handle.
         press(&mut keys, KeyCode::Char('f'));
         press(&mut keys, KeyCode::Char('f'));

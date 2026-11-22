@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::markdown::MarkdownResources;
 
-use super::{App, Content, Document};
+use super::{App, Document};
 
 impl App {
     pub(crate) fn from_test_markdown(name: String, markdown: String) -> Self {
@@ -11,9 +11,9 @@ impl App {
     }
 
     pub(crate) fn markdown_resources(&self) -> &MarkdownResources {
-        match &self.document.content {
-            Content::Markdown(markdown) => &markdown.resources,
-            Content::Pdf { .. } => panic!("expected Markdown resources"),
-        }
+        self.document()
+            .markdown()
+            .expect("expected Markdown resources")
+            .resources()
     }
 }

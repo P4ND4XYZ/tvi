@@ -90,7 +90,7 @@ impl Session {
     }
 
     fn apply(&mut self, action: Action, rows: &impl ViewRows, text: &str) {
-        if self.app.pdf().is_some() && !self.app.help_open() {
+        if self.app.document().as_pdf().is_some() && !self.app.help_open() {
             match (self.app.mode(), action) {
                 (Mode::Search(direction), Action::Submit) => {
                     let input = self.app.finish_search_input();
@@ -143,8 +143,7 @@ impl Session {
             self.renderer.as_ref(),
         ));
         if self.reload_positions.take() == Some(id) {
-            self.app
-                .refresh_reloaded_positions(prepared.document.search_text());
+            Document::refresh_reloaded_positions(&mut self.app, prepared.document.search_text());
         }
         self.prepared = Some((id, Rc::clone(&prepared)));
         prepared
@@ -155,7 +154,8 @@ impl Session {
         let body = ui::body_area(area, self.app.mode());
         self.pdf_normal_height = self
             .app
-            .pdf()
+            .document()
+            .as_pdf()
             .map(|_| usize::from(ui::body_area(area, Mode::Normal).height));
         self.app.reflow(layout, usize::from(body.height));
         if let Some((id, line)) = self.source_scroll.take()
@@ -449,7 +449,12 @@ impl Host for RefCell<Session> {
     fn scroll_to_line(&self, view: u64, line: i64) -> Result<(), String> {
         validate_view(view)?;
         let mut session = self.borrow_mut();
-        if !session.app.markdown().is_empty() {
+        if session
+            .app
+            .document()
+            .markdown()
+            .is_some_and(|markdown| !markdown.text().is_empty())
+        {
             let line = usize::try_from(line.max(1)).unwrap_or(usize::MAX);
             session.source_scroll = Some((session.app.document_id(), line - 1));
         }
@@ -520,7 +525,7 @@ fn run_app(
     );
     initial.pdf = jobs;
     initial.pdf_geometry = pdf::geometry(size.width, mode);
-    if initial.app.pdf().is_none() {
+    if initial.app.document().as_pdf().is_none() {
         drop(initial.display());
     }
     let session = Rc::new(RefCell::new(initial));
@@ -560,7 +565,12 @@ fn run_document(
         let mut session = session.borrow_mut();
         (
             session.app.document_id(),
-            session.app.pdf().is_none().then(|| session.display()),
+            session
+                .app
+                .document()
+                .as_pdf()
+                .is_none()
+                .then(|| session.display()),
         )
     };
     let build_markdown = |width, mode| {

@@ -4,7 +4,7 @@ use image::DynamicImage;
 use serde_json::json;
 
 use crate::{
-    app::App,
+    app::{App, Document},
     images::{self, Budget},
     logging::{self, Level},
     markdown::{RenderedMarkdown, mermaid::extract, tui_markdown::TuiMarkdown},
@@ -25,7 +25,7 @@ pub(super) fn prepare(
     mode: ImageMode,
     renderer: Option<&Mermaid>,
 ) -> PreparedDisplay {
-    let Some((path, markdown, resources)) = app.display_input() else {
+    let Some((path, markdown, resources)) = Document::markdown_display_input(app) else {
         unreachable!("only Markdown documents use Markdown preparation");
     };
     let mut budget = Budget::default();
@@ -68,7 +68,8 @@ pub(super) fn prepare(
     // If the adapter could not match its fences, it rendered all blocks as
     // code. Recompute matches regardless, using the old position as an estimate.
     let uncertain = restoring && placed + document.expanded_diagrams.len() != placements.len();
-    app.restore_display_positions(
+    Document::restore_display_positions(
+        app,
         document.search_text(),
         &document.expanded_diagrams,
         uncertain,

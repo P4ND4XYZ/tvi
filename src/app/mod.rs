@@ -9,14 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{markdown::MarkdownResources, pdf::Page};
-
 use command::Command;
-use document::Content;
+pub(crate) use document::PdfDocument;
 pub use document::{Document, DocumentLink};
 pub use search::Direction;
 pub(crate) use search::PdfSearch;
-use search::Search;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -33,6 +30,12 @@ pub enum Motion {
     HalfUp,
     PageDown,
     PageUp,
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ScrollEdge {
     Start,
     End,
 }
@@ -57,7 +60,6 @@ pub struct App {
     mode: Mode,
     prompt: String,
     notice: Option<String>,
-    search: Search,
     viewport: Viewport,
     help: bool,
     quit: bool,
@@ -65,7 +67,6 @@ pub struct App {
 
 struct HistoryEntry {
     document: Document,
-    search: Search,
     anchor: ViewAnchor,
 }
 
@@ -190,7 +191,6 @@ impl App {
             mode: Mode::Normal,
             prompt: String::new(),
             notice: None,
-            search: Search::default(),
             viewport: Viewport::default(),
             help: false,
             quit: false,
@@ -201,55 +201,23 @@ impl App {
         &self.document.name
     }
 
-    pub(crate) fn markdown(&self) -> &str {
-        match &self.document.content {
-            Content::Markdown(markdown) => &markdown.text,
-            Content::Pdf { .. } => "",
-        }
+    pub(crate) fn document(&self) -> &Document {
+        &self.document
     }
 
-    pub(crate) fn pdf(&self) -> Option<&Page> {
-        match &self.document.content {
-            Content::Pdf { page, .. } => Some(page),
-            Content::Markdown(_) => None,
-        }
+    pub fn document_path(&self) -> &Path {
+        &self.document.path
     }
 
-    pub(crate) fn turn_pdf_page(&mut self, page: Page, previous: bool) {
-        self.replace_pdf_page(page);
+    pub(crate) fn reset_viewport(&mut self, anchor: ViewAnchor) {
         self.viewport = Viewport {
-            anchor: if previous {
-                ViewAnchor::text(usize::MAX)
-            } else {
-                ViewAnchor::default()
-            },
+            anchor,
             ..Viewport::default()
         };
     }
 
-    pub(crate) fn replace_pdf_page(&mut self, next: Page) {
-        if let Content::Pdf { page, .. } = &mut self.document.content {
-            *page = next;
-        }
-    }
-
-    pub(crate) fn pdf_search(&self) -> Option<&PdfSearch> {
-        match &self.document.content {
-            Content::Pdf { search, .. } => search.as_ref(),
-            Content::Markdown(_) => None,
-        }
-    }
-
-    pub(crate) fn set_pdf_search(&mut self, next: PdfSearch) {
-        if let Content::Pdf { search, .. } = &mut self.document.content {
-            self.notice = next.current().is_none().then(|| "No matches".into());
-            *search = Some(next);
-        }
-    }
-
     /// A repeated scroll at the actual edge, not a scroll that just reaches the edge.
-    pub(crate) fn pdf_turn(&self, motion: Motion, rows: &impl ViewRows) -> Option<(u32, bool)> {
-        let page = self.pdf()?;
+    pub(crate) fn scroll_edge(&self, motion: Motion, rows: &impl ViewRows) -> Option<ScrollEdge> {
         if self.mode != Mode::Normal || self.help || self.viewport.height == 0 || rows.len() == 0 {
             return None;
         }
@@ -257,47 +225,13 @@ impl App {
             Motion::LineDown | Motion::HalfDown | Motion::PageDown
                 if self.viewport.top == self.viewport.last_top(rows) =>
             {
-                (page.index + 1 < page.source.count).then_some((page.index + 1, false))
+                Some(ScrollEdge::End)
             }
             Motion::LineUp | Motion::HalfUp | Motion::PageUp if self.viewport.top == 0 => {
-                page.index.checked_sub(1).map(|index| (index, true))
+                Some(ScrollEdge::Start)
             }
             _ => None,
         }
-    }
-
-    pub fn document_path(&self) -> &Path {
-        &self.document.path
-    }
-
-    pub(crate) fn display_input(&mut self) -> Option<(&Path, &str, &mut MarkdownResources)> {
-        self.document.display_input()
-    }
-
-    pub(crate) fn restore_display_positions(
-        &mut self,
-        text: &str,
-        expansions: &[Range<usize>],
-        uncertain: bool,
-    ) {
-        if expansions.is_empty() && !uncertain {
-            return;
-        }
-        // Each restored block replaces one empty line. Its new byte range is the
-        // number of bytes added, excluding the newline that already followed it.
-        let remap = |offset: usize| {
-            let mut added = 0;
-            for range in expansions {
-                if offset <= range.start - added {
-                    break;
-                }
-                added += range.len();
-            }
-            offset + added
-        };
-        let anchor = &mut self.viewport.anchor;
-        anchor.byte = remap(anchor.byte);
-        self.search.refresh(text, remap, anchor.byte);
     }
 
     pub fn document_id(&self) -> u64 {
@@ -312,27 +246,15 @@ impl App {
         self.document.resolve_link(id)
     }
 
-    pub(crate) fn replace_document(&mut self, document: Document) {
+    pub(crate) fn replace_document(&mut self, mut document: Document) {
+        document.inherit_search(&mut self.document);
         self.document = document;
     }
 
-    pub(crate) fn refresh_reloaded_positions(&mut self, text: &str) {
-        self.viewport.anchor.byte = self.viewport.anchor.byte.min(text.len());
-        self.search
-            .refresh(text, |offset| offset, self.viewport.anchor.byte);
-    }
-
     pub fn open_document(&mut self, document: Document) {
-        // A page left before its first draw (e.g. by Lua) must not convert on return.
-        if let Content::Markdown(markdown) = &mut self.document.content {
-            markdown
-                .resources
-                .successful_diagrams
-                .get_or_insert_default();
-        }
+        self.document.freeze_for_history();
         self.history.push(HistoryEntry {
             document: std::mem::replace(&mut self.document, document),
-            search: std::mem::take(&mut self.search),
             anchor: self.viewport.anchor,
         });
         self.viewport = Viewport::default();
@@ -343,7 +265,8 @@ impl App {
 
     pub fn reset_to_initial_document(&mut self) {
         let initial = self.history.drain(..).next();
-        if let Some(entry) = initial {
+        if let Some(mut entry) = initial {
+            entry.document.reset_search();
             *self = Self::from_document(entry.document);
         }
     }
@@ -351,7 +274,6 @@ impl App {
     fn jump_back(&mut self) {
         if let Some(entry) = self.history.pop() {
             self.document = entry.document;
-            self.search = entry.search;
             self.viewport = Viewport {
                 anchor: entry.anchor,
                 ..Viewport::default()
@@ -376,6 +298,10 @@ impl App {
         self.notice = Some(message);
     }
 
+    pub(crate) fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
     pub(crate) fn clear_notice_if(&mut self, message: &str) -> bool {
         if self.notice() != Some(message) {
             return false;
@@ -397,26 +323,19 @@ impl App {
     }
 
     pub fn search_query(&self) -> &str {
-        self.pdf_search()
-            .map_or_else(|| self.search.query(), |search| &search.query)
+        self.document.search_query()
     }
 
     pub fn search_selection(&self) -> Option<(usize, usize)> {
-        self.pdf_search()
-            .map_or_else(|| self.search.selection(), PdfSearch::selection)
+        self.document.search_selection()
     }
 
     pub(crate) fn search_highlights_enabled(&self) -> bool {
-        self.pdf_search()
-            .map_or(self.search.highlights, |search| search.highlights)
+        self.document.search_highlights_enabled()
     }
 
     pub fn highlights(&self) -> (&[Range<usize>], Option<&Range<usize>>) {
-        if self.search.highlights {
-            (self.search.matches(), self.search.current())
-        } else {
-            (&[], None)
-        }
+        self.document.text_highlights()
     }
 
     pub fn reflow(&mut self, rows: &impl ViewRows, height: usize) {
@@ -432,21 +351,6 @@ impl App {
         self.viewport.show(top, rows);
     }
 
-    fn move_viewport(&mut self, motion: Motion, rows: &impl ViewRows) {
-        let top = self.viewport.top;
-        let anchor = self.viewport.anchor;
-        self.viewport.navigate(motion, rows);
-        if self.pdf().is_some() && rows.len() > 0 && self.viewport.height > 0 {
-            let last = self.viewport.last_top(rows);
-            if motion == Motion::End || (self.viewport.top == last && top < last) {
-                self.viewport.anchor = ViewAnchor::text(usize::MAX);
-            } else if motion != Motion::Start && self.viewport.top == top {
-                // An inert scroll at a clamped edge must not discard the reflow anchor.
-                self.viewport.anchor = anchor;
-            }
-        }
-    }
-
     pub fn apply(&mut self, action: Action, rows: &impl ViewRows, text: &str) {
         if self.help {
             if action == Action::Cancel {
@@ -455,14 +359,17 @@ impl App {
             return;
         }
         match (self.mode, action) {
-            (Mode::Normal, Action::Move(motion)) => self.move_viewport(motion, rows),
+            (Mode::Normal, Action::Move(motion)) => {
+                self.document.navigate(&mut self.viewport, motion, rows);
+            }
             (Mode::Normal, Action::StartCommand) => self.start_input(Mode::Command),
             (Mode::Normal, Action::StartSearch(direction)) => {
                 self.start_input(Mode::Search(direction));
             }
             (Mode::Normal, Action::RepeatSearch { reverse }) => {
-                self.search.step(reverse);
-                self.reveal_search(rows);
+                self.notice = self
+                    .document
+                    .repeat_search(&mut self.viewport, rows, reverse);
             }
             (Mode::Normal, Action::JumpBack) => self.jump_back(),
             (Mode::Normal, Action::Help) => self.help = true,
@@ -481,12 +388,9 @@ impl App {
             (Mode::Command, Action::Submit) => self.execute_command(),
             (Mode::Search(direction), Action::Submit) => {
                 let query = self.finish_search_input();
-                let offset = rows
-                    .anchor_at(self.viewport.top)
-                    .unwrap_or(self.viewport.anchor)
-                    .byte;
-                self.search.submit(query, direction, text, offset);
-                self.reveal_search(rows);
+                self.notice =
+                    self.document
+                        .submit_search(&mut self.viewport, rows, text, query, direction);
             }
             _ => {}
         }
@@ -503,33 +407,12 @@ impl App {
         self.notice = None;
     }
 
-    fn reveal_search(&mut self, rows: &impl ViewRows) {
-        self.notice = if let Some(hit) = self.search.current() {
-            self.viewport.search_target(hit.start, rows);
-            None
-        } else if self.search.query().is_empty() {
-            Some("No previous search".into())
-        } else {
-            Some("No matches".into())
-        };
-    }
-
     fn execute_command(&mut self) {
         self.mode = Mode::Normal;
         match command::parse(&self.prompt) {
             Some(Command::Quit) => self.quit = true,
             Some(Command::Help) => self.help = true,
-            Some(Command::HideHighlights) => {
-                if let Content::Pdf {
-                    search: Some(search),
-                    ..
-                } = &mut self.document.content
-                {
-                    search.highlights = false;
-                } else {
-                    self.search.highlights = false;
-                }
-            }
+            Some(Command::HideHighlights) => self.document.hide_highlights(),
             None => self.notice = Some("Unknown command".into()),
         }
         self.prompt.clear();

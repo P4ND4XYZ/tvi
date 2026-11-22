@@ -129,7 +129,8 @@ fn status_line(app: &App, len: usize) -> String {
         Mode::Search(_) => "SEARCH",
     };
     let row = if len == 0 { 0 } else { app.top_row() + 1 };
-    let mut text = if let Some(page) = app.pdf() {
+    let mut text = if let Some(pdf) = app.document().as_pdf() {
+        let page = pdf.page();
         format!(
             "{mode}  PDF {}/{}  {row}/{len}",
             page.index + 1,
@@ -392,7 +393,7 @@ mod tests {
 
         let mut app =
             App::from_test_markdown("test.md".into(), "first\n\nabcdefgMATCH tail".into());
-        let doc = prepare(&TuiMarkdown, app.markdown(), 8);
+        let doc = prepare(&TuiMarkdown, app.document().markdown().unwrap().text(), 8);
         let mut terminal = Terminal::new(TestBackend::new(8, 5))?;
         let mut input = Input::default();
         paint(&mut terminal, &mut app, &doc)?;
@@ -457,7 +458,7 @@ mod tests {
     fn table_highlights_both_columns_across_cell_wraps() -> Result<(), Infallible> {
         let source = "| L | R |\n| --- | ---: |\n| **abcdef** | │XYZUV |\n| **abcdef** | │XYZUV |";
         let mut app = App::from_test_markdown("test.md".into(), source.into());
-        let doc = prepare(&TuiMarkdown, app.markdown(), 13);
+        let doc = prepare(&TuiMarkdown, app.document().markdown().unwrap().text(), 13);
         let mut terminal = Terminal::new(TestBackend::new(13, 10))?;
         let mut input = Input::default();
         paint(&mut terminal, &mut app, &doc)?;
@@ -651,7 +652,7 @@ mod tests {
     #[test]
     fn help_is_an_overlay_closed_by_escape() -> Result<(), Infallible> {
         let mut app = App::from_test_markdown("test.md".into(), "body".into());
-        let doc = prepare(&TuiMarkdown, app.markdown(), 42);
+        let doc = prepare(&TuiMarkdown, app.document().markdown().unwrap().text(), 42);
         let mut terminal = Terminal::new(TestBackend::new(42, 10))?;
         let mut input = Input::default();
         press(&mut input, &mut app, &doc, 42, [KeyCode::F(1)]);

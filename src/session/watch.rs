@@ -137,7 +137,7 @@ pub(super) struct Reload {
 impl Reload {
     /// Called on the UI thread. Return true if a notice or the displayed document changed.
     pub(super) fn poll(&mut self, session: &mut Session, now: Instant, input_busy: bool) -> bool {
-        if session.app.pdf().is_some() {
+        if session.app.document().markdown().is_none() {
             *self = Self::default();
             return false;
         }
@@ -240,7 +240,7 @@ impl Reload {
             .map_err(|error| ReloadError::Contents(ReadDocumentError::Read(error)))?;
         let markdown = String::from_utf8(bytes)
             .map_err(|error| ReloadError::Contents(ReadDocumentError::Decode(error)))?;
-        if markdown == session.app.markdown() {
+        if markdown == session.app.document().markdown().unwrap().text() {
             return Ok(false);
         }
         session
@@ -302,7 +302,7 @@ mod tests {
             assert!(
                 wait_until(Duration::from_secs(3), || {
                     reload.poll(&mut session, Instant::now(), false);
-                    session.app.markdown() == text
+                    session.app.document().markdown().unwrap().text() == text
                 }),
                 "no reload for {text}"
             );
@@ -388,7 +388,7 @@ mod tests {
             reload.poll(&mut session, Instant::now(), false);
             reload.watch.is_none() && session.app.notice() == Some(WATCH_NOTICE)
         }));
-        assert_eq!(session.app.markdown(), "old");
+        assert_eq!(session.app.document().markdown().unwrap().text(), "old");
         session.app.clear_notice_if(WATCH_NOTICE);
         assert!(!wait_until(DEBOUNCE * 3, || reload.poll(
             &mut session,
@@ -416,7 +416,7 @@ mod tests {
                 reload.poll(&mut session, now, false),
                 attempt + 1 == MAX_ATTEMPTS
             );
-            assert_eq!(session.app.markdown(), "old");
+            assert_eq!(session.app.document().markdown().unwrap().text(), "old");
         }
         assert_eq!(session.app.notice(), Some(READ_NOTICE));
         Ok(())
@@ -437,7 +437,7 @@ mod tests {
             Instant::now(),
             false
         )));
-        assert_eq!(session.app.markdown(), "old");
+        assert_eq!(session.app.document().markdown().unwrap().text(), "old");
         assert_eq!(session.app.notice(), Some(READ_NOTICE));
         let rows = [ViewAnchor::text(0)];
         session.app.apply(Action::StartCommand, &rows, "old");
@@ -448,7 +448,7 @@ mod tests {
             reload.poll(&mut session, Instant::now(), false);
             reload.pending.is_some()
         }));
-        assert_eq!(session.app.markdown(), "old");
+        assert_eq!(session.app.document().markdown().unwrap().text(), "old");
         assert_eq!(session.app.prompt(), "q");
         session.app.apply(Action::Cancel, &rows, "old");
         assert!(wait_until(Duration::from_secs(3), || reload.poll(
@@ -456,7 +456,7 @@ mod tests {
             Instant::now(),
             false
         )));
-        assert_eq!(session.app.markdown(), "new");
+        assert_eq!(session.app.document().markdown().unwrap().text(), "new");
         assert!(session.app.notice().is_none());
         Ok(())
     }

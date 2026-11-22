@@ -382,7 +382,10 @@ fn pending_cancel_and_superseded_searches_preserve_the_view() -> Result<(), Box<
         let app = &state.app;
         (
             app.document_id(),
-            app.pdf().map(|page| page.index),
+            app.document()
+                .as_pdf()
+                .map(crate::app::PdfDocument::page)
+                .map(|page| page.index),
             app.top_row(),
         )
     };
@@ -451,7 +454,12 @@ fn failed_or_cancelled_search_render_does_not_replace_the_page_or_selection()
         let state = view.session.borrow();
         (
             state.app.document_id(),
-            state.app.pdf().map(|page| page.index),
+            state
+                .app
+                .document()
+                .as_pdf()
+                .map(crate::app::PdfDocument::page)
+                .map(|page| page.index),
             state.app.top_row(),
             state.app.search_selection(),
         )
@@ -489,7 +497,12 @@ fn failed_or_cancelled_search_render_does_not_replace_the_page_or_selection()
         assert_eq!(
             (
                 state.app.document_id(),
-                state.app.pdf().map(|page| page.index),
+                state
+                    .app
+                    .document()
+                    .as_pdf()
+                    .map(crate::app::PdfDocument::page)
+                    .map(|page| page.index),
                 state.app.top_row(),
                 state.app.search_selection(),
             ),
@@ -630,7 +643,9 @@ impl View {
         let state = self.session.borrow();
         Ok(state
             .app
-            .pdf()
+            .document()
+            .as_pdf()
+            .map(crate::app::PdfDocument::page)
             .ok_or("no PDF page")?
             .decode()
             .map_err(io::Error::from)?
@@ -696,7 +711,12 @@ impl View {
             let body = ui::body_area(buffer.area, session.app.mode());
             if !layout.pdf_transfer_pending(body, top) {
                 let clip = self.kitty.clip(buffer, body, CELL_W, CELL_H)?;
-                let page = session.app.pdf().ok_or("missing rendered PDF")?;
+                let page = session
+                    .app
+                    .document()
+                    .as_pdf()
+                    .map(crate::app::PdfDocument::page)
+                    .ok_or("missing rendered PDF")?;
                 assert_eq!(page.index + 1, hit.page);
                 let native = page.decode().map_err(io::Error::from)?.into_rgba8();
                 verify_ink(&clip, &native, layout.rows().len(), top, hit, color)?;
