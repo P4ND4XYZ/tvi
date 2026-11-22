@@ -129,7 +129,15 @@ fn status_line(app: &App, len: usize) -> String {
         Mode::Search(_) => "SEARCH",
     };
     let row = if len == 0 { 0 } else { app.top_row() + 1 };
-    let mut text = format!("{mode}  {row}/{len}");
+    let mut text = if let Some(page) = app.pdf() {
+        format!(
+            "{mode}  PDF {}/{}  {row}/{len}",
+            page.index + 1,
+            page.source.count
+        )
+    } else {
+        format!("{mode}  {row}/{len}")
+    };
     if let Some((index, total)) = app.search_selection() {
         let state = if app.highlights().0.is_empty() {
             " off"
@@ -203,7 +211,7 @@ const HELP: &str = "Help (Esc to close)\n\
     Ctrl-d/u  Half page   Ctrl-f/b Page   PgDn/PgUp Page\n\
     gg/G  Start/end   : Command   / ? Search forward/backward\n\
     n/N  Next/reverse match   :noh / :nohlsearch Hide highlights\n\
-    ff  Find Markdown files   Ctrl-o  Return from a file jump\n\
+    ff  Find files   Ctrl-o  Return from a file jump\n\
     Backspace Edit   Enter Confirm   Esc Cancel\n\
     F1 / :help Help   :q / :quit Quit";
 

@@ -38,9 +38,9 @@ impl Host for TestHost {
         }
     }
 
-    fn open_file(&self, view: u64, path: &Path) -> Result<(), String> {
+    fn open_file(&self, view: u64, path: &Path) -> Result<FileOpen, String> {
         self.opened_files.borrow_mut().push((view, path.to_owned()));
-        Ok(())
+        Ok(FileOpen::Opened)
     }
 
     fn scroll_to_line(&self, view: u64, line: i64) -> Result<(), String> {

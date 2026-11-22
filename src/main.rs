@@ -9,9 +9,13 @@ mod lua;
 mod markdown;
 mod mermaid;
 mod net;
+mod pdf;
 mod process;
 mod session;
 mod terminal;
+#[cfg(all(test, windows))]
+#[path = "../tests/support/pdf.rs"]
+mod test_pdf;
 mod ui;
 
 fn main() -> ExitCode {
@@ -40,7 +44,7 @@ fn run() -> io::Result<()> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: tvi <markdown-file> (exactly one path required)",
+                "usage: tvi <file> (exactly one path required)",
             )
         })?;
     let path = Path::new(&file);
@@ -50,6 +54,9 @@ fn run() -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             "file path is not valid UTF-8",
         ));
+    }
+    if pdf::is_pdf(path) {
+        return session::start_pdf(file.into());
     }
     let document = session::read_document(path)?;
     terminal::with_screen(|screen, input| session::run(screen, input, document))

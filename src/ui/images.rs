@@ -15,6 +15,7 @@ use ratatui_image::{
 
 pub struct PlacedImage {
     pub rows: Range<usize>,
+    column: u16,
     protocol: SlicedProtocol,
     kitty_id: Option<u32>,
     drawn: Cell<bool>,
@@ -38,8 +39,28 @@ impl PlacedImage {
         };
         Some(Self {
             rows: start..start + usize::from(protocol.size().height),
+            column: 0,
             protocol,
             kitty_id,
+            drawn: Cell::new(false),
+        })
+    }
+
+    pub(super) fn pdf_tile(
+        pixels: image::RgbaImage,
+        size: Size,
+        start: usize,
+        column: u16,
+    ) -> Option<Self> {
+        let id = crate::terminal::next_image_id();
+        let protocol = SlicedProtocol::Kitty(
+            Kitty::new(DynamicImage::ImageRgba8(pixels), size, id, false, false).ok()?,
+        );
+        Some(Self {
+            rows: start..start + usize::from(size.height),
+            column,
+            protocol,
+            kitty_id: Some(id),
             drawn: Cell::new(false),
         })
     }
@@ -123,6 +144,10 @@ impl PlacedImage {
         ))
     }
 
+    pub(super) fn visible_at_width(&self, width: u16) -> bool {
+        self.column < width
+    }
+
     pub fn transmitted_id(&self) -> Option<u32> {
         self.kitty_id.filter(|_| self.drawn.get())
     }
@@ -145,12 +170,17 @@ impl PlacedImage {
         ) else {
             return;
         };
-        if body.width == 0 {
+        if self.column >= body.width {
             return;
         }
-        let clip = Rect::new(body.x, body.y + y, body.width, height);
+        let clip = Rect::new(
+            body.x + self.column,
+            body.y + y,
+            body.width - self.column,
+            height,
+        );
         let bounds = Rect {
-            width: self.protocol.size().width.min(body.width),
+            width: self.protocol.size().width.min(clip.width),
             ..clip
         };
         frame.buffer_mut().set_style(bounds, Style::reset());

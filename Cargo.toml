@@ -19,6 +19,14 @@ tui-markdown = { version = "0.3.13", features = ["highlight-code"] }
 unicode-segmentation = "1.13"
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Data_Pdf",
+    "Foundation",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "UI",
+    "Win32_System_WinRT",
+] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",

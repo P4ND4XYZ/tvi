@@ -5,7 +5,7 @@ use std::ops::Range;
 use ratatui::{
     Frame,
     buffer::CellWidth,
-    layout::Rect,
+    layout::{Rect, Size},
     style::Style,
     text::{Line, Span, Text},
 };
@@ -54,6 +54,114 @@ pub struct Layout<'a> {
     source_positions: &'a [Option<SourcePosition>],
     logical_rows: Vec<usize>,
     images: Vec<PlacedImage>,
+    pdf: bool,
+}
+
+// Four new tiles per frame: at most 128 KiB raw RGBA (under 180 KiB of
+// base64 plus Kitty transfer framing), independently of viewport size.
+const PDF_TILE_PIXELS: u32 = 8 * 1024;
+const PDF_TILES_PER_FRAME: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PdfGeometry {
+    pub columns: u16,
+    pub cell_width: u16,
+    pub cell_height: u16,
+}
+
+impl Layout<'static> {
+    pub fn empty_pdf() -> Self {
+        Self {
+            text: Text::default(),
+            rows: Vec::new(),
+            #[cfg(test)]
+            search_len: 0,
+            reflowed: Vec::new(),
+            source_positions: &[],
+            logical_rows: Vec::new(),
+            images: Vec::new(),
+            pdf: true,
+        }
+    }
+
+    pub fn pdf_page(
+        image: &image::DynamicImage,
+        aspect_height: f64,
+        geometry: PdfGeometry,
+    ) -> Option<Self> {
+        // Kitty placeholders have a finite coordinate table. Tile the width-fitted
+        // raster rather than reducing its height to fit a single placement.
+        const MAX_DISPLAY_PIXELS: u64 = 32 * 1024 * 1024;
+        const MAX_ROWS: u16 = 8192;
+        const ANCHOR_SCALE: usize = 1 << 18;
+
+        let cw = u32::from(geometry.cell_width);
+        let ch = u32::from(geometry.cell_height);
+        let cells_per_tile = PDF_TILE_PIXELS.checked_div(cw * ch)?;
+        // Keep bands shallow to limit bytes outside the viewport. Each dimension
+        // also stays below the Kitty placeholder coordinate limit.
+        let tile_columns = u16::try_from(cells_per_tile.min(128))
+            .ok()?
+            .min(geometry.columns);
+        let tile_rows =
+            u16::try_from(cells_per_tile.checked_div(u32::from(tile_columns))?.min(8)).ok()?;
+        let width = u32::from(geometry.columns) * cw;
+        let height = (f64::from(width) * aspect_height).round().max(1.0);
+        if width == 0
+            || ch == 0
+            || !height.is_finite()
+            || height > f64::from(MAX_ROWS) * f64::from(ch)
+        {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "checked against MAX_ROWS times a u16 cell size"
+        )]
+        let height = height as u32;
+        let rows = u16::try_from(height.div_ceil(ch)).ok()?;
+        if u64::from(width) * u64::from(rows) * u64::from(ch) > MAX_DISPLAY_PIXELS {
+            return None;
+        }
+        let pixels = image
+            .resize_exact(width, height, image::imageops::FilterType::Triangle)
+            .into_rgba8();
+        let mut layout = Self::empty_pdf();
+        for row in 0..rows {
+            let byte = (usize::from(row) * ANCHOR_SCALE).div_ceil(usize::from(rows));
+            layout.rows.push(Row {
+                anchor: ViewAnchor::text(byte),
+                cells: Vec::new(),
+            });
+        }
+        for start in (0..rows).step_by(usize::from(tile_rows)) {
+            let tile_rows = tile_rows.min(rows - start);
+            let y = u32::from(start) * ch;
+            let tile_height = u32::from(tile_rows) * ch;
+            for column in (0..geometry.columns).step_by(usize::from(tile_columns)) {
+                let tile_columns = tile_columns.min(geometry.columns - column);
+                let x = u32::from(column) * cw;
+                let tile_width = u32::from(tile_columns) * cw;
+                let mut tile = image::RgbaImage::new(tile_width, tile_height);
+                let visible = image::imageops::crop_imm(
+                    &pixels,
+                    x,
+                    y,
+                    tile_width,
+                    tile_height.min(height - y),
+                );
+                image::imageops::replace(&mut tile, &visible.to_image(), 0, 0);
+                layout.images.push(PlacedImage::pdf_tile(
+                    tile,
+                    Size::new(tile_columns, tile_rows),
+                    usize::from(start),
+                    column,
+                )?);
+            }
+        }
+        Some(layout)
+    }
 }
 
 impl<'a> Layout<'a> {
@@ -85,6 +193,7 @@ impl<'a> Layout<'a> {
             source_positions: &document.source_positions,
             logical_rows: Vec::with_capacity(original.lines.len() + 1),
             images: Vec::new(),
+            pdf: false,
         };
         if width != 0 {
             let mut placements = document.images.iter().peekable();
@@ -192,12 +301,32 @@ impl<'a> Layout<'a> {
         self.images.iter().filter_map(PlacedImage::transmitted_id)
     }
 
-    pub fn draw_images(&self, frame: &mut Frame<'_>, body: Rect, top: usize) {
+    fn visible_images(&self, body: Rect, top: usize) -> impl Iterator<Item = &PlacedImage> {
         let first = self.images.partition_point(|image| image.rows.end <= top);
-        for image in self.images[first..]
+        self.images[first..]
             .iter()
-            .take_while(|image| image.rows.start < top + usize::from(body.height))
-        {
+            .take_while(move |image| {
+                !body.is_empty() && image.rows.start < top + usize::from(body.height)
+            })
+            .filter(move |image| image.visible_at_width(body.width))
+    }
+
+    pub fn pdf_transfer_pending(&self, body: Rect, top: usize) -> bool {
+        self.pdf
+            && self
+                .visible_images(body, top)
+                .any(|image| image.transmitted_id().is_none())
+    }
+
+    pub fn draw_images(&self, frame: &mut Frame<'_>, body: Rect, top: usize) {
+        let mut new_tiles = 0;
+        for image in self.visible_images(body, top) {
+            if self.pdf && image.transmitted_id().is_none() {
+                if new_tiles == PDF_TILES_PER_FRAME {
+                    continue;
+                }
+                new_tiles += 1;
+            }
             image.draw(frame, body, top);
         }
     }
@@ -359,6 +488,93 @@ mod tests {
     };
 
     const EXAMPLE: &str = include_str!("../../tests/fixtures/rendering.md");
+
+    #[test]
+    fn pdf_kitty_placement_spans_body_width_and_keeps_the_last_tile_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let pixels = image::DynamicImage::new_rgb8(13, 26);
+        let geometry = PdfGeometry {
+            columns: 162,
+            cell_width: 2,
+            cell_height: 4,
+        };
+        let layout = Layout::pdf_page(&pixels, 2.0, geometry).ok_or("page was not placed")?;
+        assert_eq!(layout.len(), 162);
+        let mut terminal = Terminal::new(TestBackend::new(164, 4))?;
+        terminal.draw(|frame| layout.draw_images(frame, Rect::new(1, 0, 162, 3), 159))?;
+        let buffer = terminal.backend().buffer();
+        for y in 0..3 {
+            for x in [1, 128, 129, 162] {
+                assert!(
+                    buffer[(x, y)].symbol().contains('\u{10eeee}'),
+                    "no page pixel at {x},{y}"
+                );
+            }
+            assert_eq!(buffer[(0, y)].symbol(), " ");
+            assert_eq!(buffer[(163, y)].symbol(), " ");
+        }
+        assert_eq!(buffer[(1, 3)].symbol(), " ");
+        assert_eq!(layout.transmitted_ids().count(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_pdf_transfers_only_a_bounded_batch_of_visible_tiles_each_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let geometry = PdfGeometry {
+            columns: 128,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let image = image::DynamicImage::new_rgb8(40, 160);
+        let layout = Layout::pdf_page(&image, 4.0, geometry).ok_or("page was not placed")?;
+        let body = Rect::new(0, 0, 128, 47);
+        let mut screen = Terminal::new(TestBackend::new(128, 48))?;
+        for top in [0, 48] {
+            let mut frames = 0;
+            while layout.pdf_transfer_pending(body, top) {
+                screen.draw(|frame| layout.draw_images(frame, body, top))?;
+                let bytes: usize = screen
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .filter(|symbol| symbol.contains("\x1b_G"))
+                    .map(str::len)
+                    .sum();
+                assert!(
+                    (1..180 * 1024).contains(&bytes),
+                    "one frame wrote {bytes} Kitty bytes"
+                );
+                frames += 1;
+                assert!(frames <= 60, "visible tile transfer never finished");
+            }
+            assert!(
+                frames > 1,
+                "a large viewport should transfer in multiple batches"
+            );
+            assert!(
+                screen.backend().buffer()[(127, 46)]
+                    .symbol()
+                    .contains('\u{10eeee}')
+            );
+            screen.draw(|frame| layout.draw_images(frame, body, top))?;
+            assert!(
+                screen
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .all(|cell| !cell.symbol().contains("\x1b_G"))
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn source_lines_follow_content_through_wraps_and_hidden_lines() {

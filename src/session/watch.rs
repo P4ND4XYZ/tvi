@@ -137,6 +137,10 @@ pub(super) struct Reload {
 impl Reload {
     /// Called on the UI thread. Return true if a notice or the displayed document changed.
     pub(super) fn poll(&mut self, session: &mut Session, now: Instant, input_busy: bool) -> bool {
+        if session.app.pdf().is_some() {
+            *self = Self::default();
+            return false;
+        }
         let id = session.app.document_id();
         if self.current != Some(id) {
             // Each activation owns its own callback signals, even in the same directory.

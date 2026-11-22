@@ -4,7 +4,7 @@
 
 ## 概要
 
-文書の読み込み、画像やMermaidの表示、Lua、端末で起きた問題を調べるための機能です。[状態欄](status-help.md)には短い通知を表示し、原因の調査に必要な情報はログファイルに保存します。
+文書の読み込み、PDF・画像・Mermaidの表示、Lua、端末で起きた問題を調べるための機能です。[状態欄](status-help.md)には短い通知を表示し、原因の調査に必要な情報はログファイルに保存します。
 
 ## 保存先と保持
 
@@ -51,6 +51,7 @@ UTF-8のJSON Lines（1行に1件のJSON）で保存します。全レコード�
 | イベント | 記録する条件と内容（共通項目以外） |
 |---|---|
 | `document.open_failed` | 起動時やLuaから文書を開けなかったとき、リンク先を解決できなかったとき、または自動再読み込みの失敗が続いたとき。`document`、`trigger`（`startup` / `open_file` / `link` / `reload`）、`stage` と `reason`（例：`read` / `not_found`、`decode` / `invalid_utf8`）。 |
+| `pdf.page_failed` | 表示中のPDFでページ送りや画面幅への合わせ直しが失敗したとき。`document`、`page`（1始まり）、`trigger`（`turn` / `resize`）、`stage`、`reason`、取得できた場合は `os_code`。同じ要求では1件だけ記録し、無効になった要求の結果は記録しません。PDFを初めて開く際の失敗は `document.open_failed` に記録します。 |
 | `document.watch_failed` | 表示中の文書を監視できなかったとき。`document` と `stage`（`register` / `receive`）。同じ文書の監視中に繰り返しません。 |
 | `image.load_failed` | ローカル画像を読み込めなかったとき。`document`、`image_index`（元のMarkdown上の出現番号。生成した図は数えない）、`stage`、`reason`（例：ファイルなし、非対応形式、破損、サイズ上限）。再描画では繰り返しません。 |
 | `mermaid.launch_failed` | `mmdc` を検出したが起動できなかったとき。`document`、`reason`（例：`permission_denied`）、取得できた場合は `os_code`、`fallback: "code"`。文書を開く操作につき1件にまとめます。 |
@@ -60,7 +61,7 @@ UTF-8のJSON Lines（1行に1件のJSON）で保存します。全レコード�
 | `lua.failed` | Lua設定の読み込みやコールバックが失敗したとき。特定できた `source` と `line`、`stage`（設定・キーマップ・フロート）、`reason`（例：`syntax_error`）、`action`（例：`use_defaults`）。 |
 | `terminal.failed` | 端末の初期化・入力・描画・復元が失敗したとき。`operation`（例：`draw`）、選択済みなら `image_mode`、`reason`、取得できた場合は `os_code`、継続・終了を示す `action`。 |
 
-`mmdc` や `init.lua` が見つからないこと、端末がKitty非対応であることは警告・エラーとして記録しません。`TVI_LOG=debug` の場合は以下も記録します。
+`mmdc` や `init.lua` が見つからないこと、端末がKitty非対応であること自体は警告・エラーとして記録しません。ただし、それがPDFを開けない理由であれば `document.open_failed` を記録します。`TVI_LOG=debug` の場合は以下も記録します。
 
 | イベント | 記録内容 |
 |---|---|

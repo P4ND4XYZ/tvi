@@ -5,7 +5,9 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use mlua::{Error, Function, Lua, RegistryKey, Table, UserData, UserDataMethods, Value};
+use mlua::{
+    Error, Function, IntoLuaMulti, Lua, RegistryKey, Table, UserData, UserDataMethods, Value,
+};
 
 use crate::{
     colorscheme::Colorscheme,
@@ -29,6 +31,11 @@ pub struct LuaLink {
     pub target: String,
 }
 
+pub enum FileOpen {
+    Opened,
+    Pending,
+}
+
 pub trait Host {
     fn current_view(&self) -> Result<u64, String>;
     fn notify(&self, message: &str);
@@ -36,7 +43,10 @@ pub trait Host {
     fn project_root(&self, view: u64, markers: &[String]) -> Result<PathBuf, String>;
     fn links(&self, view: u64) -> Result<Vec<LuaLink>, String>;
     fn resolve_link(&self, view: u64, id: u64) -> Result<PathBuf, String>;
-    fn open_file(&self, view: u64, path: &Path) -> Result<(), String>;
+    fn open_file(&self, view: u64, path: &Path) -> Result<FileOpen, String>;
+    fn supports_pdf(&self) -> bool {
+        false
+    }
     fn scroll_to_line(&self, view: u64, line: i64) -> Result<(), String>;
     fn open_float(&self, view: u64, options: FloatOptions) -> Result<u64, String>;
     fn update_float(&self, view: u64, float: u64, options: FloatOptions) -> Result<(), String>;
@@ -244,6 +254,12 @@ impl Runtime {
                 live_state(&state)?.host.notify(&message);
                 Ok(())
             })?,
+        )?;
+        let state = Rc::downgrade(&self.state);
+        ui.set(
+            "supports_pdf",
+            self.lua
+                .create_function(move |_, ()| Ok(live_state(&state)?.host.supports_pdf()))?,
         )?;
         tvi.set("ui", ui)?;
         process::install(&self.lua, &tvi)?;
@@ -470,16 +486,17 @@ impl UserData for ViewHandle {
                 Err(error) => (None, Some(error)),
             })
         });
-        methods.add_method("open_file", |_, view, path: mlua::String| {
+        methods.add_method("open_file", |lua, view, path: mlua::String| {
             let state = live_state(&view.state)?;
             let result = match path.to_str() {
                 Ok(path) => state.host.open_file(view.id, Path::new(&*path)),
                 Err(_) => Err("file path is not valid UTF-8".into()),
             };
-            Ok(match result {
-                Ok(()) => (true, None),
-                Err(error) => (false, Some(error)),
-            })
+            match result {
+                Ok(FileOpen::Opened) => (true, Value::Nil).into_lua_multi(lua),
+                Ok(FileOpen::Pending) => (true, Value::Nil, true).into_lua_multi(lua),
+                Err(error) => (false, error).into_lua_multi(lua),
+            }
         });
         methods.add_method("scroll_to_line", |_, view, line: Value| {
             let state = live_state(&view.state)?;

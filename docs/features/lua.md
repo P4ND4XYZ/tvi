@@ -22,13 +22,14 @@ Luaでtviを設定し、キーの割り当てや本文ビューの操作を追�
 | `tvi.keymap.set(mode, keys, callback, opts)` | モード別にキーを登録する。`opts.desc` は操作の説明 |
 | `tvi.colorscheme.set(styles)` | [カラースキーム](colorscheme.md)全体を置き換える |
 | `tvi.ui.current_view()` | フロートではなく現在の本文ビューを取得する |
+| `tvi.ui.supports_pdf()` | このセッションで[PDF表示](pdf.md)に対応していれば `true` |
 | `tvi.ui.notify(message)` | 状態欄の通知だけを更新する |
 | `view:path()` | 現在の文書のUTF-8絶対パス、取得できない場合は `nil, err`。相対パスで起動した場合も絶対パスを返し、実体のパスへの変換や大文字・小文字の統一はしない |
 | `view:project_root(opts?)` | 文書のディレクトリから上へ、`opts.root_markers` のいずれかを含む最も近いディレクトリを探す。未指定のマーカーは `{ ".git" }`。該当なしなら文書のディレクトリ。成功時は絶対パス、失敗時は `nil, err` |
 | `tvi.process.run(program, opts)` | 指定のプログラムをシェルを介さず同期実行する。`opts.args` は文字列の配列、`opts.cwd` は作業ディレクトリ（いずれも省略可） |
 | `view:links()` | 表示文書の対象リンクを出現順に返す。各候補は `id`、`label`、`target` を持つ |
 | `view:resolve_link(id)` | リンク先の絶対パスを `path, nil`、失敗時は `nil, err` として返す。リンク先の存在は確認しない |
-| `view:open_file(path)` | 絶対パスを指定し、UTF-8の通常ファイルをそのビューでMarkdownとして開く。成功時は `true, nil`、失敗時は `false, err` を返す |
+| `view:open_file(path)` | 絶対パスを指定してそのビューで開く。Markdownは成功時に `true, nil`、その場での失敗時は `false, err`、PDFの読み込み開始時は `true, nil, true` を返す |
 | `view:scroll_to_line(line)` | 元ファイルの1始まりの行へ本文をスクロールする。戻り値なし |
 | `view:open_float(opts)` | ビューに紐づくフロートを開き、ハンドルを返す |
 | `tvi.net.listen_local(port, on_line)` | `127.0.0.1` の指定ポートで受信する。成功時はハンドル、失敗時は `nil, err` |
@@ -43,9 +44,13 @@ COMMANDとSEARCHでは文字入力・編集・確定・キャンセル用のキ�
 
 取得したビューハンドルはフォーカスが移っても対象が変わりません。`resolve_link` は、ビューが閉じている場合や、リンクIDが現在の文書に属さない場合は失敗します。解決した絶対パスは、別の文書に移動した後も `open_file` に渡せます。`open_file` は失敗しても文書や閲覧履歴を変更しません。
 
+### PDFの読み込み結果
+
+PDFで第3戻り値が `true` の場合は、開く要求を受け付けた段階です。実際に表示できたときに文書を切り替え、要求元のフロートがあれば本体が閉じます。失敗すると元の文書・閲覧履歴・フロートを保ち、状態欄に理由を表示します。フロートを閉じるか、別の文書に移ると、待機中の要求は表示に反映されません。
+
 ### 元ファイルの行への移動
 
-`view:scroll_to_line(line)` に渡すのは、折り返し後の表示行ではなく、ビューが読み込み済みの元ファイルの行番号です。`view:open_file(path)` が成功した直後に呼び出すと、新しく開いたファイルが対象になります。
+`view:scroll_to_line(line)` に渡すのは、折り返し後の表示行ではなく、ビューが読み込み済みの元ファイルの行番号です。Markdownを `view:open_file(path)` で開いた直後に呼び出すと、新しく開いたファイルが対象になります。PDFの元ファイル行への移動は行いません。
 
 - Luaの整数型だけを受け付けます。数値文字列、`120.0` などの浮動小数点数、`nil` や引数の省略などは `scroll_to_line: line must be an integer` のLuaエラーになります。閉じたビューでは `view is closed` のLuaエラーになります。
 - 0以下は先頭行、行数を超えた指定は末尾行として扱います。LF・CRLFのどちらでも末尾の改行自体は次の行に数えず、空ファイルでは何もしません。

@@ -11,6 +11,7 @@
 ---@class Tvi.UiApi
 ---@field current_view fun(): Tvi.View 現在の本文ビューを取得します。
 ---@field notify fun(message: string) 状態欄の通知を更新します。
+---@field supports_pdf fun(): boolean このセッションでPDFを表示できるかを返します。
 
 ---@class Tvi.Listener: userdata
 ---@field close fun(self: Tvi.Listener) ローカルの受信を終了します。複数回呼べます。
@@ -31,7 +32,7 @@
 ---@field project_root fun(self: Tvi.View, opts?: Tvi.ProjectRootOptions): string?, string? プロジェクトルートの絶対パス、または nil, err を返します。
 ---@field links fun(self: Tvi.View): Tvi.Link[] 対象のリンクを出現順に返します。
 ---@field resolve_link fun(self: Tvi.View, id: integer): string?, string? リンク先の絶対パス、または nil, err を返します。存在は確認しません。
----@field open_file fun(self: Tvi.View, path: string): boolean, string? 絶対パスのファイルを開き、true, nil または false, err を返します。
+---@field open_file fun(self: Tvi.View, path: string): boolean, string?, boolean? 絶対パスを開きます。PDFの読み込みを開始した場合は true, nil, true を返します。
 ---@field scroll_to_line fun(self: Tvi.View, line: integer) 現在の元ファイルの1始まりの行へ本文をスクロールします。
 ---@field open_float fun(self: Tvi.View, opts: Tvi.OpenFloatOptions): Tvi.Float フロートを開きます。すでに開いている場合は Lua エラーになります。
 

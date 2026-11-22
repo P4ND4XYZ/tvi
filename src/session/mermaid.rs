@@ -25,7 +25,9 @@ pub(super) fn prepare(
     mode: ImageMode,
     renderer: Option<&Mermaid>,
 ) -> PreparedDisplay {
-    let (path, markdown, resources) = app.display_input();
+    let Some((path, markdown, resources)) = app.display_input() else {
+        unreachable!("only Markdown documents use Markdown preparation");
+    };
     let mut budget = Budget::default();
     // Local images keep their original indices and have priority in the shared budget.
     let mut images = if mode == ImageMode::Text {

@@ -281,12 +281,16 @@ impl Input {
     }
 
     pub fn poll_key(&mut self) -> io::Result<Option<KeyEvent>> {
+        self.poll_key_for(Duration::from_millis(100))
+    }
+
+    pub fn poll_key_for(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
         let mode = Some(self.image_mode());
         #[cfg(windows)]
         if let Some(console) = &mut self.console {
-            return check(console.poll_key(), "input", mode, "exit");
+            return check(console.poll_key(timeout), "input", mode, "exit");
         }
-        check(poll_key(Duration::from_millis(100)), "input", mode, "exit")
+        check(poll_key(timeout), "input", mode, "exit")
     }
 }
 
@@ -467,8 +471,8 @@ mod windows {
             }
         }
 
-        pub(super) fn poll_key(&mut self) -> io::Result<Option<KeyEvent>> {
-            let end = Instant::now() + Duration::from_millis(100);
+        pub(super) fn poll_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
+            let end = Instant::now() + timeout;
             loop {
                 if let Some(key) = self.keys.pop_front() {
                     return Ok(Some(key));

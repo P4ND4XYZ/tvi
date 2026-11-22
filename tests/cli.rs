@@ -107,6 +107,24 @@ fn valid_utf8_path_reaches_terminal_preflight() -> io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn pdf_cli_does_not_use_markdown_utf8_decoding() -> io::Result<()> {
+    let dir = Scratch::new()?;
+    fs::write(dir.0.join("資料.PDF"), b"%PDF-1.4\n\xff")?;
+    let output = run(&dir, &["資料.PDF"])?;
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected = if cfg!(windows) {
+        "interactive terminal required"
+    } else {
+        "PDF viewing is only supported on Windows"
+    };
+    assert!(stderr.contains(expected), "{stderr}");
+    assert!(!stderr.contains("not valid UTF-8"), "{stderr}");
+    Ok(())
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[test]
 fn startup_logs_safe_document_and_terminal_fields() -> io::Result<()> {

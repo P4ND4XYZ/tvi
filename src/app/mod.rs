@@ -7,9 +7,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::markdown::MarkdownResources;
+use crate::{markdown::MarkdownResources, pdf::Page};
 
 use command::Command;
+use document::Content;
 pub use document::{Document, DocumentLink};
 pub use search::Direction;
 use search::Search;
@@ -204,7 +205,48 @@ impl App {
     }
 
     pub(crate) fn markdown(&self) -> &str {
-        &self.document.markdown
+        match &self.document.content {
+            Content::Markdown(markdown) => &markdown.text,
+            Content::Pdf(_) => "",
+        }
+    }
+
+    pub(crate) fn pdf(&self) -> Option<&Page> {
+        match &self.document.content {
+            Content::Pdf(page) => Some(page),
+            Content::Markdown(_) => None,
+        }
+    }
+
+    pub(crate) fn turn_pdf_page(&mut self, page: Page, previous: bool) {
+        self.document.content = Content::Pdf(page);
+        self.viewport = Viewport {
+            anchor: if previous {
+                ViewAnchor::text(usize::MAX)
+            } else {
+                ViewAnchor::default()
+            },
+            ..Viewport::default()
+        };
+    }
+
+    /// A repeated scroll at the actual edge, not a scroll that just reaches the edge.
+    pub(crate) fn pdf_turn(&self, motion: Motion, rows: &impl ViewRows) -> Option<(u32, bool)> {
+        let page = self.pdf()?;
+        if self.mode != Mode::Normal || self.help || self.viewport.height == 0 || rows.len() == 0 {
+            return None;
+        }
+        match motion {
+            Motion::LineDown | Motion::HalfDown | Motion::PageDown
+                if self.viewport.top == self.viewport.last_top(rows) =>
+            {
+                (page.index + 1 < page.source.count).then_some((page.index + 1, false))
+            }
+            Motion::LineUp | Motion::HalfUp | Motion::PageUp if self.viewport.top == 0 => {
+                page.index.checked_sub(1).map(|index| (index, true))
+            }
+            _ => None,
+        }
     }
 
     pub fn document_path(&self) -> &Path {
@@ -213,10 +255,13 @@ impl App {
 
     #[cfg(test)]
     pub fn markdown_resources(&self) -> &MarkdownResources {
-        &self.document.resources
+        match &self.document.content {
+            Content::Markdown(markdown) => &markdown.resources,
+            Content::Pdf(_) => panic!("expected Markdown resources"),
+        }
     }
 
-    pub(crate) fn display_input(&mut self) -> (&Path, &str, &mut MarkdownResources) {
+    pub(crate) fn display_input(&mut self) -> Option<(&Path, &str, &mut MarkdownResources)> {
         self.document.display_input()
     }
 
@@ -251,7 +296,7 @@ impl App {
     }
 
     pub fn links(&self) -> &[DocumentLink] {
-        &self.document.links
+        self.document.links()
     }
 
     pub fn resolve_link(&self, id: u64) -> Result<PathBuf, String> {
@@ -270,10 +315,12 @@ impl App {
 
     pub fn open_document(&mut self, document: Document) {
         // A page left before its first draw (e.g. by Lua) must not convert on return.
-        self.document
-            .resources
-            .successful_diagrams
-            .get_or_insert_default();
+        if let Content::Markdown(markdown) = &mut self.document.content {
+            markdown
+                .resources
+                .successful_diagrams
+                .get_or_insert_default();
+        }
         self.history.push(HistoryEntry {
             document: std::mem::replace(&mut self.document, document),
             search: std::mem::take(&mut self.search),
@@ -360,9 +407,28 @@ impl App {
         self.viewport.reflow(rows, height);
     }
 
+    pub(crate) fn reflow_current_height(&mut self, rows: &impl ViewRows) {
+        self.viewport.reflow(rows, self.viewport.height);
+    }
+
     pub(crate) fn center_row(&mut self, rows: &impl ViewRows, row: usize) {
         let top = row.saturating_sub(self.viewport.height / 2);
         self.viewport.show(top, rows);
+    }
+
+    fn move_viewport(&mut self, motion: Motion, rows: &impl ViewRows) {
+        let top = self.viewport.top;
+        let anchor = self.viewport.anchor;
+        self.viewport.navigate(motion, rows);
+        if self.pdf().is_some() && rows.len() > 0 && self.viewport.height > 0 {
+            let last = self.viewport.last_top(rows);
+            if motion == Motion::End || (self.viewport.top == last && top < last) {
+                self.viewport.anchor = ViewAnchor::text(usize::MAX);
+            } else if motion != Motion::Start && self.viewport.top == top {
+                // An inert scroll at a clamped edge must not discard the reflow anchor.
+                self.viewport.anchor = anchor;
+            }
+        }
     }
 
     pub fn apply(&mut self, action: Action, rows: &impl ViewRows, text: &str) {
@@ -373,8 +439,13 @@ impl App {
             return;
         }
         match (self.mode, action) {
-            (Mode::Normal, Action::Move(motion)) => self.viewport.navigate(motion, rows),
+            (Mode::Normal, Action::Move(motion)) => self.move_viewport(motion, rows),
             (Mode::Normal, Action::StartCommand) => self.start_input(Mode::Command),
+            (Mode::Normal, Action::StartSearch(_) | Action::RepeatSearch { .. })
+                if self.pdf().is_some() =>
+            {
+                self.set_notice("Search is not supported for PDFs".into());
+            }
             (Mode::Normal, Action::StartSearch(direction)) => {
                 self.start_input(Mode::Search(direction));
             }

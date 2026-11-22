@@ -11,17 +11,18 @@ use std::{
 use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::{
-    app::{App, Document, Mode, ViewRows},
+    app::{Action, App, Document, Mode, ViewRows},
     files,
     logging::{self, Level},
-    lua::{Host, LuaLink, Runtime},
+    lua::{FileOpen, Host, LuaLink, Runtime},
     markdown::{MarkdownRenderer, tui_markdown::TuiMarkdown},
+    pdf::{self as pdf_format, Failure as PdfFailure},
     terminal::{self, ImageMode, Screen},
     ui::{
         self,
         float::{FloatOptions, Floats},
         input::{Input, InputAction, is_escape, plugin_key},
-        layout::Layout,
+        layout::{Layout, PdfGeometry},
     },
 };
 
@@ -29,6 +30,7 @@ use crate::{
 use crate::images;
 
 mod mermaid;
+mod pdf;
 mod watch;
 
 const BODY_VIEW: u64 = 1;
@@ -41,6 +43,8 @@ struct Session {
     prepared: Option<(u64, Rc<mermaid::PreparedDisplay>)>,
     reload_positions: Option<u64>,
     source_scroll: Option<(u64, usize)>,
+    pdf: pdf::Jobs,
+    pdf_geometry: Result<PdfGeometry, PdfFailure>,
 }
 
 #[derive(Default)]
@@ -56,20 +60,40 @@ impl Session {
         Self::with_images(document, ImageMode::Text, None)
     }
 
+    #[cfg(test)]
     fn with_images(
         document: Document,
         image_mode: ImageMode,
         renderer: Option<crate::mermaid::Mermaid>,
     ) -> Self {
+        Self::with_app(App::from_document(document), image_mode, renderer)
+    }
+
+    fn with_app(
+        app: App,
+        image_mode: ImageMode,
+        renderer: Option<crate::mermaid::Mermaid>,
+    ) -> Self {
         Self {
-            app: App::from_document(document),
+            app,
             floats: Floats::default(),
             image_mode,
             renderer,
             prepared: None,
             reload_positions: None,
             source_scroll: None,
+            pdf: pdf::Jobs::default(),
+            pdf_geometry: pdf::geometry(80, image_mode),
         }
+    }
+
+    fn apply(&mut self, action: Action, rows: &impl ViewRows, text: &str) {
+        if let Action::Move(motion) = action
+            && self.pdf.move_pdf(&mut self.app, motion, self.pdf_geometry)
+        {
+            return;
+        }
+        self.app.apply(action, rows, text);
     }
 
     fn display(&mut self) -> Rc<mermaid::PreparedDisplay> {
@@ -113,12 +137,45 @@ impl Session {
         self.floats.draw(frame, body, &scheme);
     }
 
+    fn sync_pdf_layout(
+        &mut self,
+        width: u16,
+        mode: ImageMode,
+        active: &mut Option<pdf::PlacedPage>,
+        retired: &mut Vec<u32>,
+    ) {
+        self.pdf_geometry = pdf::geometry(width, mode);
+        let latest = self.pdf.placed(&self.app);
+        if active
+            .as_ref()
+            .zip(latest.as_ref())
+            .is_some_and(|(old, new)| Rc::ptr_eq(old, new))
+        {
+            return;
+        }
+        if let Some(old) = std::mem::replace(active, latest) {
+            retired.extend(old.transmitted_ids());
+        }
+    }
+
+    fn show_display_notice(&mut self, markdown: Option<&mermaid::PreparedDisplay>) {
+        if self.app.mode() == Mode::Normal && self.app.notice().is_none() {
+            if let Some(markdown) = markdown {
+                mermaid::show_notice(&mut self.app, markdown);
+            }
+            if self.app.notice().is_none() && logging::take_failure_notice() {
+                self.app.set_notice("ログを保存できません".into());
+            }
+        }
+    }
+
     fn body_uninterrupted(&self) -> bool {
         self.app.mode() == Mode::Normal && !self.app.help_open() && self.floats.active().is_none()
     }
 
     fn restore_after_init_error(&mut self, error: &str) {
         self.source_scroll = None;
+        self.pdf = pdf::Jobs::default();
         self.app.reset_to_initial_document();
         self.floats = Floats::default();
         self.show_lua_error(error);
@@ -302,11 +359,27 @@ impl Host for RefCell<Session> {
         })
     }
 
-    fn open_file(&self, view: u64, path: &Path) -> Result<(), String> {
+    fn supports_pdf(&self) -> bool {
+        self.borrow().pdf_geometry.is_ok()
+    }
+
+    fn open_file(&self, view: u64, path: &Path) -> Result<FileOpen, String> {
         validate_view(view)?;
         if !path.is_absolute() {
             log_document_failure(path, "open_file", "path", "relative_path", None);
             return Err("file path must be an absolute path".into());
+        }
+        if pdf_format::is_pdf(path) {
+            let mut session = self.borrow_mut();
+            if let Err(failure) = session.pdf_geometry {
+                pdf::log_open_failure(path, "open_file", failure);
+                return Err(failure.message.into());
+            }
+            let Session {
+                pdf, app, floats, ..
+            } = &mut *session;
+            pdf.open(app, path, floats.active());
+            return Ok(FileOpen::Pending);
         }
         require_regular_file(path).map_err(|error| {
             log_document_failure(
@@ -329,7 +402,7 @@ impl Host for RefCell<Session> {
         session.prepared = None;
         session.source_scroll = None;
         session.app.open_document(document);
-        Ok(())
+        Ok(FileOpen::Opened)
     }
 
     fn scroll_to_line(&self, view: u64, line: i64) -> Result<(), String> {
@@ -364,18 +437,53 @@ fn validate_view(view: u64) -> Result<(), String> {
     }
 }
 
+pub fn start_pdf(path: PathBuf) -> io::Result<()> {
+    if !cfg!(windows) {
+        let failure = PdfFailure::platform();
+        pdf::log_open_failure(&path, "startup", failure);
+        return Err(failure.into());
+    }
+    terminal::with_screen(|screen, input| {
+        if let Some((app, jobs)) = pdf::startup(screen, input, path)? {
+            run_app(screen, input, app, jobs)
+        } else {
+            Ok(())
+        }
+    })
+}
+
 pub fn run(
     screen: &mut Screen,
     terminal_input: &mut terminal::Input,
     document: Document,
 ) -> io::Result<()> {
+    run_app(
+        screen,
+        terminal_input,
+        App::from_document(document),
+        pdf::Jobs::default(),
+    )
+}
+
+fn run_app(
+    screen: &mut Screen,
+    terminal_input: &mut terminal::Input,
+    app: App,
+    jobs: pdf::Jobs,
+) -> io::Result<()> {
     let mode = terminal_input.image_mode();
-    let session = Rc::new(RefCell::new(Session::with_images(
-        document,
+    let size = terminal::check(screen.size(), "size", Some(mode), "exit")?;
+    let mut initial = Session::with_app(
+        app,
         mode,
         (mode != ImageMode::Text).then(crate::mermaid::Mermaid::from_env),
-    )));
-    drop(session.borrow_mut().display());
+    );
+    initial.pdf = jobs;
+    initial.pdf_geometry = pdf::geometry(size.width, mode);
+    if initial.app.pdf().is_none() {
+        drop(initial.display());
+    }
+    let session = Rc::new(RefCell::new(initial));
     let (runtime, error) = Runtime::load(session.clone());
     if let Some(error) = error {
         session.borrow_mut().restore_after_init_error(&error);
@@ -410,11 +518,20 @@ fn run_document(
     let mut width = terminal::check(screen.size(), "size", Some(image_mode), "exit")?.width;
     let (document_id, prepared) = {
         let mut session = session.borrow_mut();
-        (session.app.document_id(), session.display())
+        (
+            session.app.document_id(),
+            session.app.pdf().is_none().then(|| session.display()),
+        )
     };
-    let document = &prepared.document;
-    let images = &prepared.images;
-    let mut layout = Layout::with_images(document, width, images, image_mode);
+    let build_markdown = |width, mode| {
+        prepared
+            .as_ref()
+            .map(|md| Layout::with_images(&md.document, width, &md.images, mode))
+    };
+    let mut markdown_layout = build_markdown(width, image_mode);
+    let mut pdf_layout: Option<pdf::PlacedPage> = None;
+    let blank = Layout::empty_pdf();
+    let search_text = prepared.as_ref().map_or("", |md| md.document.search_text());
     let mut previous_size = None;
     let result = (|| loop {
         let size = terminal::check(screen.size(), "size", Some(image_mode), "exit")?;
@@ -426,68 +543,156 @@ fn run_document(
         }
         let mode = terminal_input.image_mode();
         let mut drawn_size = (0, 0);
-        let mut retired = Vec::new();
-        let draw_result = screen.draw(|frame| {
+        let mut more_tiles = false;
+        draw_frame(screen, mode, |frame, retired| {
             let area = frame.area();
             drawn_size = (area.width, area.height);
             if width != area.width || image_mode != mode {
                 width = area.width;
                 image_mode = mode;
-                retired.extend(layout.transmitted_ids());
-                layout = Layout::with_images(document, width, images, image_mode);
+                if let Some(layout) = &markdown_layout {
+                    retired.extend(layout.transmitted_ids());
+                }
+                markdown_layout = build_markdown(width, image_mode);
             }
             let mut session = session.borrow_mut();
-            if session.app.mode() == crate::app::Mode::Normal && session.app.notice().is_none() {
-                mermaid::show_notice(&mut session.app, &prepared);
-                if session.app.notice().is_none() && logging::take_failure_notice() {
-                    session.app.set_notice("ログを保存できません".into());
-                }
-            }
-            session.draw(frame, &layout, runtime);
-        });
-        let draw_result = terminal::check(draw_result, "draw", Some(mode), "exit");
-        let cleanup = terminal::check(
-            terminal::delete_images(retired),
-            "delete_images",
-            Some(mode),
-            "exit",
-        );
-        draw_result?;
-        cleanup?;
+            session.sync_pdf_layout(area.width, mode, &mut pdf_layout, retired);
+            let layout = markdown_layout
+                .as_ref()
+                .or_else(|| {
+                    session.pdf_geometry.ok()?;
+                    pdf_layout.as_deref()
+                })
+                .unwrap_or(&blank);
+            session.show_display_notice(prepared.as_deref());
+            session.draw(frame, layout, runtime);
+            more_tiles = !session.app.help_open()
+                && session.floats.active().is_none()
+                && layout.pdf_transfer_pending(
+                    ui::body_area(area, session.app.mode()),
+                    session.app.top_row(),
+                );
+        })?;
+        let layout = markdown_layout
+            .as_ref()
+            .or(pdf_layout
+                .as_deref()
+                .filter(|_| session.borrow().pdf_geometry.is_ok()))
+            .unwrap_or(&blank);
         loop {
-            let key = keys
-                .pop_replayed()
-                .map_or_else(|| terminal_input.poll_key(), |key| Ok(Some(key)))?;
-            let before = session.borrow().body_uninterrupted();
-            let redraw = keys.dispatch(key, session, runtime, &layout, document.search_text());
-            let net_redraw = poll_net(session, runtime, Instant::now(), before);
-            {
-                let mut session = session.borrow_mut();
-                if session.app.should_quit() || session.app.document_id() != document_id {
-                    return Ok(());
+            let key = keys.pop_replayed().map_or_else(
+                || {
+                    if more_tiles {
+                        terminal_input.poll_key_for(Duration::from_millis(8))
+                    } else {
+                        terminal_input.poll_key()
+                    }
+                },
+                |key| Ok(Some(key)),
+            )?;
+            if prepared.is_none() && frame_stale(screen, terminal_input, drawn_size, image_mode)? {
+                if let Some(key) = key {
+                    keys.replay.push_front(key);
                 }
-                let now = Instant::now();
-                let reload_redraw = reload.poll(&mut session, now, keys.busy(now));
-                if session.app.document_id() != document_id {
-                    return Ok(());
-                }
-                if redraw || reload_redraw || net_redraw {
-                    break;
-                }
+                break;
             }
-            let size = terminal::check(screen.size(), "size", Some(mode), "exit")?;
-            if (size.width, size.height) != drawn_size || terminal_input.image_mode() != image_mode
+            let before = session.borrow().body_uninterrupted();
+            let redraw = keys.dispatch(key, session, runtime, layout, search_text);
+            let now = Instant::now();
+            let net_redraw = poll_net(session, runtime, now, before);
+            if session.borrow().app.should_quit()
+                || session.borrow().app.document_id() != document_id
             {
+                return Ok(());
+            }
+            // A resize can occur during dispatch (including a Lua callback). Check
+            // again before publishing any asynchronous completion.
+            let resized = frame_stale(screen, terminal_input, drawn_size, image_mode)?;
+            let pdf_redraw = !resized && poll_pdf(session, runtime);
+            let reload_redraw = reload.poll(&mut session.borrow_mut(), now, keys.busy(now));
+            if session.borrow().app.document_id() != document_id {
+                return Ok(());
+            }
+            if redraw || reload_redraw || net_redraw || pdf_redraw || resized || more_tiles {
                 break;
             }
         }
     })();
+    session.borrow_mut().pdf.depart(document_id);
     result.and(terminal::check(
-        terminal::delete_images(layout.transmitted_ids()),
+        terminal::delete_images(
+            markdown_layout
+                .as_ref()
+                .or(pdf_layout.as_deref())
+                .into_iter()
+                .flat_map(Layout::transmitted_ids),
+        ),
         "delete_images",
         Some(image_mode),
         "exit",
     ))
+}
+
+fn frame_stale(
+    screen: &Screen,
+    input: &terminal::Input,
+    drawn_size: (u16, u16),
+    drawn_mode: ImageMode,
+) -> io::Result<bool> {
+    let size = terminal::check(screen.size(), "size", Some(input.image_mode()), "exit")?;
+    Ok((size.width, size.height) != drawn_size || input.image_mode() != drawn_mode)
+}
+
+fn draw_frame(
+    screen: &mut Screen,
+    mode: ImageMode,
+    draw: impl FnOnce(&mut ratatui::Frame<'_>, &mut Vec<u32>),
+) -> io::Result<()> {
+    let mut retired = Vec::new();
+    let result = terminal::check(
+        screen.draw(|frame| draw(frame, &mut retired)),
+        "draw",
+        Some(mode),
+        "exit",
+    );
+    result.and(terminal::check(
+        terminal::delete_images(retired),
+        "delete_images",
+        Some(mode),
+        "exit",
+    ))
+}
+
+fn poll_pdf(session: &RefCell<Session>, runtime: &Runtime) -> bool {
+    let update = {
+        let mut state = session.borrow_mut();
+        let Session {
+            pdf,
+            app,
+            floats,
+            pdf_geometry,
+            prepared,
+            source_scroll,
+            ..
+        } = &mut *state;
+        let id = app.document_id();
+        let update = pdf.poll(app, floats, *pdf_geometry);
+        if app.document_id() != id {
+            // Markdown history must re-read images even if a PDF was the only intervening view.
+            *prepared = None;
+            *source_scroll = None;
+        }
+        update
+    };
+    if let Some((view, float)) = update.close_float {
+        let closed = session.close_float(view, float);
+        debug_assert!(
+            closed.is_ok(),
+            "only the active float can complete an open request"
+        );
+        runtime.forget_float(float);
+    }
+    update.redraw
 }
 
 fn poll_net(session: &RefCell<Session>, runtime: &Runtime, now: Instant, before: bool) -> bool {
@@ -555,7 +760,7 @@ impl InputQueue {
         }
         match dispatch.action {
             InputAction::Builtin(action) => {
-                session.borrow_mut().app.apply(action, rows, search_text);
+                session.borrow_mut().apply(action, rows, search_text);
             }
             InputAction::Lua(mapping) => {
                 if let Err(error) = runtime.run_mapping(mapping) {

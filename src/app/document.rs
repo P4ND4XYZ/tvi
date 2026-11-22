@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::markdown::MarkdownResources;
+use crate::{markdown::MarkdownResources, pdf::Page};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -14,10 +14,19 @@ fn next_id() -> u64 {
 pub struct Document {
     pub(super) id: u64,
     pub(super) name: String,
-    pub(super) markdown: String,
-    pub(super) links: Vec<DocumentLink>,
     pub(super) path: PathBuf,
-    pub(super) resources: MarkdownResources,
+    pub(super) content: Content,
+}
+
+pub(super) enum Content {
+    Markdown(Markdown),
+    Pdf(Page),
+}
+
+pub(super) struct Markdown {
+    pub text: String,
+    pub links: Vec<DocumentLink>,
+    pub resources: MarkdownResources,
 }
 
 pub struct DocumentLink {
@@ -36,32 +45,62 @@ impl Document {
         Self {
             id: next_id(),
             name,
-            markdown,
-            links: links
-                .into_iter()
-                .map(|(label, target)| DocumentLink {
-                    id: next_id(),
-                    label,
-                    target,
-                })
-                .collect(),
             path,
-            resources: MarkdownResources::default(),
+            content: Content::Markdown(Markdown {
+                text: markdown,
+                links: links
+                    .into_iter()
+                    .map(|(label, target)| DocumentLink {
+                        id: next_id(),
+                        label,
+                        target,
+                    })
+                    .collect(),
+                resources: MarkdownResources::default(),
+            }),
         }
     }
 
     pub fn with_resources(mut self, resources: MarkdownResources) -> Self {
-        self.resources = resources;
+        if let Content::Markdown(markdown) = &mut self.content {
+            markdown.resources = resources;
+        }
         self
     }
 
-    pub(super) fn display_input(&mut self) -> (&Path, &str, &mut MarkdownResources) {
-        (&self.path, &self.markdown, &mut self.resources)
+    pub(crate) fn pdf(path: PathBuf, page: Page) -> Self {
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .replace(char::is_control, "�");
+        Self {
+            id: next_id(),
+            name,
+            path,
+            content: Content::Pdf(page),
+        }
+    }
+
+    pub(super) fn links(&self) -> &[DocumentLink] {
+        match &self.content {
+            Content::Markdown(markdown) => &markdown.links,
+            Content::Pdf(_) => &[],
+        }
+    }
+
+    pub(super) fn display_input(&mut self) -> Option<(&Path, &str, &mut MarkdownResources)> {
+        match &mut self.content {
+            Content::Markdown(markdown) => {
+                Some((&self.path, &markdown.text, &mut markdown.resources))
+            }
+            Content::Pdf(_) => None,
+        }
     }
 
     pub(super) fn resolve_link(&self, id: u64) -> Result<PathBuf, String> {
         let link = self
-            .links
+            .links()
             .iter()
             .find(|link| link.id == id)
             .ok_or_else(|| "Link does not belong to the current document".to_owned())?;

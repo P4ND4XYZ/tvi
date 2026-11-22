@@ -22,7 +22,7 @@ local function setup(responses)
   end
   function view:open_file(path)
     opened[#opened + 1] = path
-    return true
+    return true, nil, model.pdf_pending
   end
   model.press = function(name, input)
     model.on_key(model.float, { name = name, text = input })
@@ -32,6 +32,7 @@ local function setup(responses)
   _G.tvi = {
     ui = {
       current_view = function() return view end,
+      supports_pdf = function() return model.pdf_supported == true end,
       notify = function(message) notices[#notices + 1] = message end,
     },
     process = {
@@ -78,6 +79,16 @@ return function()
   local sep = package.config:sub(1, 1)
   assert(model.opened[1] == model.root .. sep .. "notes" .. sep .. "資料 a.md")
   assert(model.display == nil)
+
+  assert(table.concat(model.calls[1].args, " "):find("--extension md", 1, true))
+  assert(not table.concat(model.calls[1].args, " "):find("--extension pdf", 1, true))
+  model = setup({ { result = { ok = true, stdout = "./manual.PDF\0" } } })
+  model.pdf_supported, model.pdf_pending = true, true
+  assert(files.open())
+  assert(table.concat(model.calls[1].args, " "):find("--extension pdf", 1, true))
+  model.press("Enter")
+  assert(model.opened[1] == model.root .. sep .. "manual.PDF")
+  assert(model.display.focus_line == 1 and #model.notices == 0)
 
   local missing = { err = { kind = "not_found", message = "missing" } }
   model = setup({ missing, { result = { ok = true, code = 0, stdout = "" } } })

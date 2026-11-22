@@ -6,6 +6,10 @@ local function list_files(root)
     cwd = root,
     args = { "--type", "f", "--extension", "md", "--color", "never", "--print0" },
   }
+  if tvi.ui.supports_pdf() then
+    table.insert(opts.args, "--extension")
+    table.insert(opts.args, "pdf")
+  end
   local program = "fd"
   local result, err = tvi.process.run(program, opts)
   -- run は結果がないときにエラーの詳細を返す。
@@ -132,9 +136,12 @@ function M.open()
           path = path:gsub("/", separator)
         end
         local join = root:sub(-1) == separator and "" or separator
-        local ok, reason = view:open_file(root .. join .. path)
+        local ok, reason, pending = view:open_file(root .. join .. path)
         if ok then
-          float:close()
+          -- PDF は表示できることが確定してから本体がこのフロートを閉じる。
+          if not pending then
+            float:close()
+          end
         else
           ---@cast reason -nil
           tvi.ui.notify(reason)
