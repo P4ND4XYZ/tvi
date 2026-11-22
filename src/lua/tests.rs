@@ -19,6 +19,10 @@ impl Host for TestHost {
 
     fn notify(&self, _message: &str) {}
 
+    fn document_path(&self, _view: u64) -> Result<PathBuf, String> {
+        Err("no document".into())
+    }
+
     fn project_root(&self, _view: u64, _markers: &[String]) -> Result<PathBuf, String> {
         Err("no document".into())
     }
@@ -58,6 +62,111 @@ impl Host for TestHost {
     fn close_float(&self, view: u64, float: u64) -> Result<(), String> {
         self.floats.borrow_mut().close(view, float)
     }
+}
+
+#[test]
+fn local_listener_reports_bind_errors_and_rebinds_after_close_or_failed_init()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::net::{Ipv4Addr, TcpListener};
+
+    let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let port = reserved.local_addr()?.port();
+    let host = Rc::new(TestHost::default());
+    let runtime = Runtime::new(host.clone());
+    runtime.install_api()?;
+    runtime.lua.globals().set("port", port)?;
+    runtime
+        .lua
+        .load(
+            r#"
+        local noop = function() end
+        for _, invalid in ipairs({0, -1, 65536, 1.5, 1.0, '80', false}) do
+            local handle, err = tvi.net.listen_local(invalid, noop)
+            assert(handle == nil and err:find('integer', 1, true))
+        end
+        local handle, err = tvi.net.listen_local(port, noop)
+        assert(handle == nil and err:find('cannot listen', 1, true))
+    "#,
+        )
+        .exec()?;
+    drop(reserved);
+    runtime
+        .lua
+        .load(
+            r#"
+        local noop = function() end
+        local first = assert(tvi.net.listen_local(port, noop))
+        assert(tvi.net.listen_local(port, noop) == nil)
+        first:close()
+        first:close()
+        local second = assert(tvi.net.listen_local(port, noop))
+        first:close()
+        assert(tvi.net.listen_local(port, noop) == nil)
+        second:close()
+    "#,
+        )
+        .exec()?;
+    let scratch = Scratch::new()?;
+    let init = scratch.0.join("init.lua");
+    fs::write(
+        &init,
+        format!("assert(tvi.net.listen_local({port}, function() end)); error('init failed')"),
+    )?;
+    let (_fallback, error) = Runtime::load_from(host, Some(init));
+    assert!(error.is_some_and(|error| error.contains("init failed")));
+    let socket = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    drop(socket);
+    runtime
+        .lua
+        .load("assert(tvi.net.listen_local(port, function() end))")
+        .exec()?;
+    drop(runtime);
+    let _socket = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
+    Ok(())
+}
+
+#[test]
+fn local_listener_stops_callbacks_in_the_same_poll_after_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{
+        io::Write,
+        net::{Ipv4Addr, Shutdown, TcpListener, TcpStream},
+        time::{Duration, Instant},
+    };
+    let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let address = reserved.local_addr()?;
+    drop(reserved);
+    let runtime = Runtime::new(Rc::new(TestHost::default()));
+    runtime.install_api()?;
+    runtime.lua.globals().set("port", address.port())?;
+    runtime
+        .lua
+        .load(
+            r#"
+        calls = 0
+        local handle
+        handle = assert(tvi.net.listen_local(port, function(payload)
+            assert(payload == 'one' or payload == 'two')
+            calls = calls + 1
+            handle:close()
+            error('callback error is isolated')
+        end))
+    "#,
+        )
+        .exec()?;
+    for line in [b"one\n", b"two\n"] {
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1))?;
+        stream.write_all(line)?;
+        stream.shutdown(Shutdown::Write)?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !runtime.poll_net(Instant::now(), || true) {
+        assert!(Instant::now() < deadline, "no callback");
+        std::thread::yield_now();
+    }
+    assert!(!runtime.poll_net(Instant::now(), || true));
+    assert_eq!(runtime.lua.globals().get::<u32>("calls")?, 1);
+    Ok(())
 }
 
 #[test]

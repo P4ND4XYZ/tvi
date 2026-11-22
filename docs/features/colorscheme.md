@@ -25,16 +25,6 @@ end, { desc = "既定の配色に戻す" })
 
 開いている文書やフロートと、その後に開く文書やフロートに、次の描画から適用します。閲覧位置・検索の選択・入力中の文字は変わりません。変更は保存されません。次の起動でも適用するには `init.lua` に記述します。
 
-## Dracula風プリセット
-
-暗い背景に紫やピンクの見出しを使い、選択中の検索結果を黄色で強調します。
-
-[plugins/colorscheme/dracula.lua](../../plugins/colorscheme/dracula.lua) を、`init.lua` と同じディレクトリの `plugins/colorscheme/dracula.lua` にコピーし、`init.lua` に次を追加します。
-
-```lua
-tvi.colorscheme.set(require("plugins.colorscheme.dracula"))
-```
-
 ## グループ
 
 | グループ | 対象 |

@@ -18,6 +18,7 @@ use crate::{
 
 mod colorscheme;
 mod config;
+mod net;
 mod process;
 #[cfg(test)]
 mod tests;
@@ -31,6 +32,7 @@ pub struct LuaLink {
 pub trait Host {
     fn current_view(&self) -> Result<u64, String>;
     fn notify(&self, message: &str);
+    fn document_path(&self, view: u64) -> Result<PathBuf, String>;
     fn project_root(&self, view: u64, markers: &[String]) -> Result<PathBuf, String>;
     fn links(&self, view: u64) -> Result<Vec<LuaLink>, String>;
     fn resolve_link(&self, view: u64, id: u64) -> Result<PathBuf, String>;
@@ -53,6 +55,7 @@ struct State {
     colorscheme: RefCell<Colorscheme>,
     mappings: RefCell<Vec<RegistryKey>>,
     float: RefCell<Option<ActiveFloat>>,
+    listener: RefCell<Option<net::Active>>,
 }
 
 struct ActiveFloat {
@@ -74,6 +77,7 @@ impl Runtime {
                 colorscheme: RefCell::default(),
                 mappings: RefCell::default(),
                 float: RefCell::default(),
+                listener: RefCell::default(),
             }),
             lua: Lua::new(),
         }
@@ -243,6 +247,7 @@ impl Runtime {
         )?;
         tvi.set("ui", ui)?;
         process::install(&self.lua, &tvi)?;
+        net::install(&self.lua, &tvi, Rc::downgrade(&self.state))?;
         colorscheme::install(&self.lua, &tvi, Rc::downgrade(&self.state))?;
         self.lua.globals().set("tvi", tvi)
     }
@@ -403,6 +408,20 @@ struct ViewHandle {
 
 impl UserData for ViewHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("path", |_, view, ()| {
+            let result = live_state(&view.state)?
+                .host
+                .document_path(view.id)
+                .and_then(|path| {
+                    path.into_os_string()
+                        .into_string()
+                        .map_err(|_| "document path is not valid UTF-8".into())
+                });
+            Ok(match result {
+                Ok(path) => (Some(path), None),
+                Err(error) => (None, Some(error)),
+            })
+        });
         methods.add_method("project_root", |_, view, opts: Option<Table>| {
             let markers = opts
                 .map(|opts| opts.get::<Option<Vec<String>>>("root_markers"))

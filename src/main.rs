@@ -8,6 +8,7 @@ mod logging;
 mod lua;
 mod markdown;
 mod mermaid;
+mod net;
 mod process;
 mod session;
 mod terminal;

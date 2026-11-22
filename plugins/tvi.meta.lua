@@ -12,6 +12,12 @@
 ---@field current_view fun(): Tvi.View 現在の本文ビューを取得します。
 ---@field notify fun(message: string) 状態欄の通知を更新します。
 
+---@class Tvi.Listener: userdata
+---@field close fun(self: Tvi.Listener) ローカルの受信を終了します。複数回呼べます。
+
+---@class Tvi.NetApi
+---@field listen_local fun(port: integer, on_line: fun(line: string): boolean?): Tvi.Listener?, string? IPv4ループバックで1行ずつ受信します。失敗時は nil, err を返します。
+
 ---@class Tvi.ProjectRootOptions
 ---@field root_markers? string[] 探すマーカー名の配列。既定は { ".git" } です。
 
@@ -21,6 +27,7 @@
 ---@field target string リンク先の文字列。
 
 ---@class Tvi.View: userdata
+---@field path fun(self: Tvi.View): string?, string? 現在の文書のUTF-8絶対パス、または nil, err を返します。
 ---@field project_root fun(self: Tvi.View, opts?: Tvi.ProjectRootOptions): string?, string? プロジェクトルートの絶対パス、または nil, err を返します。
 ---@field links fun(self: Tvi.View): Tvi.Link[] 対象のリンクを出現順に返します。
 ---@field resolve_link fun(self: Tvi.View, id: integer): string?, string? リンク先の絶対パス、または nil, err を返します。存在は確認しません。
@@ -118,6 +125,7 @@
 ---@class Tvi.Api
 ---@field keymap Tvi.KeymapApi
 ---@field ui Tvi.UiApi
+---@field net Tvi.NetApi
 ---@field process Tvi.ProcessApi
 ---@field colorscheme Tvi.ColorschemeApi
 

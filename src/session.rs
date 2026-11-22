@@ -11,7 +11,7 @@ use std::{
 use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::{
-    app::{App, Document, ViewRows},
+    app::{App, Document, Mode, ViewRows},
     files,
     logging::{self, Level},
     lua::{Host, LuaLink, Runtime},
@@ -111,6 +111,10 @@ impl Session {
             &scheme,
         );
         self.floats.draw(frame, body, &scheme);
+    }
+
+    fn body_uninterrupted(&self) -> bool {
+        self.app.mode() == Mode::Normal && !self.app.help_open() && self.floats.active().is_none()
     }
 
     fn restore_after_init_error(&mut self, error: &str) {
@@ -227,6 +231,28 @@ impl Host for RefCell<Session> {
         self.borrow_mut()
             .app
             .set_notice(message.replace(char::is_control, "�"));
+    }
+
+    fn document_path(&self, view: u64) -> Result<PathBuf, String> {
+        validate_view(view)?;
+        let session = self.borrow();
+        let path = session.app.document_path();
+        if path.as_os_str().is_empty() {
+            return Err("document path is unavailable".into());
+        }
+        if path.is_absolute() {
+            return Ok(path.to_owned());
+        }
+        let absolute = std::env::current_dir()
+            .map_err(|error| format!("cannot determine working directory: {error}"))?
+            .join(path);
+        if absolute.is_absolute() {
+            Ok(absolute)
+        } else {
+            // Windows drive-relative paths may refer to a different working directory.
+            path::absolute(path)
+                .map_err(|error| format!("cannot make document path absolute: {error}"))
+        }
     }
 
     fn project_root(&self, view: u64, markers: &[String]) -> Result<PathBuf, String> {
@@ -432,7 +458,9 @@ fn run_document(
             let key = keys
                 .pop_replayed()
                 .map_or_else(|| terminal_input.poll_key(), |key| Ok(Some(key)))?;
+            let before = session.borrow().body_uninterrupted();
             let redraw = keys.dispatch(key, session, runtime, &layout, document.search_text());
+            let net_redraw = poll_net(session, runtime, Instant::now(), before);
             {
                 let mut session = session.borrow_mut();
                 if session.app.should_quit() || session.app.document_id() != document_id {
@@ -443,7 +471,7 @@ fn run_document(
                 if session.app.document_id() != document_id {
                     return Ok(());
                 }
-                if redraw || reload_redraw {
+                if redraw || reload_redraw || net_redraw {
                     break;
                 }
             }
@@ -460,6 +488,13 @@ fn run_document(
         Some(image_mode),
         "exit",
     ))
+}
+
+fn poll_net(session: &RefCell<Session>, runtime: &Runtime, now: Instant, before: bool) -> bool {
+    runtime.poll_net(now, || {
+        let session = session.borrow();
+        before && !session.app.should_quit() && session.body_uninterrupted()
+    })
 }
 
 impl InputQueue {
@@ -549,7 +584,7 @@ fn recover_lua_error(session: &RefCell<Session>, runtime: &Runtime, error: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Action, Mode};
+    use crate::app::Action;
     use crossterm::event::{KeyCode, KeyModifiers};
     use std::{
         env,
@@ -585,6 +620,131 @@ mod tests {
         fn drop(&mut self) {
             drop(fs::remove_dir_all(&self.0));
         }
+    }
+
+    #[test]
+    fn lua_view_path_preserves_relative_startup_spelling_and_tracks_document_switches()
+    -> Result<(), Box<dyn Error>> {
+        let scratch = Scratch::new()?;
+        let next = scratch.0.join("next.md");
+        fs::write(&next, "Next")?;
+        let relative = Path::new("./docs/index.md");
+        let absolute = env::current_dir()?.join(relative);
+        let init = scratch.init(
+            r#"
+            local view = tvi.ui.current_view()
+            tvi.keymap.set('normal', '<F2>', function() tvi.ui.notify(assert(view:path())) end)
+        "#,
+        )?;
+        let session = Rc::new(RefCell::new(Session::new(read_document(relative)?)));
+        let (runtime, error) = Runtime::load_from(session.clone(), Some(init));
+        assert_eq!(error, None);
+        let mut keys = InputQueue::default();
+        let mut show_path = || {
+            keys.dispatch(
+                Some(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+                &session,
+                &runtime,
+                &[],
+                "",
+            )
+        };
+        assert!(show_path());
+        assert_eq!(session.borrow().app.notice(), absolute.to_str());
+        session.open_file(BODY_VIEW, &next)?;
+        assert!(show_path());
+        assert_eq!(session.borrow().app.notice(), next.to_str());
+        session.borrow_mut().app.apply(Action::JumpBack, &[], "");
+        assert!(show_path());
+        assert_eq!(session.borrow().app.notice(), absolute.to_str());
+        Ok(())
+    }
+
+    #[test]
+    fn follow_scrolls_on_an_idle_poll_but_discards_modal_frames() -> Result<(), Box<dyn Error>> {
+        use crate::app::Direction;
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::{
+            io::Write,
+            net::{Ipv4Addr, Shutdown, TcpListener, TcpStream},
+        };
+
+        let scratch = Scratch::new()?;
+        let source = scratch.0.join("source.md");
+        let markup: String = (1..=30).map(|i| format!("item {i}\n\n")).collect();
+        fs::write(&source, &markup)?;
+        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let address = reserved.local_addr()?;
+        let init = scratch.init(&format!(
+            r#"
+            os.getenv = function(name)
+                if name == 'HERDR_WORKSPACE_ID' then return 'workspace' end
+                if name == 'TVI_FOLLOW_PORT' then return '{}' end
+            end
+            local follow = (function()
+                {}
+            end)()
+            assert(follow.start())
+        "#,
+            address.port(),
+            include_str!("../plugins/follow.lua")
+        ))?;
+        let session = Rc::new(RefCell::new(Session::new(read_document(&source)?)));
+        drop(reserved);
+        let (runtime, error) = Runtime::load_from(session.clone(), Some(init));
+        assert_eq!(error, None);
+        let send = |line: usize| -> io::Result<()> {
+            let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1))?;
+            writeln!(stream, "workspace\t{line}\t{}", source.display())?;
+            stream.shutdown(Shutdown::Write)
+        };
+        let id = session.borrow().app.document_id();
+        let prepared = session.borrow_mut().display();
+        let layout = Layout::at_width(&prepared.document, 30);
+        let draw = |terminal: &mut Terminal<TestBackend>| {
+            terminal
+                .draw(|frame| session.borrow_mut().draw(frame, &layout, &runtime))
+                .map(|_| ())
+        };
+        let mut terminal = Terminal::new(TestBackend::new(30, 10))?;
+        draw(&mut terminal)?;
+        for action in [
+            Action::StartCommand,
+            Action::StartSearch(Direction::Forward),
+            Action::Help,
+        ] {
+            session.borrow_mut().app.apply(action, &layout, "");
+            assert!(!session.borrow().body_uninterrupted());
+            send(29)?;
+            assert!(!poll_net(&session, &runtime, Instant::now(), false));
+            session.borrow_mut().app.apply(Action::Cancel, &layout, "");
+        }
+        let float = session.open_float(BODY_VIEW, FloatOptions::default())?;
+        assert!(!session.borrow().body_uninterrupted());
+        send(29)?;
+        // Escape dismisses the float before the tick, but must not deliver its backlog.
+        session.close_float(BODY_VIEW, float)?;
+        assert!(!poll_net(&session, &runtime, Instant::now(), false));
+        assert!(!poll_net(&session, &runtime, Instant::now(), true));
+        draw(&mut terminal)?;
+        assert_eq!(session.borrow().app.top_row(), 0);
+
+        send(20)?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !poll_net(&session, &runtime, Instant::now(), true) {
+            assert!(Instant::now() < deadline, "follow did not request a redraw");
+            std::thread::yield_now();
+        }
+        draw(&mut terminal)?;
+        assert!(session.borrow().app.top_row() > 0);
+        assert_eq!(session.borrow().app.document_id(), id);
+        assert!(session.borrow().app.search_query().is_empty());
+        session
+            .borrow_mut()
+            .app
+            .apply(Action::JumpBack, &layout, "");
+        assert_eq!(session.borrow().app.document_id(), id);
+        Ok(())
     }
 
     #[test]

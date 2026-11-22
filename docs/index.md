@@ -2,7 +2,7 @@
 
 ## 目的
 
-tviは、端末上でMarkdownファイルを読むための閲覧専用ビューアです。
+tviは、端末上でMarkdownファイルを読むための閲覧専用ビューアです。ここではtvi本体の機能と公開APIを扱います。
 
 ## 目次
 
@@ -17,9 +17,9 @@ tviは、端末上でMarkdownファイルを読むための閲覧専用ビュー
 | [コマンドと終了](features/commands.md) | コマンドによる終了、ヘルプ、検索ハイライトの解除、コマンドエラー |
 | [状態表示とヘルプ](features/status-help.md) | モードや閲覧位置の表示とキー一覧 |
 | [診断ログ](features/diagnostic-log.md) | 保存先、ローテーションと保持上限、記録するイベント、デバッグログの有効化 |
-| [リンク先への移動](features/links.md) | ローカルリンクの一覧、文書間の移動と復帰 |
-| [Lua設定とプラグイン](features/lua.md) | 起動時の設定、元ファイルの行への移動などの公開APIとエディターでの補完 |
-| [カラースキーム](features/colorscheme.md) | Luaからの配色変更、Dracula風プリセット、指定できる色と装飾 |
+| [文書間の移動と復帰](features/links.md) | 対象リンク、文書間の移動と閲覧履歴 |
+| [Lua設定と公開API](features/lua.md) | 起動時の設定、本文の操作やローカル受信などの公開API |
+| [カラースキーム](features/colorscheme.md) | Luaからの配色変更、指定できる色と装飾 |
 
 ### 設計方針
 
