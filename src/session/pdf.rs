@@ -9,7 +9,7 @@ use std::{
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::{
-    app::{App, Document, Mode, Motion, ViewRows},
+    app::{App, Direction, Document, Mode, Motion, PdfSearch, ViewRows},
     logging::{self, Level},
     pdf::{Failure, Page, Renderer, Source, Worker},
     terminal::{self, ImageMode, Screen},
@@ -20,6 +20,11 @@ use crate::{
 };
 
 use super::log_document_failure;
+
+mod marks;
+mod search;
+use marks::Marks;
+use search::{Origin, SEARCHING, SearchJobs};
 
 pub(super) type PlacedPage = Rc<Layout<'static>>;
 
@@ -40,9 +45,14 @@ pub(super) fn geometry(columns: u16, mode: ImageMode) -> Result<Geometry, Failur
     }
 }
 
-fn fit(page: &Page, geometry: Geometry) -> Result<Layout<'static>, Failure> {
+fn fit(page: &Page, geometry: Geometry, marks: Option<&Marks>) -> Result<Layout<'static>, Failure> {
     let image = page.decode()?;
-    Layout::pdf_page(&image, page.aspect_height(), geometry).ok_or_else(|| {
+    Layout::pdf_page(&image, page.aspect_height(), geometry, |pixels| {
+        if let Some(marks) = marks {
+            marks.paint(page, pixels);
+        }
+    })
+    .ok_or_else(|| {
         Failure::new(
             "pdf_layout",
             "display_size",
@@ -68,18 +78,32 @@ enum Work {
 }
 
 impl Work {
-    fn place(self, renderer: &mut Renderer, geometry: Geometry) -> ResultPage {
+    fn marks(&self, search: Option<&PdfSearch>) -> Option<Marks> {
+        let index = match self {
+            Self::Open(_) => return None,
+            Self::Turn(_, index) => *index,
+            Self::Fit(page) => page.index,
+        };
+        Marks::for_page(search, index)
+    }
+
+    fn place(
+        self,
+        renderer: &mut Renderer,
+        geometry: Geometry,
+        marks: Option<&Marks>,
+    ) -> ResultPage {
         let page = match self {
             Self::Open(path) => renderer.open(&path)?,
             Self::Turn(source, index) => renderer.render(source, index)?,
             Self::Fit(page) => page,
         };
-        let layout = fit(&page, geometry);
+        let layout = fit(&page, geometry, marks);
         Ok((page, layout))
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq)]
 enum Intent {
     Open {
         from: u64,
@@ -96,13 +120,17 @@ enum Intent {
     Fit {
         from: (u64, u32),
     },
+    Search {
+        from: (u64, u32),
+        result: PdfSearch,
+    },
 }
 
 impl Intent {
     fn document_id(&self) -> u64 {
         match self {
             Self::Open { from, .. } => *from,
-            Self::Turn { from, .. } | Self::Fit { from } => from.0,
+            Self::Turn { from, .. } | Self::Fit { from } | Self::Search { from, .. } => from.0,
         }
     }
 
@@ -116,12 +144,7 @@ impl Intent {
                     && app.mode() == *mode
                     && !app.help_open()
             }
-            Self::Turn { from, .. } => {
-                Some(*from) == page_key(app)
-                    && floats.active().is_none()
-                    && app.mode() == Mode::Normal
-                    && !app.help_open()
-            }
+            Self::Turn { from, .. } | Self::Search { from, .. } => can_navigate(*from, app, floats),
             Self::Fit { from } => Some(*from) == page_key(app),
         }
     }
@@ -136,6 +159,7 @@ struct Running {
     // Dropping the intent cancels publication, but the native call may still be completing.
     intent: Option<Intent>,
     geometry: Geometry,
+    marks: Option<Marks>,
     result: Receiver<ResultPage>,
 }
 
@@ -144,19 +168,28 @@ pub(super) struct Jobs {
     queued: Option<Request>,
     running: Option<Running>,
     placed: Option<Placement>,
-    failed_fit: Option<((u64, u32), Geometry)>,
+    failed_fit: Option<((u64, u32), Geometry, Option<Marks>)>,
     deferred_motion: Option<((u64, u32), Motion)>,
+    search: SearchJobs,
     worker: Rc<RefCell<Worker>>,
 }
 
 struct Placement {
     key: (u64, u32),
     geometry: Geometry,
+    marks: Option<Marks>,
     layout: PlacedPage,
 }
 
 fn page_key(app: &App) -> Option<(u64, u32)> {
     app.pdf().map(|page| (app.document_id(), page.index))
+}
+
+fn can_navigate(from: (u64, u32), app: &App, floats: &Floats) -> bool {
+    Some(from) == page_key(app)
+        && floats.active().is_none()
+        && app.mode() == Mode::Normal
+        && !app.help_open()
 }
 
 impl Jobs {
@@ -169,13 +202,19 @@ impl Jobs {
         terminal::with_screen(|screen, input| run(screen, input, jobs))
     }
 
-    fn submit(&self, work: Work, geometry: Geometry) -> Result<Receiver<ResultPage>, Failure> {
+    fn submit(
+        &self,
+        work: Work,
+        geometry: Geometry,
+        marks: Option<Marks>,
+    ) -> Result<Receiver<ResultPage>, Failure> {
         self.worker
             .borrow_mut()
-            .submit(move |renderer| work.place(renderer, geometry))
+            .submit(move |renderer| work.place(renderer, geometry, marks.as_ref()))
     }
 
     pub(super) fn reset(&mut self) {
+        self.search.cancel();
         self.cancel_if(|_| true);
         self.placed = None;
         self.failed_fit = None;
@@ -190,6 +229,9 @@ impl Jobs {
     }
 
     pub(super) fn depart(&mut self, document: u64) {
+        if self.search.from().is_some_and(|(id, _)| id == document) {
+            self.search.cancel();
+        }
         self.cancel_if(|intent| intent.document_id() == document);
         if self
             .placed
@@ -216,6 +258,144 @@ impl Jobs {
                 work: Work::Open(path.to_owned()),
             });
         }
+    }
+
+    pub(super) fn search_pending(&self) -> bool {
+        self.search_from().is_some()
+    }
+
+    fn search_from(&self) -> Option<(u64, u32)> {
+        self.search.from().or_else(|| match self.pending() {
+            Some(Intent::Search { from, .. }) => Some(*from),
+            _ => None,
+        })
+    }
+
+    pub(super) fn cancel_search(&mut self, app: &mut App) {
+        if self.search_pending() {
+            self.search.cancel();
+            self.cancel_if(|intent| matches!(intent, Intent::Search { .. }));
+            app.clear_notice_if(SEARCHING);
+        }
+    }
+
+    pub(super) fn start_search(&mut self, app: &mut App, input: String, direction: Direction) {
+        if let Some(from) = page_key(app) {
+            self.prioritize_search();
+            let origin = self
+                .placed(app)
+                .and_then(|layout| Origin::new(from.1, app.top_row(), &layout));
+            self.search.start(app, from, input, direction, origin);
+        }
+    }
+
+    pub(super) fn repeat_search(
+        &mut self,
+        app: &mut App,
+        geometry: Result<Geometry, Failure>,
+        reverse: bool,
+    ) {
+        if self.search.from().is_some() {
+            return; // Cannot step until the new query has a result.
+        }
+        let result = match self.pending() {
+            Some(Intent::Search { result, .. }) => Some(result),
+            _ => app.pdf_search(),
+        };
+        let Some(mut result) = result.cloned() else {
+            app.set_notice("No previous search".into());
+            return;
+        };
+        self.prioritize_search();
+        result.step(reverse);
+        self.reveal_search(app, geometry, result);
+    }
+
+    fn prioritize_search(&mut self) {
+        self.deferred_motion = None;
+        self.cancel_if(|intent| !matches!(intent, Intent::Fit { .. }));
+    }
+
+    fn reveal_search(
+        &mut self,
+        app: &mut App,
+        geometry: Result<Geometry, Failure>,
+        result: PdfSearch,
+    ) {
+        let Some((from, page)) = page_key(app).zip(app.pdf()) else {
+            return;
+        };
+        let Some(hit) = result.current() else {
+            app.set_pdf_search(result);
+            return;
+        };
+        let work = if hit.page == page.index {
+            if !page.supports_hit(hit) {
+                search::fail(app, search::GEOMETRY);
+                return;
+            }
+            if let Some(layout) = self.matching_layout(app, geometry) {
+                app.center_row(layout.as_ref(), layout.pdf_row(hit.from_top));
+                app.set_pdf_search(result);
+                return;
+            }
+            Work::Fit(page.clone())
+        } else {
+            Work::Turn(page.source.clone(), hit.page)
+        };
+        if let Err(failure) = geometry {
+            search::fail(app, failure);
+            return;
+        }
+        self.replace(Request {
+            intent: Intent::Search { from, result },
+            work,
+        });
+        app.set_notice(SEARCHING.into());
+    }
+
+    fn revalidate_search(
+        &mut self,
+        app: &mut App,
+        floats: &Floats,
+        geometry: Result<Geometry, Failure>,
+    ) -> bool {
+        let Some(from) = self.search_from() else {
+            return false;
+        };
+        if !can_navigate(from, app, floats) {
+            self.cancel_search(app);
+        } else if let Err(failure) = geometry {
+            self.cancel_search(app);
+            search::fail(app, failure);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn advance_search(&mut self, app: &mut App, geometry: Result<Geometry, Failure>) -> bool {
+        if let Some(from) = self.search.needs_origin()
+            && self.placed(app).is_none()
+            && geometry.is_ok_and(|geometry| self.fit_failed_at(from, geometry))
+        {
+            self.cancel_search(app);
+            search::fail(app, search::GEOMETRY);
+            return true;
+        }
+        let origin = self.search.needs_origin().and_then(|from| {
+            let layout = self.placed(app)?;
+            // A restored page may have just received its first layout since coming
+            // back from history. Compute the origin from its restored anchor.
+            app.reflow_current_height(layout.as_ref());
+            Origin::new(from.1, app.top_row(), &layout)
+        });
+        match self.search.poll(app.pdf().map(|page| &page.source), origin) {
+            Ok(Some(result)) => self.reveal_search(app, geometry, result),
+            Err(failure) => search::fail(app, failure),
+            Ok(None) => return false,
+        }
+        true
     }
 
     fn matching_layout(
@@ -246,7 +426,7 @@ impl Jobs {
             self.apply_motion(app, motion, layout.as_ref());
         } else {
             self.cancel_if(|intent| matches!(intent, Intent::Turn { .. }));
-            if geometry.is_ok_and(|geometry| self.failed_fit != Some((from, geometry))) {
+            if geometry.is_ok_and(|geometry| !self.fit_failed_at(from, geometry)) {
                 // Keep the latest motion across a refit, not an edge decision from the old view.
                 self.deferred_motion = Some((from, motion));
             }
@@ -276,12 +456,7 @@ impl Jobs {
     }
 
     fn revalidate_turn(&mut self, app: &App, floats: &Floats, geometry: Result<Geometry, Failure>) {
-        let can_move = |key| {
-            Some(key) == page_key(app)
-                && floats.active().is_none()
-                && app.mode() == Mode::Normal
-                && !app.help_open()
-        };
+        let can_move = |key| can_navigate(key, app, floats);
         self.deferred_motion = self.deferred_motion.filter(|&(key, _)| can_move(key));
         let layout = self.matching_layout(app, geometry);
         if let Some(&Intent::Turn {
@@ -359,26 +534,44 @@ impl Jobs {
         }
         if self
             .failed_fit
-            .is_some_and(|(failed, _)| Some(failed) != key)
-            || geometry.is_ok_and(|geometry| {
-                self.failed_fit
-                    .is_some_and(|(_, failed)| failed != geometry)
+            .as_ref()
+            .is_some_and(|(failed, previous, _)| {
+                Some(*failed) != key || geometry.is_ok_and(|geometry| geometry != *previous)
             })
         {
             self.failed_fit = None;
         }
+        let search_cancelled = self.revalidate_search(app, floats, geometry);
         self.cancel_if(|intent| !intent.still_current(app, floats));
-
         self.revalidate_turn(app, floats, geometry);
-        let mut update = Update::default();
+        let mut update = self.poll_rendered(app, geometry);
+        update.redraw |= search_cancelled;
+        update.redraw |= self.advance_search(app, geometry);
+        update.redraw |= self.replay_resized_motion(app, geometry);
+        self.queue_fit(app, geometry);
+        if let Some(failed) = self.submit_queued(app, geometry) {
+            update.redraw |= failed.redraw;
+        }
+        update
+    }
+
+    fn poll_rendered(&mut self, app: &mut App, geometry: Result<Geometry, Failure>) -> Update {
         if let Some(running) = &mut self.running
             && let Some(result) = try_result(&running.result)
         {
             let intent = running.intent.take();
             let placed_at = running.geometry;
+            let marks = running.marks.take();
             self.running = None;
             if let Some(intent) = intent {
-                update = match (geometry, result) {
+                // A same-page search or :noh can change the desired tiles while
+                // a refit is in progress. Do not publish the old marks.
+                if let Intent::Fit { from } = &intent
+                    && marks != Marks::for_page(app.pdf_search(), from.1)
+                {
+                    return Update::default();
+                }
+                return match (geometry, result) {
                     (Ok(latest), Ok((page, _))) if placed_at != latest => {
                         self.queued = Some(Request {
                             intent,
@@ -387,47 +580,72 @@ impl Jobs {
                         Update::default()
                     }
                     (Ok(_), Ok((page, Ok(layout)))) => {
-                        self.commit(app, intent, page, placed_at, layout)
+                        self.commit(app, intent, page, placed_at, marks, layout)
                     }
                     (_, Err(error) | Ok((_, Err(error)))) => {
-                        self.fail(app, intent, error, Some(placed_at))
+                        self.fail(app, intent, error, Some(placed_at), marks)
                     }
-                    (Err(error), Ok(_)) => self.fail(app, intent, error, None),
+                    (Err(error), Ok(_)) => self.fail(app, intent, error, None, marks),
                 };
             }
         }
+        Update::default()
+    }
 
-        update.redraw |= self.replay_resized_motion(app, geometry);
+    fn fit_failed_at(&self, key: (u64, u32), geometry: Geometry) -> bool {
+        self.failed_fit
+            .as_ref()
+            .is_some_and(|failed| (failed.0, failed.1) == (key, geometry))
+    }
+
+    fn queue_fit(&mut self, app: &App, geometry: Result<Geometry, Failure>) {
         if self.pending().is_none()
             && let (Some(key), Some(page), Ok(geometry)) = (page_key(app), app.pdf(), geometry)
+            && let marks = Marks::for_page(app.pdf_search(), key.1)
+            && !self.placed.as_ref().is_some_and(|placed| {
+                placed.key == key && placed.geometry == geometry && placed.marks == marks
+            })
             && !self
-                .placed
+                .failed_fit
                 .as_ref()
-                .is_some_and(|placed| placed.key == key && placed.geometry == geometry)
-            && self.failed_fit != Some((key, geometry))
+                .is_some_and(|failed| (failed.0, failed.1) == (key, geometry) && failed.2 == marks)
         {
             self.queued = Some(Request {
                 intent: Intent::Fit { from: key },
                 work: Work::Fit(page.clone()),
             });
         }
-        if self.running.is_none()
-            && let Some(Request { intent, work }) = self.queued.take()
-        {
-            match geometry
-                .and_then(|geometry| self.submit(work, geometry).map(|result| (geometry, result)))
-            {
-                Ok((geometry, result)) => {
-                    self.running = Some(Running {
-                        intent: Some(intent),
-                        geometry,
-                        result,
-                    });
-                }
-                Err(error) => return self.fail(app, intent, error, geometry.ok()),
-            }
+    }
+
+    fn submit_queued(
+        &mut self,
+        app: &mut App,
+        geometry: Result<Geometry, Failure>,
+    ) -> Option<Update> {
+        if self.running.is_some() {
+            return None;
         }
-        update
+        let Request { intent, work } = self.queued.take()?;
+        let search = match &intent {
+            Intent::Search { result, .. } => Some(result),
+            _ => app.pdf_search(),
+        };
+        let marks = work.marks(search);
+        match geometry.and_then(|geometry| {
+            self.submit(work, geometry, marks.clone())
+                .map(|result| (geometry, result))
+        }) {
+            Ok((geometry, result)) => {
+                self.running = Some(Running {
+                    intent: Some(intent),
+                    geometry,
+                    marks,
+                    result,
+                });
+                None
+            }
+            Err(error) => Some(self.fail(app, intent, error, geometry.ok(), marks)),
+        }
     }
 
     fn commit(
@@ -436,6 +654,7 @@ impl Jobs {
         intent: Intent,
         page: Page,
         geometry: Geometry,
+        marks: Option<Marks>,
         layout: Layout<'static>,
     ) -> Update {
         let close_float = match intent {
@@ -452,11 +671,25 @@ impl Jobs {
                 app.clear_notice_if(FIT_NOTICE);
                 None
             }
+            Intent::Search { result, .. } => {
+                let Some(hit) = result.current().filter(|hit| page.supports_hit(*hit)) else {
+                    search::fail(app, search::GEOMETRY);
+                    return Update {
+                        redraw: true,
+                        close_float: None,
+                    };
+                };
+                app.replace_pdf_page(page);
+                app.center_row(&layout, layout.pdf_row(hit.from_top));
+                app.set_pdf_search(result);
+                None
+            }
         };
         if let Some(key) = page_key(app) {
             self.placed = Some(Placement {
                 key,
                 geometry,
+                marks,
                 layout: Rc::new(layout),
             });
         }
@@ -473,6 +706,7 @@ impl Jobs {
         intent: Intent,
         failure: Failure,
         geometry: Option<Geometry>,
+        marks: Option<Marks>,
     ) -> Update {
         match intent {
             Intent::Open { path, .. } => {
@@ -484,11 +718,12 @@ impl Jobs {
                 app.set_notice(TURN_NOTICE.into());
             }
             Intent::Fit { from } => {
-                self.failed_fit = geometry.map(|geometry| (from, geometry));
+                self.failed_fit = geometry.map(|geometry| (from, geometry, marks));
                 self.deferred_motion = None;
                 log_page_failure(app.document_path(), from.1, "resize", failure);
                 app.set_notice(FIT_NOTICE.into());
             }
+            Intent::Search { .. } => search::fail(app, failure),
         }
         Update {
             redraw: true,
@@ -534,7 +769,7 @@ pub(super) fn startup(
     let report = |failure: &Failure| log_open_failure(&path, "startup", *failure);
     let mut placed_at = geometry(size.width, mode).inspect_err(report)?;
     let mut receiver = jobs
-        .submit(Work::Open(path.clone()), placed_at)
+        .submit(Work::Open(path.clone()), placed_at, None)
         .inspect_err(report)?;
 
     loop {
@@ -553,6 +788,7 @@ pub(super) fn startup(
                 jobs.placed = page_key(&app).map(|key| Placement {
                     key,
                     geometry: placed_at,
+                    marks: None,
                     layout: Rc::new(layout),
                 });
                 return Ok(Some((app, jobs)));
@@ -560,7 +796,7 @@ pub(super) fn startup(
             // Keep the native raster; only the placement needs to match the new width.
             placed_at = latest;
             receiver = jobs
-                .submit(Work::Fit(page), placed_at)
+                .submit(Work::Fit(page), placed_at, None)
                 .inspect_err(report)?;
         }
         terminal::check(
@@ -584,6 +820,10 @@ pub(super) fn startup(
 }
 
 #[cfg(all(test, windows))]
+#[path = "../../tests/support/pdf_text_coordinates.rs"]
+mod pdf_text_coordinates;
+
+#[cfg(all(test, windows))]
 mod tests {
     use std::{
         fs,
@@ -593,7 +833,7 @@ mod tests {
     };
 
     use crate::{
-        app::{Action, Direction},
+        app::Action,
         lua::{FileOpen, Host, Runtime},
         session::{BODY_VIEW, InputQueue, Session, poll_pdf},
         ui::float::FloatOptions,
@@ -625,12 +865,12 @@ mod tests {
         )))
     }
 
-    fn wait(session: &RefCell<Session>, runtime: &Runtime) -> io::Result<()> {
+    pub(super) fn wait(session: &RefCell<Session>, runtime: &Runtime) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             poll_pdf(session, runtime);
             let jobs = &session.borrow().pdf;
-            if jobs.running.is_none() && jobs.queued.is_none() {
+            if jobs.running.is_none() && jobs.queued.is_none() && !jobs.search.busy() {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -797,7 +1037,7 @@ mod tests {
                 // Wait without polling, then deliver the completed result to make this race deterministic.
                 let completed = state
                     .pdf
-                    .submit(request.work, narrow)
+                    .submit(request.work, narrow, None)
                     .map_err(io::Error::from)?
                     .recv_timeout(Duration::from_secs(15))?;
                 let (send, result) = mpsc::channel();
@@ -805,6 +1045,7 @@ mod tests {
                 state.pdf.running = Some(Running {
                     intent: Some(request.intent),
                     geometry: narrow,
+                    marks: None,
                     result,
                 });
                 if geometry_changes {
@@ -907,15 +1148,8 @@ mod tests {
         drop(state);
 
         let restored = demo.page()?;
-        let mut state = demo.session.borrow_mut();
-        assert_eq!(state.app.top_row(), 25);
-        state.apply(
-            Action::StartSearch(Direction::Forward),
-            restored.as_ref(),
-            "",
-        );
-        assert_eq!(state.app.mode(), Mode::Normal);
-        assert_eq!(state.app.notice(), Some("Search is not supported for PDFs"));
+        assert_eq!(demo.session.borrow().app.top_row(), 25);
+        assert_eq!(restored.len(), 80);
         Ok(())
     }
 
@@ -982,6 +1216,7 @@ mod tests {
             session.pdf.running = Some(Running {
                 intent: Some(intent),
                 geometry: FIRST,
+                marks: None,
                 result,
             });
         }

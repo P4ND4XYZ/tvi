@@ -17,8 +17,15 @@ mod terminal;
 #[path = "../tests/support/pdf.rs"]
 mod test_pdf;
 mod ui;
+#[cfg(windows)]
+#[path = "process/windows.rs"]
+mod windows_job;
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    if let Some(status) = pdf::text::worker_entry() {
+        return status;
+    }
     logging::init();
     logging::emit(
         logging::Level::Debug,

@@ -44,7 +44,7 @@ UTF-8のJSON Lines（1行に1件のJSON）で保存します。全レコード�
 {"ts":"2026-08-24T09:41:23.184Z","level":"WARN","event":"mermaid.convert_failed","pid":1234,"document":"architecture.md","line":42,"stage":"convert","reason":"nonzero_exit","exit_code":1,"elapsed_ms":812,"fallback":"code"}
 ```
 
-1件の上限は4 KiBです。長い項目は短縮し、有効なJSONを1行で残します。Markdown・Mermaidの本文、検索語、入力キー、環境変数の値、絶対パス、外部コマンドの生の出力やLuaの未加工のエラー文字列は、デバッグ時も保存しません。
+1件の上限は4 KiBです。長い項目は短縮し、有効なJSONを1行で残します。Markdown・Mermaid・PDFの本文、検索語、入力キー、環境変数の値、絶対パス、外部コマンドの生の出力やLuaの未加工のエラー文字列は、デバッグ時も保存しません。
 
 ## 出力するイベント
 
@@ -52,6 +52,7 @@ UTF-8のJSON Lines（1行に1件のJSON）で保存します。全レコード�
 |---|---|
 | `document.open_failed` | 起動時やLuaから文書を開けなかったとき、リンク先を解決できなかったとき、または自動再読み込みの失敗が続いたとき。`document`、`trigger`（`startup` / `open_file` / `link` / `reload`）、`stage` と `reason`（例：`read` / `not_found`、`decode` / `invalid_utf8`）。 |
 | `pdf.page_failed` | 表示中のPDFでページ送りや画面幅への合わせ直しが失敗したとき。`document`、`page`（1始まり）、`trigger`（`turn` / `resize`）、`stage`、`reason`、取得できた場合は `os_code`。同じ要求では1件だけ記録し、無効になった要求の結果は記録しません。PDFを初めて開く際の失敗は `document.open_failed` に記録します。 |
+| `pdf.search_failed` | PDFのテキスト抽出や一致ページの表示に失敗したとき。`stage` と `reason` のみを追加し、文書名は記録しません。キャンセルされた要求や、一致がない場合は記録しません。 |
 | `document.watch_failed` | 表示中の文書を監視できなかったとき。`document` と `stage`（`register` / `receive`）。同じ文書の監視中に繰り返しません。 |
 | `image.load_failed` | ローカル画像を読み込めなかったとき。`document`、`image_index`（元のMarkdown上の出現番号。生成した図は数えない）、`stage`、`reason`（例：ファイルなし、非対応形式、破損、サイズ上限）。再描画では繰り返しません。 |
 | `mermaid.launch_failed` | `mmdc` を検出したが起動できなかったとき。`document`、`reason`（例：`permission_denied`）、取得できた場合は `os_code`、`fallback: "code"`。文書を開く操作につき1件にまとめます。 |

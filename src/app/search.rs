@@ -1,9 +1,45 @@
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
+
+use crate::pdf::text::Hit;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Forward,
     Backward,
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct PdfSearch {
+    pub query: Arc<str>,
+    pub direction: Direction,
+    pub hits: Arc<[Hit]>,
+    pub selected: usize,
+    pub highlights: bool,
+}
+
+impl PdfSearch {
+    pub(crate) fn current(&self) -> Option<Hit> {
+        self.hits.get(self.selected).copied()
+    }
+
+    pub(crate) fn selection(&self) -> Option<(usize, usize)> {
+        self.current().map(|_| (self.selected + 1, self.hits.len()))
+    }
+
+    pub(crate) fn step(&mut self, reverse: bool) {
+        if !self.hits.is_empty() {
+            self.selected = step_index(self.selected, self.hits.len(), self.direction, reverse);
+            self.highlights = true;
+        }
+    }
+}
+
+fn step_index(index: usize, len: usize, direction: Direction, reverse: bool) -> usize {
+    if (direction == Direction::Backward) ^ reverse {
+        index.checked_sub(1).unwrap_or(len - 1)
+    } else {
+        (index + 1) % len
+    }
 }
 
 #[derive(Default)]
@@ -64,12 +100,7 @@ impl Search {
 
     pub fn step(&mut self, reverse: bool) {
         if let (Some(index), Some(direction)) = (self.selected, self.direction) {
-            let len = self.matches.len();
-            self.selected = Some(if (direction == Direction::Backward) ^ reverse {
-                index.checked_sub(1).unwrap_or(len - 1)
-            } else {
-                (index + 1) % len
-            });
+            self.selected = Some(step_index(index, self.matches.len(), direction, reverse));
             self.highlights = true;
         }
     }

@@ -5,6 +5,8 @@ use std::{
 
 use crate::{markdown::MarkdownResources, pdf::Page};
 
+use super::PdfSearch;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_id() -> u64 {
@@ -20,7 +22,10 @@ pub struct Document {
 
 pub(super) enum Content {
     Markdown(Markdown),
-    Pdf(Page),
+    Pdf {
+        page: Page,
+        search: Option<PdfSearch>,
+    },
 }
 
 pub(super) struct Markdown {
@@ -78,14 +83,14 @@ impl Document {
             id: next_id(),
             name,
             path,
-            content: Content::Pdf(page),
+            content: Content::Pdf { page, search: None },
         }
     }
 
     pub(super) fn links(&self) -> &[DocumentLink] {
         match &self.content {
             Content::Markdown(markdown) => &markdown.links,
-            Content::Pdf(_) => &[],
+            Content::Pdf { .. } => &[],
         }
     }
 
@@ -94,7 +99,7 @@ impl Document {
             Content::Markdown(markdown) => {
                 Some((&self.path, &markdown.text, &mut markdown.resources))
             }
-            Content::Pdf(_) => None,
+            Content::Pdf { .. } => None,
         }
     }
 

@@ -1,7 +1,7 @@
 use std::{fs, os::windows::ffi::OsStrExt as _, path::Path, sync::Arc};
 
 use ::windows::{
-    Data::Pdf::{PdfDocument, PdfPage, PdfPageRenderOptions},
+    Data::Pdf::{PdfDocument, PdfPage, PdfPageRenderOptions, PdfPageRotation},
     Graphics::Imaging::BitmapEncoder,
     Storage::Streams::{DataReader, IRandomAccessStream, InMemoryRandomAccessStream},
     UI::Color,
@@ -11,7 +11,7 @@ use ::windows::{
     core::{Error, PCWSTR},
 };
 
-use super::{Failure, Page, Source};
+use super::{Failure, Page, Source, text};
 
 const MAX_PNG_BYTES: u64 = 16 * 1024 * 1024;
 const LOAD: &str = "Could not open the PDF document (invalid or password-protected PDF)";
@@ -66,8 +66,10 @@ pub(super) struct Document {
 }
 
 impl Document {
-    pub(super) fn open(path: &Path) -> Result<Self, Failure> {
-        let metadata = fs::metadata(path).map_err(|error| Failure::io("metadata", &error))?;
+    pub(super) fn open(path: &Path) -> Result<(Self, text::Input), Failure> {
+        let absolute =
+            std::path::absolute(path).map_err(|error| Failure::io("pdf_load", &error))?;
+        let metadata = fs::metadata(&absolute).map_err(|error| Failure::io("metadata", &error))?;
         if !metadata.is_file() {
             return Err(Failure::new(
                 "metadata",
@@ -75,8 +77,6 @@ impl Document {
                 "PDF path is not a regular file",
             ));
         }
-        let absolute =
-            std::path::absolute(path).map_err(|error| Failure::io("pdf_load", &error))?;
         let load_error = |error| native("pdf_load", "invalid_or_password_protected", LOAD, &error);
         let stream = open_stream(&absolute)?;
         let native = PdfDocument::LoadFromStreamAsync(&stream)
@@ -90,11 +90,14 @@ impl Document {
             ));
         }
         let count = native.PageCount().map_err(load_error)?;
-        Ok(Self {
-            native,
-            _stream: stream,
-            count,
-        })
+        Ok((
+            Self {
+                native,
+                _stream: stream,
+                count,
+            },
+            text::Input::new(absolute, &metadata),
+        ))
     }
 
     pub(super) fn render(&self, source: Source, index: u32) -> Result<Page, Failure> {
@@ -104,6 +107,8 @@ impl Document {
         let render_error = |error| native("pdf_render", "winrt", RENDER, &error);
         let png_error = |error| native("pdf_png", "stream", RENDER, &error);
         let page = self.native.GetPage(index).map_err(render_error)?;
+        // Failure to identify search geometry must not affect ordinary rendering.
+        let searchable_geometry = searchable_geometry(&page).unwrap_or(false);
         let result = render_png(&page, render_error, png_error);
         let close = page.Close().map_err(render_error);
         let (png, aspect_height) = result?;
@@ -113,8 +118,17 @@ impl Document {
             index,
             png,
             aspect_height,
+            searchable_geometry,
         })
     }
+}
+
+fn searchable_geometry(page: &PdfPage) -> windows::core::Result<bool> {
+    if page.Rotation()? != PdfPageRotation::Normal {
+        return Ok(false);
+    }
+    let dimensions = page.Dimensions()?;
+    Ok(dimensions.MediaBox()? == dimensions.CropBox()?)
 }
 
 #[allow(

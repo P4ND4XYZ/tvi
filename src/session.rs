@@ -45,6 +45,7 @@ struct Session {
     source_scroll: Option<(u64, usize)>,
     pdf: pdf::Jobs,
     pdf_geometry: Result<PdfGeometry, PdfFailure>,
+    pdf_normal_height: Option<usize>,
 }
 
 #[derive(Default)]
@@ -84,10 +85,42 @@ impl Session {
             source_scroll: None,
             pdf: pdf::Jobs::default(),
             pdf_geometry: pdf::geometry(80, image_mode),
+            pdf_normal_height: None,
         }
     }
 
     fn apply(&mut self, action: Action, rows: &impl ViewRows, text: &str) {
+        if self.app.pdf().is_some() && !self.app.help_open() {
+            match (self.app.mode(), action) {
+                (Mode::Search(direction), Action::Submit) => {
+                    let input = self.app.finish_search_input();
+                    self.pdf.start_search(&mut self.app, input, direction);
+                    // The origin was the prompt viewport, but the jump uses the
+                    // normal body height, even if results arrive before redraw.
+                    if let Some(height) = self.pdf_normal_height {
+                        self.app.reflow(rows, height);
+                    }
+                    return;
+                }
+                (Mode::Normal, Action::RepeatSearch { reverse }) => {
+                    self.pdf
+                        .repeat_search(&mut self.app, self.pdf_geometry, reverse);
+                    return;
+                }
+                (
+                    Mode::Normal,
+                    Action::Move(_)
+                    | Action::StartSearch(_)
+                    | Action::StartCommand
+                    | Action::JumpBack
+                    | Action::Help
+                    | Action::Cancel,
+                ) => {
+                    self.pdf.cancel_search(&mut self.app);
+                }
+                _ => {}
+            }
+        }
         if let Action::Move(motion) = action
             && self.pdf.move_pdf(&mut self.app, motion, self.pdf_geometry)
         {
@@ -118,7 +151,12 @@ impl Session {
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>, layout: &Layout<'_>, runtime: &Runtime) {
-        let body = ui::body_area(frame.area(), self.app.mode());
+        let area = frame.area();
+        let body = ui::body_area(area, self.app.mode());
+        self.pdf_normal_height = self
+            .app
+            .pdf()
+            .map(|_| usize::from(ui::body_area(area, Mode::Normal).height));
         self.app.reflow(layout, usize::from(body.height));
         if let Some((id, line)) = self.source_scroll.take()
             && id == self.app.document_id()
@@ -378,6 +416,7 @@ impl Host for RefCell<Session> {
             let Session {
                 pdf, app, floats, ..
             } = &mut *session;
+            pdf.cancel_search(app);
             pdf.open(app, path, floats.active());
             return Ok(FileOpen::Pending);
         }
@@ -401,7 +440,9 @@ impl Host for RefCell<Session> {
         let mut session = self.borrow_mut();
         session.prepared = None;
         session.source_scroll = None;
-        session.app.open_document(document);
+        let Session { app, pdf, .. } = &mut *session;
+        pdf.cancel_search(app);
+        app.open_document(document);
         Ok(FileOpen::Opened)
     }
 
@@ -417,7 +458,13 @@ impl Host for RefCell<Session> {
 
     fn open_float(&self, view: u64, options: FloatOptions) -> Result<u64, String> {
         validate_view(view)?;
-        self.borrow_mut().floats.open(view, options)
+        let mut state = self.borrow_mut();
+        let Session {
+            app, floats, pdf, ..
+        } = &mut *state;
+        let float = floats.open(view, options)?;
+        pdf.cancel_search(app);
+        Ok(float)
     }
 
     fn update_float(&self, view: u64, float: u64, options: FloatOptions) -> Result<(), String> {
@@ -732,6 +779,16 @@ impl InputQueue {
                 return false;
             }
             return true;
+        }
+
+        if key.is_some_and(is_escape) {
+            let mut state = session.borrow_mut();
+            if state.body_uninterrupted() && state.pdf.search_pending() {
+                self.input.reset();
+                self.undecided_key = None;
+                state.apply(Action::Cancel, rows, search_text);
+                return true;
+            }
         }
 
         let dispatch = if let Some(key) = key {

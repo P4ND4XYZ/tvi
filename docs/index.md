@@ -11,10 +11,10 @@ tviは端末上で文書を読むための閲覧専用ビューアです。Markd
 | 文書 | 説明 |
 |---|---|
 | [Markdown表示](features/markdown.md) | UTF-8ファイルの読み込み・自動再読み込み、折り返し、ローカル画像・Mermaidの図の表示、起動時のエラー |
-| [PDF表示](features/pdf.md) | 対応端末、開き方、ページ内のスクロールとページ送り |
+| [PDF表示](features/pdf.md) | 対応端末、開き方、ページ送りとテキスト検索の案内 |
 | [文書内の移動](features/navigation.md) | 行・ページ単位の移動とリサイズ時の閲覧位置の保持 |
 | [動作モードと入力](features/modes.md) | NORMAL、COMMAND、SEARCHの役割と切り替え |
-| [検索](features/search.md) | 検索条件、一致箇所への移動、ハイライトの解除と再表示 |
+| [検索](features/search.md) | Markdown・PDFの検索、一致箇所への移動とハイライト |
 | [コマンドと終了](features/commands.md) | コマンドによる終了、ヘルプ、検索ハイライトの解除、コマンドエラー |
 | [状態表示とヘルプ](features/status-help.md) | モードや閲覧位置の表示とキー一覧 |
 | [診断ログ](features/diagnostic-log.md) | 保存先、ローテーションと保持上限、記録するイベント、デバッグログの有効化 |
@@ -24,6 +24,6 @@ tviは端末上で文書を読むための閲覧専用ビューアです。Markd
 
 ### 設計方針
 
-- [モジュール構成と依存関係](design/architecture.md): 各モジュールの責務、Markdown adapterの境界、PDFの専用スレッドと文書の保持期間
+- [モジュール構成と依存関係](design/architecture.md): 各モジュールの責務、Markdown adapterの境界、PDF描画・検索の分離と文書の保持期間
 - [Lua連携の設計](design/lua-integration.md): RustとLuaの責務、入力と状態の管理
 - [Mermaid表示の設計](design/mermaid.md): 変換プロセスと既存の画像表示の境界、PNGキャッシュ、検証方針

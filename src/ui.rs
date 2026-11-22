@@ -139,10 +139,10 @@ fn status_line(app: &App, len: usize) -> String {
         format!("{mode}  {row}/{len}")
     };
     if let Some((index, total)) = app.search_selection() {
-        let state = if app.highlights().0.is_empty() {
-            " off"
-        } else {
+        let state = if app.search_highlights_enabled() {
             ""
+        } else {
+            " off"
         };
         let result = write!(text, "  [{index}/{total}{state}]");
         debug_assert!(result.is_ok(), "formatting to String cannot fail");

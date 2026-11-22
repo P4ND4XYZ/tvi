@@ -34,8 +34,8 @@ end, { desc = "既定の配色に戻す" })
 | `markdown.link` | リンク |
 | `markdown.quote` | 引用と GFM アラートのラベル。指定していない属性は元の装飾を維持 |
 | `markdown.code` | インラインコードのみ |
-| `search.match` | 検索の一致箇所（既定は白文字に青背景） |
-| `search.current` | 選択中の一致箇所（既定は黒文字に黄背景） |
+| `search.match` | Markdown検索の一致箇所（既定は白文字に青背景） |
+| `search.current` | Markdown検索で選択中の一致箇所（既定は黒文字に黄背景） |
 | `ui.status` | 状態欄と通知 |
 | `ui.prompt` | コマンド・検索の入力欄 |
 | `float.normal` | フロートの本文、ヘッダー、選択行 |

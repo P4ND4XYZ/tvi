@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use crate::images::Budget;
 
+pub(crate) mod text;
 #[cfg(windows)]
 mod windows;
 
@@ -89,6 +90,23 @@ pub(crate) struct Source {
 struct Lease {
     id: u64,
     sender: mpsc::Sender<Message>,
+    input: Arc<text::Input>,
+}
+
+impl Source {
+    pub(crate) fn search(
+        &self,
+        query: Arc<str>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<mpsc::Receiver<text::ResultHits>, Failure> {
+        #[cfg(windows)]
+        return text::spawn(self.lease.input.clone(), self.count, query, cancelled);
+        #[cfg(not(windows))]
+        {
+            let _ = (self, query, cancelled);
+            Err(Failure::platform())
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -107,6 +125,7 @@ pub(crate) struct Page {
     // entire PDF's worth of decoded pages or terminal placements.
     png: Arc<[u8]>,
     aspect_height: f64,
+    searchable_geometry: bool,
 }
 
 impl Page {
@@ -118,6 +137,12 @@ impl Page {
                 "Could not decode the PDF page image",
             )
         })
+    }
+
+    pub(crate) fn supports_hit(&self, hit: text::Hit) -> bool {
+        self.index == hit.page
+            && self.searchable_geometry
+            && (self.aspect_height / hit.aspect_height - 1.0).abs() < 0.001
     }
 
     pub fn aspect_height(&self) -> f64 {
@@ -156,13 +181,14 @@ impl Renderer {
     pub fn open(&mut self, path: &Path) -> Result<Page, Failure> {
         #[cfg(windows)]
         {
-            let document = windows::Document::open(path)?;
+            let (document, input) = windows::Document::open(path)?;
             let id = self.next_id;
             self.next_id += 1;
             let source = Source {
                 lease: Arc::new(Lease {
                     id,
                     sender: self.sender.clone(),
+                    input: Arc::new(input),
                 }),
                 count: document.count,
             };

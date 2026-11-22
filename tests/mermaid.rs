@@ -1,6 +1,14 @@
 #[path = "../src/mermaid.rs"]
 mod mermaid;
 
+#[cfg(windows)]
+#[allow(
+    dead_code,
+    reason = "Mermaid uses job cleanup but does not query extractor memory limits"
+)]
+#[path = "../src/process/windows.rs"]
+mod windows_job;
+
 use std::{
     env,
     fs::{self, File, OpenOptions},

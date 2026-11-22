@@ -13,6 +13,7 @@ use command::Command;
 use document::Content;
 pub use document::{Document, DocumentLink};
 pub use search::Direction;
+pub(crate) use search::PdfSearch;
 use search::Search;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,19 +208,19 @@ impl App {
     pub(crate) fn markdown(&self) -> &str {
         match &self.document.content {
             Content::Markdown(markdown) => &markdown.text,
-            Content::Pdf(_) => "",
+            Content::Pdf { .. } => "",
         }
     }
 
     pub(crate) fn pdf(&self) -> Option<&Page> {
         match &self.document.content {
-            Content::Pdf(page) => Some(page),
+            Content::Pdf { page, .. } => Some(page),
             Content::Markdown(_) => None,
         }
     }
 
     pub(crate) fn turn_pdf_page(&mut self, page: Page, previous: bool) {
-        self.document.content = Content::Pdf(page);
+        self.replace_pdf_page(page);
         self.viewport = Viewport {
             anchor: if previous {
                 ViewAnchor::text(usize::MAX)
@@ -228,6 +229,26 @@ impl App {
             },
             ..Viewport::default()
         };
+    }
+
+    pub(crate) fn replace_pdf_page(&mut self, next: Page) {
+        if let Content::Pdf { page, .. } = &mut self.document.content {
+            *page = next;
+        }
+    }
+
+    pub(crate) fn pdf_search(&self) -> Option<&PdfSearch> {
+        match &self.document.content {
+            Content::Pdf { search, .. } => search.as_ref(),
+            Content::Markdown(_) => None,
+        }
+    }
+
+    pub(crate) fn set_pdf_search(&mut self, next: PdfSearch) {
+        if let Content::Pdf { search, .. } = &mut self.document.content {
+            self.notice = next.current().is_none().then(|| "No matches".into());
+            *search = Some(next);
+        }
     }
 
     /// A repeated scroll at the actual edge, not a scroll that just reaches the edge.
@@ -257,7 +278,7 @@ impl App {
     pub fn markdown_resources(&self) -> &MarkdownResources {
         match &self.document.content {
             Content::Markdown(markdown) => &markdown.resources,
-            Content::Pdf(_) => panic!("expected Markdown resources"),
+            Content::Pdf { .. } => panic!("expected Markdown resources"),
         }
     }
 
@@ -388,11 +409,18 @@ impl App {
     }
 
     pub fn search_query(&self) -> &str {
-        self.search.query()
+        self.pdf_search()
+            .map_or_else(|| self.search.query(), |search| &search.query)
     }
 
     pub fn search_selection(&self) -> Option<(usize, usize)> {
-        self.search.selection()
+        self.pdf_search()
+            .map_or_else(|| self.search.selection(), PdfSearch::selection)
+    }
+
+    pub(crate) fn search_highlights_enabled(&self) -> bool {
+        self.pdf_search()
+            .map_or(self.search.highlights, |search| search.highlights)
     }
 
     pub fn highlights(&self) -> (&[Range<usize>], Option<&Range<usize>>) {
@@ -441,11 +469,6 @@ impl App {
         match (self.mode, action) {
             (Mode::Normal, Action::Move(motion)) => self.move_viewport(motion, rows),
             (Mode::Normal, Action::StartCommand) => self.start_input(Mode::Command),
-            (Mode::Normal, Action::StartSearch(_) | Action::RepeatSearch { .. })
-                if self.pdf().is_some() =>
-            {
-                self.set_notice("Search is not supported for PDFs".into());
-            }
             (Mode::Normal, Action::StartSearch(direction)) => {
                 self.start_input(Mode::Search(direction));
             }
@@ -469,8 +492,7 @@ impl App {
             }
             (Mode::Command, Action::Submit) => self.execute_command(),
             (Mode::Search(direction), Action::Submit) => {
-                let query = std::mem::take(&mut self.prompt);
-                self.mode = Mode::Normal;
+                let query = self.finish_search_input();
                 let offset = rows
                     .anchor_at(self.viewport.top)
                     .unwrap_or(self.viewport.anchor)
@@ -480,6 +502,11 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    pub(crate) fn finish_search_input(&mut self) -> String {
+        self.mode = Mode::Normal;
+        std::mem::take(&mut self.prompt)
     }
 
     fn start_input(&mut self, mode: Mode) {
@@ -504,7 +531,17 @@ impl App {
         match command::parse(&self.prompt) {
             Some(Command::Quit) => self.quit = true,
             Some(Command::Help) => self.help = true,
-            Some(Command::HideHighlights) => self.search.highlights = false,
+            Some(Command::HideHighlights) => {
+                if let Content::Pdf {
+                    search: Some(search),
+                    ..
+                } = &mut self.document.content
+                {
+                    search.highlights = false;
+                } else {
+                    self.search.highlights = false;
+                }
+            }
             None => self.notice = Some("Unknown command".into()),
         }
         self.prompt.clear();

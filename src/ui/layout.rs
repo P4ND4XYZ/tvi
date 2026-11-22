@@ -1,3 +1,4 @@
+pub(crate) mod pdf_marks;
 mod table;
 
 use std::ops::Range;
@@ -54,7 +55,7 @@ pub struct Layout<'a> {
     source_positions: &'a [Option<SourcePosition>],
     logical_rows: Vec<usize>,
     images: Vec<PlacedImage>,
-    pdf: bool,
+    pdf_raster_rows: Option<f64>,
 }
 
 // Four new tiles per frame: at most 128 KiB raw RGBA (under 180 KiB of
@@ -80,7 +81,7 @@ impl Layout<'static> {
             source_positions: &[],
             logical_rows: Vec::new(),
             images: Vec::new(),
-            pdf: true,
+            pdf_raster_rows: Some(0.0),
         }
     }
 
@@ -88,6 +89,7 @@ impl Layout<'static> {
         image: &image::DynamicImage,
         aspect_height: f64,
         geometry: PdfGeometry,
+        decorate: impl FnOnce(&mut image::RgbaImage),
     ) -> Option<Self> {
         // Kitty placeholders have a finite coordinate table. Tile the width-fitted
         // raster rather than reducing its height to fit a single placement.
@@ -124,10 +126,12 @@ impl Layout<'static> {
         if u64::from(width) * u64::from(rows) * u64::from(ch) > MAX_DISPLAY_PIXELS {
             return None;
         }
-        let pixels = image
+        let mut pixels = image
             .resize_exact(width, height, image::imageops::FilterType::Triangle)
             .into_rgba8();
+        decorate(&mut pixels);
         let mut layout = Self::empty_pdf();
+        layout.pdf_raster_rows = Some(f64::from(height) / f64::from(ch));
         for row in 0..rows {
             let byte = (usize::from(row) * ANCHOR_SCALE).div_ceil(usize::from(rows));
             layout.rows.push(Row {
@@ -193,7 +197,7 @@ impl<'a> Layout<'a> {
             source_positions: &document.source_positions,
             logical_rows: Vec::with_capacity(original.lines.len() + 1),
             images: Vec::new(),
-            pdf: false,
+            pdf_raster_rows: None,
         };
         if width != 0 {
             let mut placements = document.images.iter().peekable();
@@ -311,8 +315,23 @@ impl<'a> Layout<'a> {
             .filter(move |image| image.visible_at_width(body.width))
     }
 
+    pub(crate) fn pdf_row(&self, from_top: f64) -> usize {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "hit fractions lie within the raster's finite row count"
+        )]
+        let row = (from_top * self.pdf_raster_rows.unwrap_or_default()).floor() as usize;
+        row.min(self.rows.len().saturating_sub(1))
+    }
+
+    pub(crate) fn pdf_row_boundary(&self, row: usize) -> Option<f64> {
+        let raster = self.pdf_raster_rows.filter(|&rows| rows > 0.0)?;
+        Some(f64::from(u16::try_from(row).ok()?) / raster)
+    }
+
     pub fn pdf_transfer_pending(&self, body: Rect, top: usize) -> bool {
-        self.pdf
+        self.pdf_raster_rows.is_some()
             && self
                 .visible_images(body, top)
                 .any(|image| image.transmitted_id().is_none())
@@ -321,7 +340,7 @@ impl<'a> Layout<'a> {
     pub fn draw_images(&self, frame: &mut Frame<'_>, body: Rect, top: usize) {
         let mut new_tiles = 0;
         for image in self.visible_images(body, top) {
-            if self.pdf && image.transmitted_id().is_none() {
+            if self.pdf_raster_rows.is_some() && image.transmitted_id().is_none() {
                 if new_tiles == PDF_TILES_PER_FRAME {
                     continue;
                 }
@@ -500,7 +519,8 @@ mod tests {
             cell_width: 2,
             cell_height: 4,
         };
-        let layout = Layout::pdf_page(&pixels, 2.0, geometry).ok_or("page was not placed")?;
+        let layout =
+            Layout::pdf_page(&pixels, 2.0, geometry, |_| {}).ok_or("page was not placed")?;
         assert_eq!(layout.len(), 162);
         let mut terminal = Terminal::new(TestBackend::new(164, 4))?;
         terminal.draw(|frame| layout.draw_images(frame, Rect::new(1, 0, 162, 3), 159))?;
@@ -531,7 +551,8 @@ mod tests {
             cell_height: 20,
         };
         let image = image::DynamicImage::new_rgb8(40, 160);
-        let layout = Layout::pdf_page(&image, 4.0, geometry).ok_or("page was not placed")?;
+        let layout =
+            Layout::pdf_page(&image, 4.0, geometry, |_| {}).ok_or("page was not placed")?;
         let body = Rect::new(0, 0, 128, 47);
         let mut screen = Terminal::new(TestBackend::new(128, 48))?;
         for top in [0, 48] {
