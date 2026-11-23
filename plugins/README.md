@@ -6,12 +6,23 @@ tviの[Lua設定](../docs/features/lua.md#起動時の設定)から読み込む�
 |---|---|
 | [ファイル選択](#ファイル選択) | プロジェクト内の閲覧可能なファイルを探し、同じビューで開きます。 |
 | [リンク一覧](#リンク一覧) | 現在の文書にあるローカルMarkdownリンクを一覧から選び、別の文書へ移動します。 |
+| [PDFの拡大・縮小](#pdfの拡大縮小) | `+` と `-` でPDFの表示倍率を変更します。 |
 | [カーソル追従](cursor-follow.md) | 同じHerdrワークスペースのNeovimが開いているMarkdownファイルとカーソル行に追従します。 |
 | [Dracula風プリセット](#dracula風プリセット) | 暗い背景を使った配色に切り替えます。 |
 
 ## ファイル選択
 
 同梱の [files.lua](files.lua) はNORMALモードの `ff` で開きます。`fd` または `fdfind` が必要です。Markdownと、[表示に対応した環境](../docs/features/pdf.md)ではPDFも候補になります。文字入力で候補を絞り、`Ctrl-n` / `Ctrl-p` で選び、`Enter` で開きます。開けなければ候補を残し、`Esc` で閉じます。
+
+## PDFの拡大・縮小
+
+[pdf_zoom.lua](pdf_zoom.lua) を `init.lua` と同じディレクトリの `plugins/pdf_zoom.lua` にコピーし、`init.lua` に次を追加します。
+
+```lua
+require("plugins.pdf_zoom").setup()
+```
+
+NORMALモードで `+` を押すと表示中の倍率を1.25倍に、`-` を押すと0.8倍にします。PDF以外では何もしません。倍率は描画後に反映されるため、連打した回数分だけ変わるとは限りません。
 
 ## リンク一覧
 

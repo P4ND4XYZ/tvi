@@ -3,6 +3,7 @@ local suites = {
   "plugins.tests.files_test",
   "plugins.tests.dracula_test",
   "plugins.tests.follow_test",
+  "plugins.tests.pdf_zoom_test",
 }
 
 for _, name in ipairs(suites) do
