@@ -20,10 +20,13 @@ use crate::{
 
 mod colorscheme;
 mod config;
+mod document_handle;
 mod net;
 mod process;
 #[cfg(test)]
 mod tests;
+
+pub use document_handle::{DocumentInfo, DocumentKind};
 
 pub struct LuaLink {
     pub id: u64,
@@ -39,6 +42,7 @@ pub enum FileOpen {
 pub trait Host {
     fn current_view(&self) -> Result<u64, String>;
     fn notify(&self, message: &str);
+    fn document(&self, view: u64) -> Result<Option<DocumentInfo>, String>;
     fn document_path(&self, view: u64) -> Result<PathBuf, String>;
     fn project_root(&self, view: u64, markers: &[String]) -> Result<PathBuf, String>;
     fn links(&self, view: u64) -> Result<Vec<LuaLink>, String>;
@@ -48,6 +52,9 @@ pub trait Host {
         false
     }
     fn scroll_to_line(&self, view: u64, line: i64) -> Result<(), String>;
+    fn pdf_zoom(&self, view: u64) -> Result<f64, String>;
+    fn set_pdf_zoom(&self, view: u64, scale: f64) -> Result<(), String>;
+    fn pan_pdf_x(&self, view: u64, columns: i64) -> Result<(), String>;
     fn open_float(&self, view: u64, options: FloatOptions) -> Result<u64, String>;
     fn update_float(&self, view: u64, float: u64, options: FloatOptions) -> Result<(), String>;
     fn close_float(&self, view: u64, float: u64) -> Result<(), String>;
@@ -424,67 +431,8 @@ struct ViewHandle {
 
 impl UserData for ViewHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("path", |_, view, ()| {
-            let result = live_state(&view.state)?
-                .host
-                .document_path(view.id)
-                .and_then(|path| {
-                    path.into_os_string()
-                        .into_string()
-                        .map_err(|_| "document path is not valid UTF-8".into())
-                });
-            Ok(match result {
-                Ok(path) => (Some(path), None),
-                Err(error) => (None, Some(error)),
-            })
-        });
-        methods.add_method("project_root", |_, view, opts: Option<Table>| {
-            let markers = opts
-                .map(|opts| opts.get::<Option<Vec<String>>>("root_markers"))
-                .transpose()?
-                .flatten()
-                .unwrap_or_else(|| vec![".git".into()]);
-            let result = live_state(&view.state)?
-                .host
-                .project_root(view.id, &markers)
-                .and_then(|path| {
-                    path.into_os_string()
-                        .into_string()
-                        .map_err(|_| "project root is not valid UTF-8".into())
-                });
-            Ok(match result {
-                Ok(path) => (Some(path), None),
-                Err(error) => (None, Some(error)),
-            })
-        });
-        methods.add_method("links", |lua, view, ()| {
-            let links = live_state(&view.state)?
-                .host
-                .links(view.id)
-                .map_err(Error::runtime)?;
-            let list = lua.create_table_with_capacity(links.len(), 0)?;
-            for (index, link) in links.into_iter().enumerate() {
-                let candidate = lua.create_table()?;
-                candidate.set("id", link.id)?;
-                candidate.set("label", link.label)?;
-                candidate.set("target", link.target)?;
-                list.raw_set(index + 1, candidate)?;
-            }
-            Ok(list)
-        });
-        methods.add_method("resolve_link", |_, view, id: u64| {
-            let result = live_state(&view.state)?
-                .host
-                .resolve_link(view.id, id)
-                .and_then(|path| {
-                    path.into_os_string()
-                        .into_string()
-                        .map_err(|_| "link path is not valid UTF-8".into())
-                });
-            Ok(match result {
-                Ok(path) => (Some(path), None),
-                Err(error) => (None, Some(error)),
-            })
+        methods.add_method("document", |lua, view, ()| {
+            document_handle::for_view(lua, view)
         });
         methods.add_method("open_file", |lua, view, path: mlua::String| {
             let state = live_state(&view.state)?;
@@ -497,16 +445,6 @@ impl UserData for ViewHandle {
                 Ok(FileOpen::Pending) => (true, Value::Nil, true).into_lua_multi(lua),
                 Err(error) => (false, error).into_lua_multi(lua),
             }
-        });
-        methods.add_method("scroll_to_line", |_, view, line: Value| {
-            let state = live_state(&view.state)?;
-            let Value::Integer(line) = line else {
-                return Err(Error::runtime("scroll_to_line: line must be an integer"));
-            };
-            state
-                .host
-                .scroll_to_line(view.id, line)
-                .map_err(Error::runtime)
         });
         methods.add_method("open_float", |lua, view, opts: Table| {
             let state = live_state(&view.state)?;

@@ -1,15 +1,17 @@
 local links = require("plugins.links")
 
-local function open_picker(candidates)
-  local view, float = {}, {}
+local function open_picker(candidates, kind)
+  local view, doc, float = {}, {}, {}
   local picker = { current_view = view }
   local on_key
 
-  function view:links()
-    return candidates
+  function view:document() return picker.document or doc end
+  function doc:type() return kind or "md" end
+  if kind ~= "pdf" then
+    function doc:links() return candidates end
   end
 
-  function view:resolve_link(id)
+  function doc:resolve_link(id)
     if picker.resolve_error then
       return nil, picker.resolve_error
     end
@@ -56,6 +58,7 @@ local function opens_the_filtered_link_in_the_original_view()
     { id = 7, label = query, target = "cat.md" },
   })
   picker.current_view = {}
+  picker.document = {} -- Resolving the candidates must use the document that listed them.
   for _, point in utf8.codes(query) do
     local ch = utf8.char(point)
     picker:press(ch, ch)
@@ -102,4 +105,7 @@ return function()
   opens_the_filtered_link_in_the_original_view()
   leaves_the_picker_open_if_a_link_cannot_be_resolved()
   moves_selection_with_control_n_and_control_p()
+  local picker = open_picker(nil, "pdf")
+  picker:press("Enter")
+  assert(not picker.opened_file, "the picker must not query links on a PDF document")
 end

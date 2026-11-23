@@ -47,7 +47,8 @@ function M.start()
       return false
     end
     local view = tvi.ui.current_view()
-    if path ~= view:path() then
+    local doc = view:document()
+    if not doc or path ~= doc:path() then
       local extension = path:lower():match("%.([a-z]+)$")
       if extension ~= "md" and extension ~= "markdown" then
         return false
@@ -55,8 +56,13 @@ function M.start()
       if not view:open_file(path) then
         return false
       end
+      doc = view:document()
     end
-    view:scroll_to_line(line)
+    if not doc or doc:type() ~= "md" then
+      return false
+    end
+    ---@cast doc Tvi.MarkdownDocument
+    doc:scroll_to_line(line)
   end)
   if not handle then
     return fail("follow: " .. err)

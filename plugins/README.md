@@ -22,7 +22,7 @@ local links = require("plugins.links")
 tvi.keymap.set("normal", "gl", links.open, { desc = "リンク一覧を開く" })
 ```
 
-旧版の `plugins/links.lua` を設定ディレクトリにコピーしている場合は、[新しいファイル](links.lua)に差し替えてください。旧APIの `view:open_link(id)` は使えません。自作Luaでは `view:resolve_link(id)` で絶対パスを取得し、成功した場合に `view:open_file(path)` へ渡してください。
+旧版の `plugins/links.lua` を設定ディレクトリにコピーしている場合は、[新しいファイル](links.lua)に差し替えてください。自作Luaでは `view:document()` で [Markdownの文書ハンドル](../docs/features/lua.md#文書ハンドル)を取得し、そのハンドルでリンクを列挙・解決してから、得られた絶対パスを `view:open_file(path)` に渡してください。
 
 ### 操作
 

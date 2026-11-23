@@ -22,6 +22,17 @@ pub enum ImageMode {
     Kitty { cell_width: u16, cell_height: u16 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only Windows queries cell sizes")
+)]
+pub(crate) enum CellSizeStatus {
+    Ready,
+    Pending,
+    Unconfirmed,
+}
+
 impl ImageMode {
     fn label(self) -> &'static str {
         match self {
@@ -260,6 +271,15 @@ impl Input {
         }
     }
 
+    /// Unlike `image_mode()`, this cannot treat a cached size as confirmed after a resize.
+    pub(crate) fn pdf_restore_cell_size(&mut self) -> CellSizeStatus {
+        #[cfg(windows)]
+        if let Some(console) = &mut self.console {
+            return console.pdf_restore_cell_size();
+        }
+        CellSizeStatus::Ready // The geometry check reports unsupported Kitty/platform.
+    }
+
     pub fn poll_key(&mut self) -> io::Result<Option<KeyEvent>> {
         self.poll_key_for(Duration::from_millis(100))
     }
@@ -337,7 +357,9 @@ mod windows {
         },
     };
 
-    use super::{Duration, ImageMode, IsTerminal, KeyEvent, Write, io, next_image_id};
+    use super::{
+        CellSizeStatus, Duration, ImageMode, IsTerminal, KeyEvent, Write, io, next_image_id,
+    };
 
     const CELL_QUERY: &str = "\x1b[16t";
     const PROBE_BUDGET: Duration = Duration::from_millis(160);
@@ -355,6 +377,7 @@ mod windows {
         resize_reply: Option<Instant>,
         last_resize_query: Option<Instant>,
         resize_pending: bool,
+        resize_unconfirmed: bool,
         parser: VtInput,
         keys: VecDeque<KeyEvent>,
     }
@@ -420,6 +443,7 @@ mod windows {
                 resize_reply: None,
                 last_resize_query: None,
                 resize_pending: false,
+                resize_unconfirmed: false,
                 parser: VtInput::default(),
                 keys: VecDeque::new(),
             };
@@ -450,7 +474,28 @@ mod windows {
         }
 
         pub(super) fn refresh_cell_size(&mut self) {
-            self.resize_pending = self.image_mode().is_some();
+            if self.image_mode().is_some() {
+                self.resize_pending = true;
+                self.resize_unconfirmed = true;
+            }
+        }
+
+        pub(super) fn pdf_restore_cell_size(&mut self) -> CellSizeStatus {
+            let now = Instant::now();
+            // A replayed key bypasses the console pump. Do not postpone a due
+            // query (and therefore its deadline) while processing replayed input.
+            self.send_resize_if_due(now);
+            self.cell_size_status(now)
+        }
+
+        fn cell_size_status(&self, now: Instant) -> CellSizeStatus {
+            if self.image_mode().is_none() || !self.resize_unconfirmed {
+                CellSizeStatus::Ready
+            } else if self.resize_pending || self.resize_reply.is_some_and(|end| now < end) {
+                CellSizeStatus::Pending
+            } else {
+                CellSizeStatus::Unconfirmed
+            }
         }
 
         fn send_resize_if_due(&mut self, now: Instant) {
@@ -461,16 +506,14 @@ mod windows {
             {
                 self.resize_pending = false;
                 self.last_resize_query = Some(now);
-                if super::check(
+                self.resize_reply = super::check(
                     send(format_args!("{CELL_QUERY}")),
                     "query_cell_size",
                     self.image_mode(),
                     "fallback",
                 )
                 .is_ok()
-                {
-                    self.resize_reply = Some(now + PROBE_BUDGET);
-                }
+                .then_some(now + PROBE_BUDGET);
             }
         }
 
@@ -545,6 +588,9 @@ mod windows {
                         || self.resize_reply.take().is_some_and(|end| now < end) =>
                 {
                     self.cells = Some((w, h));
+                    // A reply for an earlier size does not satisfy a newer resize
+                    // that is still waiting to send its own query.
+                    self.resize_unconfirmed = self.resize_pending;
                 }
                 _ => {}
             }
@@ -890,6 +936,7 @@ mod windows {
                 resize_reply: None,
                 last_resize_query: None,
                 resize_pending: false,
+                resize_unconfirmed: false,
                 parser: VtInput::default(),
                 keys: VecDeque::new(),
             });
@@ -912,6 +959,53 @@ mod windows {
             assert_eq!(console.cells, Some((8, 16)));
             console.resize_reply = Some(end + PROBE_BUDGET);
             console.accept_reply(Reply::Cell(12, 24), end);
+            assert_eq!(console.cells, Some((12, 24)));
+        }
+
+        #[test]
+        fn restore_requires_a_timely_cell_reply_for_the_latest_observed_resize() {
+            let now = Instant::now();
+            let end = now + PROBE_BUDGET;
+            let mut console = std::mem::ManuallyDrop::new(ConsoleInput {
+                input: std::ptr::null_mut(),
+                original_input_mode: 0,
+                output: std::ptr::null_mut(),
+                original_output_mode: 0,
+                query_id: 31,
+                startup: None,
+                kitty_ok: true,
+                cells: Some((8, 16)),
+                resize_reply: None,
+                last_resize_query: None,
+                resize_pending: false,
+                resize_unconfirmed: false,
+                parser: VtInput::default(),
+                keys: VecDeque::new(),
+            });
+            let start = |c: &mut ConsoleInput, at| {
+                c.resize_pending = false; // substitute only writing the query to the terminal
+                c.resize_reply = Some(at + PROBE_BUDGET);
+            };
+
+            assert_eq!(console.cell_size_status(now), CellSizeStatus::Ready);
+            console.refresh_cell_size();
+            assert_eq!(console.cell_size_status(now), CellSizeStatus::Pending);
+            start(&mut console, now);
+            assert_eq!(console.cell_size_status(now), CellSizeStatus::Pending);
+            assert_eq!(console.cell_size_status(end), CellSizeStatus::Unconfirmed);
+            console.accept_reply(Reply::Cell(12, 24), end); // too late
+            assert_eq!(console.cell_size_status(end), CellSizeStatus::Unconfirmed);
+            assert_eq!(console.cells, Some((8, 16))); // existing display fallback
+
+            console.refresh_cell_size();
+            start(&mut console, end);
+            console.refresh_cell_size(); // another resize before the older reply
+            console.accept_reply(Reply::Cell(12, 24), end);
+            assert_eq!(console.cell_size_status(end), CellSizeStatus::Pending);
+            start(&mut console, end);
+            // Even an unchanged size can now be confirmed.
+            console.accept_reply(Reply::Cell(12, 24), end);
+            assert_eq!(console.cell_size_status(end), CellSizeStatus::Ready);
             assert_eq!(console.cells, Some((12, 24)));
         }
 

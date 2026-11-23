@@ -4,15 +4,24 @@ local function with_follow(run)
   local env = { HERDR_WORKSPACE_ID = "work-資料" }
   local state = { path = "/docs/Current.md", calls = 0, closed = 0, opened = {}, scrolls = {} }
   local view = {}
-  function view:path() return state.path end
+  function view:document()
+    local path, kind = state.path, state.kind or "md"
+    local doc = {}
+    function doc:path() return path end
+    function doc:type() return kind end
+    if kind == "md" then
+      function doc:scroll_to_line(line)
+        assert(path == state.path, "follow must use the newly displayed document")
+        state.scrolls[#state.scrolls + 1] = { path = path, line = line }
+      end
+    end
+    return doc
+  end
   function view:open_file(path)
     state.opened[#state.opened + 1] = path
     if state.open_error then return false, state.open_error end
-    state.path = path
+    state.path, state.kind = path, "md"
     return true
-  end
-  function view:scroll_to_line(line)
-    state.scrolls[#state.scrolls + 1] = { path = state.path, line = line }
   end
   ---@diagnostic disable-next-line: missing-fields
   _G.tvi = {
@@ -108,4 +117,12 @@ return function()
   with_follow(ignores_invalid_frames_and_non_markdown_switches)
   with_follow(switches_documents_before_scrolling)
   with_follow(does_not_scroll_when_open_file_fails)
+  with_follow(function(state)
+    assert(follow.start())
+    state.path, state.kind = "/docs/Current.pdf", "pdf"
+    assert(state.on_line("work-資料\t12\t/docs/Current.pdf") == false)
+    assert(#state.opened == 0 and #state.scrolls == 0)
+    state.on_line("work-資料\t15\t/docs/Other.md")
+    assert(state.scrolls[1].path == "/docs/Other.md" and state.scrolls[1].line == 15)
+  end)
 end

@@ -261,7 +261,11 @@ enum ReloadError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Action, Direction, ViewAnchor};
+    use crate::{
+        app::{Action, Direction, ViewAnchor},
+        lua::Runtime,
+    };
+    use std::{cell::RefCell, rc::Rc};
     use std::{error::Error, thread};
 
     fn wait_until(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
@@ -318,6 +322,44 @@ mod tests {
         fs::write(dir.path().join("other.md"), "unrelated")?;
         assert!(!wait_until(DEBOUNCE * 3, || watch.changed()));
         assert!(!watch.failed());
+        Ok(())
+    }
+
+    #[test]
+    fn reload_keeps_lua_document_active_but_does_not_retarget_link_ids()
+    -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("source.md");
+        fs::write(&path, "[Old](old.md)")?;
+        let session = Rc::new(RefCell::new(Session::new(super::super::read_document(
+            &path,
+        )?)));
+        let init = dir.path().join("init.lua");
+        fs::write(
+            &init,
+            r#"
+            local doc = tvi.ui.current_view():document()
+            local path = assert(doc:path())
+            local old = doc:links()[1].id
+            assert(doc:resolve_link(old):find("old.md", 1, true))
+            tvi.keymap.set("normal", "<F2>", function()
+                assert(doc:type() == "md" and doc:path() == path)
+                local target, err = doc:resolve_link(old)
+                assert(target == nil and err)
+                local links = doc:links()
+                assert(#links == 1 and links[1].label == "New")
+                assert(doc:resolve_link(links[1].id):find("new.md", 1, true))
+                doc:scroll_to_line(1)
+            end)
+            "#,
+        )?;
+        let (runtime, diagnostic) = Runtime::load_from(session.clone(), Some(init));
+        assert_eq!(diagnostic, None);
+        fs::write(path, "[New](new.md)")?;
+        Reload::default()
+            .read(&mut session.borrow_mut())
+            .map_err(|_| io::Error::other("reload failed"))?;
+        runtime.run_mapping(1)?;
         Ok(())
     }
 

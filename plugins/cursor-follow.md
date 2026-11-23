@@ -6,7 +6,7 @@
 
 ## 利用方法
 
-1. [plugins/follow.lua](follow.lua) を、tviの [`init.lua`](../docs/features/lua.md#起動時の設定) と同じディレクトリの `plugins/follow.lua` にコピーします。
+1. [plugins/follow.lua](follow.lua) を、tviの [`init.lua`](../docs/features/lua.md#起動時の設定) と同じディレクトリの `plugins/follow.lua` にコピーします。旧版をコピー済みの場合は、新版を同じ場所にコピーし直してください。
 2. tviの `init.lua` で次のように受信を開始し、対象文書を開きます。
 3. 対応する送信側の設定があるNeovimで、同じワークスペース内のMarkdownファイルを開きます。送信は起動時に有効になります。停止は `:TviFollow off`、再開は `:TviFollow on` です。
 

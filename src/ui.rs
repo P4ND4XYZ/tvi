@@ -72,7 +72,11 @@ pub fn draw(
         );
         highlight(frame, app, body, layout, scheme);
         if !float_active {
-            layout.draw_images(frame, body, app.top_row());
+            if let Some(pdf) = app.document().as_pdf() {
+                layout.draw_images_at(frame, body, app.top_row(), pdf.center_x());
+            } else {
+                layout.draw_images(frame, body, app.top_row());
+            }
         }
     }
     let status = Rect::new(area.x, body.bottom(), area.width, 1);

@@ -5,11 +5,31 @@ use super::super::{Motion, PdfSearch, ScrollEdge, ViewAnchor, ViewRows, Viewport
 pub(crate) struct PdfDocument {
     page: Page,
     search: Option<PdfSearch>,
+    scale: f64,
+    center_x: f64,
 }
 
 impl PdfDocument {
     pub(super) fn new(page: Page) -> Self {
-        Self { page, search: None }
+        Self {
+            page,
+            search: None,
+            scale: 1.0,
+            center_x: 0.5,
+        }
+    }
+
+    pub(crate) fn scale(&self) -> f64 {
+        self.scale
+    }
+
+    pub(crate) fn center_x(&self) -> f64 {
+        self.center_x
+    }
+
+    pub(super) fn set_view(&mut self, scale: f64, center_x: f64) {
+        self.scale = scale;
+        self.center_x = center_x;
     }
 
     pub(crate) fn page(&self) -> &Page {

@@ -7,9 +7,19 @@ use super::*;
 #[derive(Default)]
 struct TestHost {
     view: Cell<u64>,
+    closed: Cell<bool>,
+    document: Cell<Option<DocumentInfo>>,
     floats: RefCell<Floats>,
     opened_files: RefCell<Vec<(u64, PathBuf)>>,
     source_lines: RefCell<Vec<i64>>,
+    zooms: RefCell<Vec<f64>>,
+    horizontal_moves: RefCell<Vec<i64>>,
+}
+
+impl TestHost {
+    fn shows(&self, kind: DocumentKind) {
+        self.document.set(Some(DocumentInfo { epoch: 1, kind }));
+    }
 }
 
 impl Host for TestHost {
@@ -19,12 +29,19 @@ impl Host for TestHost {
 
     fn notify(&self, _message: &str) {}
 
+    fn document(&self, view: u64) -> Result<Option<DocumentInfo>, String> {
+        if view != 0 || self.closed.get() {
+            return Err("view is closed".into());
+        }
+        Ok(self.document.get())
+    }
+
     fn document_path(&self, _view: u64) -> Result<PathBuf, String> {
-        Err("no document".into())
+        Ok(std::env::temp_dir().join("displayed"))
     }
 
     fn project_root(&self, _view: u64, _markers: &[String]) -> Result<PathBuf, String> {
-        Err("no document".into())
+        Ok(std::env::temp_dir())
     }
 
     fn links(&self, _view: u64) -> Result<Vec<LuaLink>, String> {
@@ -48,6 +65,20 @@ impl Host for TestHost {
             return Err("view is closed".into());
         }
         self.source_lines.borrow_mut().push(line);
+        Ok(())
+    }
+
+    fn pdf_zoom(&self, _view: u64) -> Result<f64, String> {
+        Ok(1.0)
+    }
+
+    fn set_pdf_zoom(&self, _view: u64, scale: f64) -> Result<(), String> {
+        self.zooms.borrow_mut().push(scale);
+        Ok(())
+    }
+
+    fn pan_pdf_x(&self, _view: u64, columns: i64) -> Result<(), String> {
+        self.horizontal_moves.borrow_mut().push(columns);
         Ok(())
     }
 
@@ -172,35 +203,135 @@ fn local_listener_stops_callbacks_in_the_same_poll_after_close()
 #[test]
 fn scroll_to_line_accepts_only_lua_integers_and_returns_nothing() -> mlua::Result<()> {
     let host = Rc::new(TestHost::default());
+    host.shows(DocumentKind::Markdown);
     let runtime = Runtime::new(host.clone());
     runtime.install_api()?;
     runtime.lua.load(r##"
-        local view = tvi.ui.current_view()
+        doc = tvi.ui.current_view():document()
         for _, line in ipairs({ "120", 120.0, 120.5, {}, true, function() end }) do
-            local ok, err = pcall(view.scroll_to_line, view, line)
+            local ok, err = pcall(doc.scroll_to_line, doc, line)
             assert(not ok and tostring(err):find("scroll_to_line: line must be an integer", 1, true))
         end
         for _, args in ipairs({table.pack(), table.pack(nil)}) do
-            local ok, err = pcall(view.scroll_to_line, view, table.unpack(args, 1, args.n))
+            local ok, err = pcall(doc.scroll_to_line, doc, table.unpack(args, 1, args.n))
             assert(not ok and tostring(err):find("scroll_to_line: line must be an integer", 1, true))
         end
         for _, line in ipairs({0, math.mininteger, math.maxinteger}) do
-            assert(select("#", view:scroll_to_line(line)) == 0)
+            assert(select("#", doc:scroll_to_line(line)) == 0)
         end
     "##).exec()?;
     assert_eq!(*host.source_lines.borrow(), [0, i64::MIN, i64::MAX]);
 
-    host.view.set(1);
+    host.closed.set(true);
     runtime
         .lua
         .load(
             r#"
-        local ok, err = pcall(function() tvi.ui.current_view():scroll_to_line(1) end)
+        local ok, err = pcall(doc.scroll_to_line, doc, 1)
         assert(not ok and tostring(err):find("view is closed", 1, true))
+        local path, path_err = doc:path()
+        assert(path == nil and path_err == "view is closed")
+        assert(not pcall(function() return tvi.ui.current_view():document() end))
     "#,
         )
         .exec()?;
     assert_eq!(host.source_lines.borrow().len(), 3);
+    Ok(())
+}
+
+#[test]
+fn view_returns_only_the_displayed_formats_document_methods() -> mlua::Result<()> {
+    let host = Rc::new(TestHost::default());
+    let runtime = Runtime::new(host.clone());
+    runtime.install_api()?;
+    runtime.lua.load(r##"
+        view = tvi.ui.current_view()
+        assert(type(view.open_file) == "function" and type(view.open_float) == "function")
+        for _, name in ipairs({"path", "project_root", "links", "resolve_link", "scroll_to_line", "zoom", "set_zoom", "pan_x"}) do
+            assert(view[name] == nil, name)
+        end
+        local doc = view:document()
+        assert(doc == nil and select("#", view:document()) == 1)
+    "##).exec()?;
+
+    host.shows(DocumentKind::Markdown);
+    runtime
+        .lua
+        .load(
+            r##"
+        md = view:document()
+        assert(type(md) == "userdata" and md:type() == "md")
+        assert(select("#", view:document()) == 1)
+        assert(md:path() and md:project_root() and #md:links() == 0 and md:resolve_link(1))
+        assert(md.zoom == nil and md.set_zoom == nil and md.pan_x == nil)
+    "##,
+        )
+        .exec()?;
+
+    host.shows(DocumentKind::Pdf);
+    runtime
+        .lua
+        .load(
+            r##"
+        local pdf = view:document()
+        assert(type(pdf) == "userdata" and pdf:type() == "pdf")
+        assert(pdf:path() and pdf:project_root())
+        assert(pdf.links == nil and pdf.resolve_link == nil and pdf.scroll_to_line == nil)
+    "##,
+        )
+        .exec()?;
+    Ok(())
+}
+
+#[test]
+fn pdf_zoom_and_pan_validate_lua_values_and_reject_expired_handles() -> mlua::Result<()> {
+    let host = Rc::new(TestHost::default());
+    host.shows(DocumentKind::Pdf);
+    let runtime = Runtime::new(host.clone());
+    runtime.install_api()?;
+    runtime
+        .lua
+        .load(
+            r"
+        doc = tvi.ui.current_view():document()
+        assert(doc:zoom() == 1.0)
+        for _, invalid in ipairs({0, -1, 1/0, -1/0, 0/0, '2.0', true, {}}) do
+            local ok, err = doc:set_zoom(invalid)
+            assert(ok == false and type(err) == 'string')
+        end
+        local ok, err = doc:set_zoom()
+        assert(ok == false and type(err) == 'string')
+        for _, scale in ipairs({2, 0.625, 1.0}) do
+            local result = table.pack(doc:set_zoom(scale))
+            assert(result.n == 2 and result[1] == true and result[2] == nil)
+        end
+        for _, invalid in ipairs({1.0, 1.5, '2', true, {}}) do
+            assert(not pcall(doc.pan_x, doc, invalid))
+        end
+        assert(not pcall(doc.pan_x, doc))
+        for _, columns in ipairs({0, math.mininteger, math.maxinteger}) do
+            assert(select('#', doc:pan_x(columns)) == 0)
+        end
+    ",
+        )
+        .exec()?;
+
+    for kind in [DocumentKind::Pdf, DocumentKind::Markdown] {
+        host.document.set(Some(DocumentInfo { epoch: 2, kind }));
+        runtime
+            .lua
+            .load(
+                r"
+            assert(not pcall(doc.zoom, doc))
+            local ok, err = doc:set_zoom(1.5)
+            assert(ok == false and err == 'document is no longer displayed')
+            assert(not pcall(doc.pan_x, doc, 1))
+        ",
+            )
+            .exec()?;
+    }
+    assert_eq!(*host.zooms.borrow(), [2.0, 0.625, 1.0]);
+    assert_eq!(*host.horizontal_moves.borrow(), [0, i64::MIN, i64::MAX]);
     Ok(())
 }
 
@@ -320,7 +451,7 @@ fn config_relative_module_can_register_a_mapping_that_uses_a_captured_view()
         r#"
         local view = tvi.ui.current_view()
         return function()
-            local path = assert(view:resolve_link(1))
+            local path = assert(view:document():resolve_link(1))
             assert(view:open_file(path))
         end
         "#,
@@ -332,6 +463,7 @@ fn config_relative_module_can_register_a_mapping_that_uses_a_captured_view()
         "#,
     )?;
     let host = Rc::new(TestHost::default());
+    host.shows(DocumentKind::Markdown);
     let (runtime, diagnostic) = Runtime::load_from(host.clone(), Some(init));
     assert_eq!(diagnostic, None);
     host.view.set(17);

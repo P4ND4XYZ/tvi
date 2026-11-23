@@ -9,15 +9,16 @@ use std::{
 };
 
 use crossterm::event::{KeyEvent, KeyEventKind};
+use ratatui::layout::Size;
 
 use crate::{
     app::{Action, App, Document, Mode, ViewRows},
     files,
     logging::{self, Level},
-    lua::{FileOpen, Host, LuaLink, Runtime},
+    lua::{DocumentInfo, DocumentKind, FileOpen, Host, LuaLink, Runtime},
     markdown::{MarkdownRenderer, tui_markdown::TuiMarkdown},
     pdf::{self as pdf_format, Failure as PdfFailure},
-    terminal::{self, ImageMode, Screen},
+    terminal::{self, CellSizeStatus, ImageMode, Screen},
     ui::{
         self,
         float::{FloatOptions, Floats},
@@ -120,6 +121,9 @@ impl Session {
                 }
                 _ => {}
             }
+        }
+        if action == Action::JumpBack && self.body_uninterrupted() && self.pdf.restore(&self.app) {
+            return;
         }
         if let Action::Move(motion) = action
             && self.pdf.move_pdf(&mut self.app, motion, self.pdf_geometry)
@@ -328,6 +332,21 @@ impl Host for RefCell<Session> {
             .set_notice(message.replace(char::is_control, "�"));
     }
 
+    fn document(&self, view: u64) -> Result<Option<DocumentInfo>, String> {
+        validate_view(view)?;
+        let session = self.borrow();
+        let app = &session.app;
+        let kind = if app.document().as_pdf().is_some() {
+            DocumentKind::Pdf
+        } else {
+            DocumentKind::Markdown
+        };
+        Ok(Some(DocumentInfo {
+            epoch: app.display_epoch(),
+            kind,
+        }))
+    }
+
     fn document_path(&self, view: u64) -> Result<PathBuf, String> {
         validate_view(view)?;
         let session = self.borrow();
@@ -399,6 +418,39 @@ impl Host for RefCell<Session> {
 
     fn supports_pdf(&self) -> bool {
         self.borrow().pdf_geometry.is_ok()
+    }
+
+    fn pdf_zoom(&self, view: u64) -> Result<f64, String> {
+        validate_view(view)?;
+        let session = self.borrow();
+        session
+            .app
+            .document()
+            .as_pdf()
+            .map(crate::app::PdfDocument::scale)
+            .ok_or_else(|| "no PDF document is displayed".into())
+    }
+
+    fn set_pdf_zoom(&self, view: u64, scale: f64) -> Result<(), String> {
+        validate_view(view)?;
+        let Session {
+            app,
+            pdf,
+            pdf_geometry,
+            ..
+        } = &mut *self.borrow_mut();
+        pdf.set_zoom(app, *pdf_geometry, scale)
+    }
+
+    fn pan_pdf_x(&self, view: u64, columns: i64) -> Result<(), String> {
+        validate_view(view)?;
+        let Session {
+            app,
+            pdf,
+            pdf_geometry,
+            ..
+        } = &mut *self.borrow_mut();
+        pdf.pan_x(app, *pdf_geometry, columns)
     }
 
     fn open_file(&self, view: u64, path: &Path) -> Result<FileOpen, String> {
@@ -536,6 +588,7 @@ fn run_app(
 
     let mut keys = InputQueue::default();
     let mut reload = watch::Reload::default();
+    let mut previous_size = size;
     while !session.borrow().app.should_quit() {
         let now = Instant::now();
         reload.poll(&mut session.borrow_mut(), now, keys.busy(now));
@@ -546,6 +599,7 @@ fn run_app(
             &runtime,
             &mut keys,
             &mut reload,
+            &mut previous_size,
         )?;
     }
     Ok(())
@@ -558,6 +612,7 @@ fn run_document(
     runtime: &Runtime,
     keys: &mut InputQueue,
     reload: &mut watch::Reload,
+    previous_size: &mut Size,
 ) -> io::Result<()> {
     let mut image_mode = terminal_input.image_mode();
     let mut width = terminal::check(screen.size(), "size", Some(image_mode), "exit")?.width;
@@ -582,21 +637,15 @@ fn run_document(
     let mut pdf_layout: Option<pdf::PlacedPage> = None;
     let blank = Layout::empty_pdf();
     let search_text = prepared.as_ref().map_or("", |md| md.document.search_text());
-    let mut previous_size = None;
     let result = (|| loop {
         let size = terminal::check(screen.size(), "size", Some(image_mode), "exit")?;
-        if previous_size
-            .replace(size)
-            .is_some_and(|previous| previous != size)
-        {
-            terminal_input.refresh_cell_size();
-        }
+        observe_terminal_size(terminal_input, previous_size, size);
         let mode = terminal_input.image_mode();
-        let mut drawn_size = (0, 0);
+        let mut drawn_size = Size::default();
         let mut more_tiles = false;
         draw_frame(screen, mode, |frame, retired| {
             let area = frame.area();
-            drawn_size = (area.width, area.height);
+            drawn_size = area.as_size();
             if width != area.width || image_mode != mode {
                 width = area.width;
                 image_mode = mode;
@@ -621,8 +670,15 @@ fn run_document(
                 && layout.pdf_transfer_pending(
                     ui::body_area(area, session.app.mode()),
                     session.app.top_row(),
+                    session
+                        .app
+                        .document()
+                        .as_pdf()
+                        .map_or(0.5, crate::app::PdfDocument::center_x),
                 );
         })?;
+        // The frame may autoresize after the size read at the top of the loop.
+        observe_terminal_size(terminal_input, previous_size, drawn_size);
         let layout = markdown_layout
             .as_ref()
             .or(pdf_layout
@@ -640,7 +696,15 @@ fn run_document(
                 },
                 |key| Ok(Some(key)),
             )?;
-            if prepared.is_none() && frame_stale(screen, terminal_input, drawn_size, image_mode)? {
+            if prepared.is_none()
+                && frame_stale(
+                    screen,
+                    terminal_input,
+                    previous_size,
+                    drawn_size,
+                    image_mode,
+                )?
+            {
                 if let Some(key) = key {
                     keys.replay.push_front(key);
                 }
@@ -657,8 +721,21 @@ fn run_document(
             }
             // A resize can occur during dispatch (including a Lua callback). Check
             // again before publishing any asynchronous completion.
-            let resized = frame_stale(screen, terminal_input, drawn_size, image_mode)?;
-            let pdf_redraw = !resized && poll_pdf(session, runtime);
+            let resized = frame_stale(
+                screen,
+                terminal_input,
+                previous_size,
+                drawn_size,
+                image_mode,
+            )?;
+            let pdf_redraw = !resized && {
+                let cell_size = if session.borrow().pdf.restore_pending() {
+                    terminal_input.pdf_restore_cell_size()
+                } else {
+                    CellSizeStatus::Ready
+                };
+                poll_pdf_with_cell_size(session, runtime, cell_size)
+            };
             let reload_redraw = reload.poll(&mut session.borrow_mut(), now, keys.busy(now));
             if session.borrow().app.document_id() != document_id {
                 return Ok(());
@@ -683,14 +760,22 @@ fn run_document(
     ))
 }
 
+fn observe_terminal_size(input: &mut terminal::Input, previous_size: &mut Size, size: Size) {
+    if std::mem::replace(previous_size, size) != size {
+        input.refresh_cell_size();
+    }
+}
+
 fn frame_stale(
     screen: &Screen,
-    input: &terminal::Input,
-    drawn_size: (u16, u16),
+    input: &mut terminal::Input,
+    previous_size: &mut Size,
+    drawn_size: Size,
     drawn_mode: ImageMode,
 ) -> io::Result<bool> {
     let size = terminal::check(screen.size(), "size", Some(input.image_mode()), "exit")?;
-    Ok((size.width, size.height) != drawn_size || input.image_mode() != drawn_mode)
+    observe_terminal_size(input, previous_size, size);
+    Ok(size != drawn_size || input.image_mode() != drawn_mode)
 }
 
 fn draw_frame(
@@ -713,7 +798,16 @@ fn draw_frame(
     ))
 }
 
+#[cfg(test)]
 fn poll_pdf(session: &RefCell<Session>, runtime: &Runtime) -> bool {
+    poll_pdf_with_cell_size(session, runtime, CellSizeStatus::Ready)
+}
+
+fn poll_pdf_with_cell_size(
+    session: &RefCell<Session>,
+    runtime: &Runtime,
+    cell_size: CellSizeStatus,
+) -> bool {
     let update = {
         let mut state = session.borrow_mut();
         let Session {
@@ -726,7 +820,7 @@ fn poll_pdf(session: &RefCell<Session>, runtime: &Runtime) -> bool {
             ..
         } = &mut *state;
         let id = app.document_id();
-        let update = pdf.poll(app, floats, *pdf_geometry);
+        let update = pdf.poll(app, floats, *pdf_geometry, cell_size);
         if app.document_id() != id {
             // Markdown history must re-read images even if a PDF was the only intervening view.
             *prepared = None;
@@ -888,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn lua_view_path_preserves_relative_startup_spelling_and_tracks_document_switches()
+    fn lua_document_path_preserves_relative_startup_spelling_and_tracks_document_switches()
     -> Result<(), Box<dyn Error>> {
         let scratch = Scratch::new()?;
         let next = scratch.0.join("next.md");
@@ -898,7 +992,9 @@ mod tests {
         let init = scratch.init(
             r#"
             local view = tvi.ui.current_view()
-            tvi.keymap.set('normal', '<F2>', function() tvi.ui.notify(assert(view:path())) end)
+            tvi.keymap.set('normal', '<F2>', function()
+                tvi.ui.notify(assert(view:document():path()))
+            end)
         "#,
         )?;
         let session = Rc::new(RefCell::new(Session::new(read_document(relative)?)));
@@ -922,6 +1018,60 @@ mod tests {
         session.borrow_mut().app.apply(Action::JumpBack, &[], "");
         assert!(show_path());
         assert_eq!(session.borrow().app.notice(), absolute.to_str());
+        Ok(())
+    }
+
+    #[test]
+    fn lua_document_handle_does_not_revive_on_history_restore_or_reopen()
+    -> Result<(), Box<dyn Error>> {
+        let scratch = Scratch::new()?;
+        let source = scratch.0.join("first.md");
+        let second = scratch.0.join("second.md");
+        fs::write(&source, "[Next](second.md)")?;
+        fs::write(&second, "")?;
+        let init = scratch.init(
+            r#"
+            local view = tvi.ui.current_view()
+            local original = view:document()
+            local source = assert(original:path())
+            local link = original:links()[1].id
+
+            local function assert_stale(doc)
+                for _, result in ipairs({
+                    table.pack(doc:path()),
+                    table.pack(doc:project_root()),
+                    table.pack(doc:resolve_link(link)),
+                }) do
+                    assert(result[1] == nil and result[2] == "document is no longer displayed")
+                end
+                for _, method in ipairs({doc.type, doc.links, doc.scroll_to_line}) do
+                    local ok, err = pcall(method, doc, 1)
+                    assert(not ok and tostring(err):find("document is no longer displayed", 1, true))
+                end
+            end
+
+            tvi.keymap.set("normal", "<F2>", function()
+                assert_stale(original)
+                assert(view:document():path())
+            end)
+            tvi.keymap.set("normal", "<F3>", function()
+                local restored = view:document()
+                assert(restored:path() == source)
+                assert(restored:resolve_link(restored:links()[1].id))
+                assert(view:open_file(source))
+                assert_stale(restored)
+                assert(view:document():path() == source)
+            end)
+        "#,
+        )?;
+        let session = Rc::new(RefCell::new(Session::new(read_document(&source)?)));
+        let (runtime, diagnostic) = Runtime::load_from(session.clone(), Some(init));
+        assert_eq!(diagnostic, None);
+        session.open_file(BODY_VIEW, &second)?;
+        runtime.run_mapping(1)?;
+        session.borrow_mut().app.apply(Action::JumpBack, &[], "");
+        runtime.run_mapping(1)?;
+        runtime.run_mapping(2)?;
         Ok(())
     }
 
@@ -1028,27 +1178,29 @@ mod tests {
         let init = scratch.init(
             r#"
             local view = tvi.ui.current_view()
-            local root = assert(view:project_root({ root_markers = {} }))
+            local root = assert(view:document():project_root({ root_markers = {} }))
             local sep = root:find("\\", 1, true) and "\\" or "/"
             tvi.keymap.set("normal", "<F2>", function()
                 assert(view:open_file(root .. sep .. "next.md"))
-                view:scroll_to_line(math.mininteger)
-                view:scroll_to_line(21)
-                assert(not pcall(view.scroll_to_line, view, "5"))
+                local doc = view:document()
+                doc:scroll_to_line(math.mininteger)
+                doc:scroll_to_line(21)
+                assert(not pcall(doc.scroll_to_line, doc, "5"))
             end)
             tvi.keymap.set("normal", "<F3>", function()
-                assert(not pcall(view.scroll_to_line, view, 2.0))
+                local doc = view:document()
+                assert(not pcall(doc.scroll_to_line, doc, 2.0))
                 view:open_float({
                     lines = {"body scroll test"},
                     on_key = function(_, key)
-                        view:scroll_to_line(key.text == "b" and math.maxinteger or math.mininteger)
+                        doc:scroll_to_line(key.text == "b" and math.maxinteger or math.mininteger)
                     end,
                 })
             end)
             tvi.keymap.set("normal", "<F4>", function()
-                view:scroll_to_line(21)
+                view:document():scroll_to_line(21)
                 assert(view:open_file(root .. sep .. "empty.md"))
-                view:scroll_to_line(500)
+                view:document():scroll_to_line(500)
                 assert(view:open_file(root .. sep .. "later.md"))
             end)
         "#,
@@ -1221,9 +1373,10 @@ mod tests {
         let init = scratch.init(
             r#"
             local view = tvi.ui.current_view()
-            local root, err = view:project_root({ root_markers = {} })
+            local doc = view:document()
+            local root, err = doc:project_root({ root_markers = {} })
             assert(root and err == nil)
-            local invalid, reason = view:project_root({ root_markers = { "../bad" } })
+            local invalid, reason = doc:project_root({ root_markers = { "../bad" } })
             assert(invalid == nil and reason)
             tvi.keymap.set("normal", "ff", function()
                 tvi.ui.notify("sample notice")
@@ -1415,11 +1568,12 @@ mod tests {
         let init = scratch.init(
             r#"
 local view = tvi.ui.current_view()
-local id = view:links()[1].id
-local target = assert(view:resolve_link(id))
+local doc = view:document()
+local id = doc:links()[1].id
+local target = assert(doc:resolve_link(id))
 assert(view:open_file(target))
-local path, err = view:resolve_link(id)
-assert(path == nil and err:find("current document", 1, true))
+local path, err = doc:resolve_link(id)
+assert(path == nil and err == "document is no longer displayed")
 error("startup failed")
 "#,
         )?;

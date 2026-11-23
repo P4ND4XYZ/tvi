@@ -87,6 +87,46 @@ fn ink_bounds(image: &RgbaImage) -> [Option<Ink>; 3] {
 }
 
 #[test]
+fn zoom_and_horizontal_pan_clip_pixels_and_search_marks_at_both_edges() -> Result<(), Box<dyn Error>>
+{
+    let (mut view, _dir) = View::open()?;
+    let first = view.sync()?;
+    let upper = hit(1, 54., 838., 960.);
+    view.query(&first, '/', TERM)?;
+    view.expect_hit(&upper, 0, 1)?;
+
+    view.session.set_pdf_zoom(BODY_VIEW, 2.0)?;
+    let zoomed = view.sync()?;
+    assert_eq!(zoomed.rows().len(), 128);
+    assert_eq!(view.session.borrow().app.search_selection(), Some((1, 3)));
+    let native = view.native_page()?;
+    let top_before = view.session.borrow().app.top_row();
+    for (pan, left) in [
+        (0, 128),
+        (i64::MIN, 0),
+        (1, 8),
+        (i64::MAX, 256),
+        (1, 256),
+        (i64::MIN, 0),
+    ] {
+        view.session.pan_pdf_x(BODY_VIEW, pan)?;
+        let (clip, top) = view.clip_after_transfer(&zoomed)?;
+        assert_eq!(top, top_before);
+        verify_ink(&clip, &native, 128, top, &upper, 0, (512, left))?;
+    }
+
+    // The next selected match is partly outside the leftmost viewport.
+    // Result navigation must reveal it horizontally as well as vertically.
+    view.key(&zoomed, Char('n'));
+    let same_page = view.sync()?;
+    let (clip, top) = view.clip_after_transfer(&same_page)?;
+    assert_eq!(view.session.borrow().app.search_selection(), Some((2, 3)));
+    let lower = hit(1, 112., 104., 960.);
+    verify_ink(&clip, &native, 128, top, &lower, 2, (512, 184))?;
+    Ok(())
+}
+
+#[test]
 fn japanese_same_line_hits_scroll_to_winrt_ink() -> Result<(), Box<dyn Error>> {
     let (mut view, dir) = View::open()?;
     let first = view.sync()?;
@@ -314,7 +354,7 @@ fn viewport_pixels(view: &mut View, layout: &PlacedPage) -> Result<RgbaImage, Bo
         let buffer = view.terminal.backend().buffer();
         let state = view.session.borrow();
         let body = ui::body_area(buffer.area, state.app.mode());
-        if !layout.pdf_transfer_pending(body, state.app.top_row()) {
+        if !layout.pdf_transfer_pending(body, state.app.top_row(), 0.5) {
             return view.kitty.clip(buffer, body, CELL_W, CELL_H);
         }
     }
@@ -703,24 +743,46 @@ impl View {
         hit: &Hit,
         color: usize,
     ) -> Result<usize, Box<dyn Error>> {
+        let (clip, top) = self.clip_after_transfer(layout)?;
+        let state = self.session.borrow();
+        let page = state
+            .app
+            .document()
+            .as_pdf()
+            .ok_or("missing rendered PDF")?
+            .page();
+        assert_eq!(page.index + 1, hit.page);
+        let native = page.decode().map_err(io::Error::from)?.into_rgba8();
+        verify_ink(
+            &clip,
+            &native,
+            layout.rows().len(),
+            top,
+            hit,
+            color,
+            (clip.width(), 0),
+        )?;
+        Ok(top)
+    }
+
+    fn clip_after_transfer(
+        &mut self,
+        layout: &PlacedPage,
+    ) -> Result<(RgbaImage, usize), Box<dyn Error>> {
         for _ in 0..8 {
             self.draw(layout)?;
             let buffer = self.terminal.backend().buffer();
             let session = self.session.borrow();
             let top = session.app.top_row();
             let body = ui::body_area(buffer.area, session.app.mode());
-            if !layout.pdf_transfer_pending(body, top) {
-                let clip = self.kitty.clip(buffer, body, CELL_W, CELL_H)?;
-                let page = session
-                    .app
-                    .document()
-                    .as_pdf()
-                    .map(crate::app::PdfDocument::page)
-                    .ok_or("missing rendered PDF")?;
-                assert_eq!(page.index + 1, hit.page);
-                let native = page.decode().map_err(io::Error::from)?.into_rgba8();
-                verify_ink(&clip, &native, layout.rows().len(), top, hit, color)?;
-                return Ok(top);
+            let center = session
+                .app
+                .document()
+                .as_pdf()
+                .ok_or("missing rendered PDF")?
+                .center_x();
+            if !layout.pdf_transfer_pending(body, top, center) {
+                return Ok((self.kitty.clip(buffer, body, CELL_W, CELL_H)?, top));
             }
         }
         Err("visible PDF tiles did not finish transferring".into())
@@ -734,11 +796,11 @@ fn verify_ink(
     top: usize,
     hit: &Hit,
     color: usize,
+    (width, left): (u32, u32),
 ) -> Result<(), Box<dyn Error>> {
-    // Reference: fit the whole WinRT raster as one image (these geometries
+    // Reference: scale the whole WinRT raster as one image (these geometries
     // have no cell padding). Crop it without using any Kitty placement data.
     let height = u32::try_from(rows)? * CELL_H;
-    let width = clip.width();
     let start = u32::try_from(top)? * CELL_H;
     let end = start + clip.height();
     let fitted = imageops::resize(native, width, height, imageops::FilterType::Triangle);
@@ -781,6 +843,7 @@ fn verify_ink(
     let y1 = ((hit.media.ury - hit.y + 36. * 0.22) / hit.media.ury * f64::from(height)).ceil();
     assert!(
         clip.enumerate_pixels().all(|(x, y, actual)| {
+            let x = x + left;
             let y = y + start;
             let original = fitted.get_pixel(x, y).0;
             let expected = if (x0..x1).contains(&f64::from(x)) && (y0..y1).contains(&f64::from(y)) {

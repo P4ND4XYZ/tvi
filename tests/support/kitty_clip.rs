@@ -92,8 +92,15 @@ impl KittyClip {
                         .next()
                         .and_then(|mark| OFFSETS.iter().position(|&m| m == mark))
                         .ok_or("unknown Kitty tile row")?;
-                    assert_eq!(marks.next(), Some(OFFSETS[0]), "expected tile column zero");
-                    (u32::try_from(row)?, 0)
+                    let col = match marks.next() {
+                        Some('\u{305}') => 0,
+                        Some('\u{30d}') => 1,
+                        Some('\u{35b}') => 16,
+                        Some('\u{369}') => 23, // centered on the lower search hit
+                        Some('\u{485}') => 32, // right edge at 2x in a 32-column viewport
+                        _ => return Err("unexpected Kitty test column offset".into()),
+                    };
+                    (u32::try_from(row)?, col)
                 };
                 let tile = self.0.get(&id).ok_or("undelivered Kitty tile")?;
                 assert!((col + 1) * cw <= tile.width() && (row + 1) * ch <= tile.height());

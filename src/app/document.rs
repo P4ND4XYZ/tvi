@@ -149,6 +149,12 @@ impl Document {
         }
     }
 
+    pub(crate) fn set_pdf_view(app: &mut App, scale: f64, center_x: f64) {
+        if let Some(pdf) = app.document.pdf_mut() {
+            pdf.set_view(scale, center_x);
+        }
+    }
+
     pub(crate) fn replace_pdf_page(app: &mut App, next: Page) {
         if let Some(pdf) = app.document.pdf_mut() {
             pdf.replace_page(next);

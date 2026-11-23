@@ -13,6 +13,30 @@ use ratatui_image::{
     sliced::{SlicedImage, SlicedProtocol},
 };
 
+// Kitty's protocol-defined column indices for a PDF tile; the first cell of
+// each row carries its column explicitly, and the terminal infers the rest.
+// https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
+pub(super) const PDF_TILE_COLUMNS: u32 = 128;
+const KITTY_COLUMNS: [char; PDF_TILE_COLUMNS as usize] = [
+    '\u{305}', '\u{30d}', '\u{30e}', '\u{310}', '\u{312}', '\u{33d}', '\u{33e}', '\u{33f}',
+    '\u{346}', '\u{34a}', '\u{34b}', '\u{34c}', '\u{350}', '\u{351}', '\u{352}', '\u{357}',
+    '\u{35b}', '\u{363}', '\u{364}', '\u{365}', '\u{366}', '\u{367}', '\u{368}', '\u{369}',
+    '\u{36a}', '\u{36b}', '\u{36c}', '\u{36d}', '\u{36e}', '\u{36f}', '\u{483}', '\u{484}',
+    '\u{485}', '\u{486}', '\u{487}', '\u{592}', '\u{593}', '\u{594}', '\u{595}', '\u{597}',
+    '\u{598}', '\u{599}', '\u{59c}', '\u{59d}', '\u{59e}', '\u{59f}', '\u{5a0}', '\u{5a1}',
+    '\u{5a8}', '\u{5a9}', '\u{5ab}', '\u{5ac}', '\u{5af}', '\u{5c4}', '\u{610}', '\u{611}',
+    '\u{612}', '\u{613}', '\u{614}', '\u{615}', '\u{616}', '\u{617}', '\u{657}', '\u{658}',
+    '\u{659}', '\u{65a}', '\u{65b}', '\u{65d}', '\u{65e}', '\u{6d6}', '\u{6d7}', '\u{6d8}',
+    '\u{6d9}', '\u{6da}', '\u{6db}', '\u{6dc}', '\u{6df}', '\u{6e0}', '\u{6e1}', '\u{6e2}',
+    '\u{6e4}', '\u{6e7}', '\u{6e8}', '\u{6eb}', '\u{6ec}', '\u{730}', '\u{732}', '\u{733}',
+    '\u{735}', '\u{736}', '\u{73a}', '\u{73d}', '\u{73f}', '\u{740}', '\u{741}', '\u{743}',
+    '\u{745}', '\u{747}', '\u{749}', '\u{74a}', '\u{7eb}', '\u{7ec}', '\u{7ed}', '\u{7ee}',
+    '\u{7ef}', '\u{7f0}', '\u{7f1}', '\u{7f3}', '\u{816}', '\u{817}', '\u{818}', '\u{819}',
+    '\u{81b}', '\u{81c}', '\u{81d}', '\u{81e}', '\u{81f}', '\u{820}', '\u{821}', '\u{822}',
+    '\u{823}', '\u{825}', '\u{826}', '\u{827}', '\u{829}', '\u{82a}', '\u{82b}', '\u{82c}',
+];
+const PLACEHOLDER: char = '\u{10eeee}';
+
 pub struct PlacedImage {
     pub rows: Range<usize>,
     column: u16,
@@ -100,8 +124,9 @@ impl PlacedImage {
         Some(SlicedProtocol::Kitty(kitty))
     }
 
-    pub(super) fn visible_at_width(&self, width: u16) -> bool {
-        self.column < width
+    pub(super) fn visible_at_columns(&self, left: u16, width: u16) -> bool {
+        let end = u32::from(self.column) + u32::from(self.protocol.size().width);
+        end > u32::from(left) && u32::from(self.column) < u32::from(left) + u32::from(width)
     }
 
     pub fn transmitted_id(&self) -> Option<u32> {
@@ -112,7 +137,7 @@ impl PlacedImage {
         self.protocol.size().height
     }
 
-    pub fn draw(&self, frame: &mut Frame<'_>, body: Rect, top: usize) {
+    pub fn draw(&self, frame: &mut Frame<'_>, body: Rect, top: usize, left: u16) {
         let bottom = top + usize::from(body.height);
         let start = self.rows.start.max(top);
         let end = self.rows.end.min(bottom);
@@ -126,22 +151,39 @@ impl PlacedImage {
         ) else {
             return;
         };
-        if self.column >= body.width {
+        let x = self.column.saturating_sub(left);
+        let skip_x = left.saturating_sub(self.column);
+        let width = self
+            .protocol
+            .size()
+            .width
+            .saturating_sub(skip_x)
+            .min(body.width.saturating_sub(x));
+        if width == 0 {
             return;
         }
-        let clip = Rect::new(
-            body.x + self.column,
-            body.y + y,
-            body.width - self.column,
-            height,
-        );
-        let bounds = Rect {
-            width: self.protocol.size().width.min(clip.width),
-            ..clip
-        };
-        frame.buffer_mut().set_style(bounds, Style::reset());
+        let clip = Rect::new(body.x + x, body.y + y, width, height);
+        frame.buffer_mut().set_style(clip, Style::reset());
         self.drawn.set(true);
         frame.render_widget(SlicedImage::new(&self.protocol, (0, -skip).into()), clip);
+        if skip_x != 0
+            && let Some(&column) = KITTY_COLUMNS.get(usize::from(skip_x))
+        {
+            // SlicedImage supports row clipping but always starts at tile column zero.
+            // Keep its transfer, row and image ID; replace just that first column mark.
+            let buffer = frame.buffer_mut();
+            for y in clip.top()..clip.bottom() {
+                let cell = &mut buffer[(clip.x, y)];
+                if let Some((prefix, marks)) = cell.symbol().rsplit_once(PLACEHOLDER) {
+                    let mut marks = marks.chars();
+                    if let (Some(row), Some(_)) = (marks.next(), marks.next()) {
+                        let symbol =
+                            format!("{prefix}{PLACEHOLDER}{row}{column}{}", marks.as_str());
+                        cell.set_symbol(&symbol);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -162,7 +204,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(7, 4))?;
         assert_eq!(placed.rows, 2..6);
         assert!(placed.transmitted_id().is_none());
-        terminal.draw(|frame| placed.draw(frame, Rect::new(1, 1, 5, 2), 3))?;
+        terminal.draw(|frame| placed.draw(frame, Rect::new(1, 1, 5, 2), 3, 0))?;
         let buffer = terminal.backend().buffer();
         assert!(buffer[(1, 1)].symbol().contains("a=T,U=1"));
         assert!(
@@ -179,7 +221,7 @@ mod tests {
         assert_eq!(buffer[(1, 0)].symbol(), " ");
         assert_eq!(buffer[(1, 3)].symbol(), " ");
         assert_eq!(buffer[(6, 2)].symbol(), " ");
-        terminal.draw(|frame| placed.draw(frame, Rect::new(1, 1, 5, 2), 1))?;
+        terminal.draw(|frame| placed.draw(frame, Rect::new(1, 1, 5, 2), 1, 0))?;
         assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), " ");
         assert!(
             terminal.backend().buffer()[(1, 2)]

@@ -11,7 +11,7 @@ tviは端末上で文書を読むための閲覧専用ビューアです。Markd
 | 文書 | 説明 |
 |---|---|
 | [Markdown表示](features/markdown.md) | UTF-8ファイルの読み込み・自動再読み込み、折り返し、ローカル画像・Mermaidの図の表示、起動時のエラー |
-| [PDF表示](features/pdf.md) | 対応端末、開き方、ページ送りとテキスト検索の案内 |
+| [PDF表示](features/pdf.md) | 対応端末、開き方、ページ送り、テキスト検索、Luaからの倍率変更と横移動 |
 | [文書内の移動](features/navigation.md) | 行・ページ単位の移動とリサイズ時の閲覧位置の保持 |
 | [動作モードと入力](features/modes.md) | NORMAL、COMMAND、SEARCHの役割と切り替え |
 | [検索](features/search.md) | Markdown・PDFの検索、一致箇所への移動とハイライト |
@@ -19,7 +19,7 @@ tviは端末上で文書を読むための閲覧専用ビューアです。Markd
 | [状態表示とヘルプ](features/status-help.md) | モードや閲覧位置の表示とキー一覧 |
 | [診断ログ](features/diagnostic-log.md) | 保存先、ローテーションと保持上限、記録するイベント、デバッグログの有効化 |
 | [文書間の移動と復帰](features/links.md) | 対象リンク、文書間の移動と閲覧履歴 |
-| [Lua設定と公開API](features/lua.md) | 起動時の設定、本文の操作やローカル受信などの公開API |
+| [Lua設定と公開API](features/lua.md) | 起動時の設定、本文ビュー・形式別の文書ハンドル、ローカル受信などの公開API |
 | [カラースキーム](features/colorscheme.md) | Luaからの配色変更、指定できる色と装飾 |
 
 ### 設計方針

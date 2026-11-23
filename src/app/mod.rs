@@ -56,6 +56,8 @@ pub enum Action {
 
 pub struct App {
     document: Document,
+    // Unlike Document::id, this changes on history restore, not on reload.
+    display_epoch: u64,
     history: Vec<HistoryEntry>,
     mode: Mode,
     prompt: String,
@@ -187,6 +189,7 @@ impl App {
     pub fn from_document(document: Document) -> Self {
         Self {
             document,
+            display_epoch: 0,
             history: Vec::new(),
             mode: Mode::Normal,
             prompt: String::new(),
@@ -238,6 +241,10 @@ impl App {
         self.document.id
     }
 
+    pub(crate) fn display_epoch(&self) -> u64 {
+        self.display_epoch
+    }
+
     pub fn links(&self) -> &[DocumentLink] {
         self.document.links()
     }
@@ -252,6 +259,7 @@ impl App {
     }
 
     pub fn open_document(&mut self, document: Document) {
+        self.display_epoch += 1;
         self.document.freeze_for_history();
         self.history.push(HistoryEntry {
             document: std::mem::replace(&mut self.document, document),
@@ -267,12 +275,21 @@ impl App {
         let initial = self.history.drain(..).next();
         if let Some(mut entry) = initial {
             entry.document.reset_search();
-            *self = Self::from_document(entry.document);
+            *self = Self {
+                display_epoch: self.display_epoch + 1,
+                ..Self::from_document(entry.document)
+            };
         }
     }
 
-    fn jump_back(&mut self) {
+    pub(crate) fn history_pdf(&self) -> Option<(&Path, &PdfDocument)> {
+        let document = &self.history.last()?.document;
+        Some((&document.path, document.as_pdf()?))
+    }
+
+    pub(crate) fn jump_back(&mut self) {
         if let Some(entry) = self.history.pop() {
+            self.display_epoch += 1;
             self.document = entry.document;
             self.viewport = Viewport {
                 anchor: entry.anchor,
@@ -344,6 +361,14 @@ impl App {
 
     pub(crate) fn reflow_current_height(&mut self, rows: &impl ViewRows) {
         self.viewport.reflow(rows, self.viewport.height);
+    }
+
+    pub(crate) fn viewport_height(&self) -> usize {
+        self.viewport.height
+    }
+
+    pub(crate) fn show_top_row(&mut self, rows: &impl ViewRows, row: usize) {
+        self.viewport.show(row, rows);
     }
 
     pub(crate) fn center_row(&mut self, rows: &impl ViewRows, row: usize) {

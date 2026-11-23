@@ -98,7 +98,12 @@ end
 
 function M.open()
   local view = tvi.ui.current_view()
-  local root, err = view:project_root({ root_markers = M.root_markers })
+  local doc = view:document()
+  if not doc then
+    tvi.ui.notify("No document is displayed")
+    return
+  end
+  local root, err = doc:project_root({ root_markers = M.root_markers })
   if not root then
     ---@cast err -nil
     tvi.ui.notify(err)

@@ -54,7 +54,12 @@ end
 
 function M.open()
   local view = tvi.ui.current_view()
-  local links = view:links()
+  local doc = view:document()
+  if doc and doc:type() ~= "md" then
+    doc = nil
+  end
+  ---@cast doc Tvi.MarkdownDocument?
+  local links = doc and doc:links() or {}
   local query, candidates, selected = "", links, 1
 
   local function refilter()
@@ -82,8 +87,8 @@ function M.open()
   opts.on_key = function(float, key)
     if key.name == "Enter" then
       local link = candidates[selected]
-      if link then
-        local path, err = view:resolve_link(link.id)
+      if link and doc then
+        local path, err = doc:resolve_link(link.id)
         if not path then
           float:update(display(tostring(err or "Could not resolve link")))
           return

@@ -3,8 +3,9 @@ local function setup(responses)
   local separator = package.config:sub(1, 1)
   local root = separator == "\\" and "C:\\資料 project" or "/資料 project"
   local model = { calls = calls, notices = notices, opened = opened, root = root }
-  local view = {}
-  function view:project_root(opts)
+  local view, doc = {}, {}
+  function view:document() return doc end
+  function doc:project_root(opts)
     model.markers = opts.root_markers
     return root
   end

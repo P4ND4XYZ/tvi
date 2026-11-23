@@ -1,4 +1,5 @@
 pub(crate) mod pdf_marks;
+mod pdf_zoom;
 mod table;
 
 use std::ops::Range;
@@ -55,7 +56,7 @@ pub struct Layout<'a> {
     source_positions: &'a [Option<SourcePosition>],
     logical_rows: Vec<usize>,
     images: Vec<PlacedImage>,
-    pdf_raster_rows: Option<f64>,
+    pdf_raster: Option<pdf_zoom::Raster>,
 }
 
 // Four new tiles per frame: at most 128 KiB raw RGBA (under 180 KiB of
@@ -81,7 +82,7 @@ impl Layout<'static> {
             source_positions: &[],
             logical_rows: Vec::new(),
             images: Vec::new(),
-            pdf_raster_rows: Some(0.0),
+            pdf_raster: None,
         }
     }
 
@@ -89,49 +90,28 @@ impl Layout<'static> {
         image: &image::DynamicImage,
         aspect_height: f64,
         geometry: PdfGeometry,
+        scale: f64,
         decorate: impl FnOnce(&mut image::RgbaImage),
     ) -> Option<Self> {
-        // Kitty placeholders have a finite coordinate table. Tile the width-fitted
-        // raster rather than reducing its height to fit a single placement.
-        const MAX_DISPLAY_PIXELS: u64 = 32 * 1024 * 1024;
-        const MAX_ROWS: u16 = 8192;
         const ANCHOR_SCALE: usize = 1 << 18;
-
+        let raster = geometry.raster(aspect_height, scale)?;
+        let pdf_zoom::Raster {
+            width,
+            height,
+            columns,
+            rows,
+            tile_columns,
+            tile_rows,
+            ..
+        } = raster;
         let cw = u32::from(geometry.cell_width);
         let ch = u32::from(geometry.cell_height);
-        let cells_per_tile = PDF_TILE_PIXELS.checked_div(cw * ch)?;
-        // Keep bands shallow to limit bytes outside the viewport. Each dimension
-        // also stays below the Kitty placeholder coordinate limit.
-        let tile_columns = u16::try_from(cells_per_tile.min(128))
-            .ok()?
-            .min(geometry.columns);
-        let tile_rows =
-            u16::try_from(cells_per_tile.checked_div(u32::from(tile_columns))?.min(8)).ok()?;
-        let width = u32::from(geometry.columns) * cw;
-        let height = (f64::from(width) * aspect_height).round().max(1.0);
-        if width == 0
-            || ch == 0
-            || !height.is_finite()
-            || height > f64::from(MAX_ROWS) * f64::from(ch)
-        {
-            return None;
-        }
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "checked against MAX_ROWS times a u16 cell size"
-        )]
-        let height = height as u32;
-        let rows = u16::try_from(height.div_ceil(ch)).ok()?;
-        if u64::from(width) * u64::from(rows) * u64::from(ch) > MAX_DISPLAY_PIXELS {
-            return None;
-        }
         let mut pixels = image
             .resize_exact(width, height, image::imageops::FilterType::Triangle)
             .into_rgba8();
         decorate(&mut pixels);
         let mut layout = Self::empty_pdf();
-        layout.pdf_raster_rows = Some(f64::from(height) / f64::from(ch));
+        layout.pdf_raster = Some(raster);
         for row in 0..rows {
             let byte = (usize::from(row) * ANCHOR_SCALE).div_ceil(usize::from(rows));
             layout.rows.push(Row {
@@ -143,8 +123,8 @@ impl Layout<'static> {
             let tile_rows = tile_rows.min(rows - start);
             let y = u32::from(start) * ch;
             let tile_height = u32::from(tile_rows) * ch;
-            for column in (0..geometry.columns).step_by(usize::from(tile_columns)) {
-                let tile_columns = tile_columns.min(geometry.columns - column);
+            for column in (0..columns).step_by(usize::from(tile_columns)) {
+                let tile_columns = tile_columns.min(columns - column);
                 let x = u32::from(column) * cw;
                 let tile_width = u32::from(tile_columns) * cw;
                 let mut tile = image::RgbaImage::new(tile_width, tile_height);
@@ -152,7 +132,7 @@ impl Layout<'static> {
                     &pixels,
                     x,
                     y,
-                    tile_width,
+                    tile_width.min(width - x),
                     tile_height.min(height - y),
                 );
                 image::imageops::replace(&mut tile, &visible.to_image(), 0, 0);
@@ -197,7 +177,7 @@ impl<'a> Layout<'a> {
             source_positions: &document.source_positions,
             logical_rows: Vec::with_capacity(original.lines.len() + 1),
             images: Vec::new(),
-            pdf_raster_rows: None,
+            pdf_raster: None,
         };
         if width != 0 {
             let mut placements = document.images.iter().peekable();
@@ -305,14 +285,19 @@ impl<'a> Layout<'a> {
         self.images.iter().filter_map(PlacedImage::transmitted_id)
     }
 
-    fn visible_images(&self, body: Rect, top: usize) -> impl Iterator<Item = &PlacedImage> {
+    fn visible_images(
+        &self,
+        body: Rect,
+        top: usize,
+        left: u16,
+    ) -> impl Iterator<Item = &PlacedImage> {
         let first = self.images.partition_point(|image| image.rows.end <= top);
         self.images[first..]
             .iter()
             .take_while(move |image| {
                 !body.is_empty() && image.rows.start < top + usize::from(body.height)
             })
-            .filter(move |image| image.visible_at_width(body.width))
+            .filter(move |image| image.visible_at_columns(left, body.width))
     }
 
     pub(crate) fn pdf_row(&self, from_top: f64) -> usize {
@@ -321,32 +306,82 @@ impl<'a> Layout<'a> {
             clippy::cast_sign_loss,
             reason = "hit fractions lie within the raster's finite row count"
         )]
-        let row = (from_top * self.pdf_raster_rows.unwrap_or_default()).floor() as usize;
+        let row = (from_top * self.pdf_raster.map_or(0.0, |raster| raster.height_in_cells)).floor()
+            as usize;
         row.min(self.rows.len().saturating_sub(1))
     }
 
     pub(crate) fn pdf_row_boundary(&self, row: usize) -> Option<f64> {
-        let raster = self.pdf_raster_rows.filter(|&rows| rows > 0.0)?;
-        Some(f64::from(u16::try_from(row).ok()?) / raster)
+        let raster = self.pdf_raster?;
+        Some(f64::from(u16::try_from(row).ok()?) / raster.height_in_cells)
     }
 
-    pub fn pdf_transfer_pending(&self, body: Rect, top: usize) -> bool {
-        self.pdf_raster_rows.is_some()
+    pub(crate) fn pdf_center_x(&self, width: u16, center: f64) -> f64 {
+        self.pdf_raster.map_or(center, |raster| {
+            raster.center_x(width, raster.left(width, center))
+        })
+    }
+
+    pub(crate) fn pdf_pan_x(&self, width: u16, center: f64, columns: i64) -> f64 {
+        self.pdf_raster
+            .map_or(center, |raster| raster.pan_x(width, center, columns))
+    }
+
+    pub(crate) fn pdf_center_y(&self, height: usize, top: usize) -> Option<f64> {
+        Some(self.pdf_raster?.center_y(height, top))
+    }
+
+    pub(crate) fn pdf_top(&self, height: usize, center: f64) -> usize {
+        self.pdf_raster
+            .map_or(0, |raster| raster.top(height, center))
+    }
+
+    pub(crate) fn pdf_reveal_x(&self, width: u16, center: f64, hit: (f64, f64)) -> f64 {
+        self.pdf_raster
+            .map_or(center, |raster| raster.reveal_x(width, center, hit))
+    }
+
+    fn image_viewport(&self, mut body: Rect, center: f64) -> (Rect, u16) {
+        let Some(raster) = self.pdf_raster else {
+            return (body, 0);
+        };
+        let left = raster.left(body.width, center);
+        if raster.columns < body.width {
+            body.x += (body.width - raster.columns) / 2;
+            body.width = raster.columns;
+        }
+        (body, left)
+    }
+
+    pub fn pdf_transfer_pending(&self, body: Rect, top: usize, center: f64) -> bool {
+        let (body, left) = self.image_viewport(body, center);
+        self.pdf_raster.is_some()
             && self
-                .visible_images(body, top)
+                .visible_images(body, top, left)
                 .any(|image| image.transmitted_id().is_none())
     }
 
     pub fn draw_images(&self, frame: &mut Frame<'_>, body: Rect, top: usize) {
+        self.draw_images_at(frame, body, top, 0.5);
+    }
+
+    pub(crate) fn draw_images_at(
+        &self,
+        frame: &mut Frame<'_>,
+        body: Rect,
+        top: usize,
+        center: f64,
+    ) {
+        let (body, left) = self.image_viewport(body, center);
         let mut new_tiles = 0;
-        for image in self.visible_images(body, top) {
-            if self.pdf_raster_rows.is_some() && image.transmitted_id().is_none() {
+        for image in self.visible_images(body, top, left) {
+            if self.pdf_raster.is_some() && image.transmitted_id().is_none() {
                 if new_tiles == PDF_TILES_PER_FRAME {
                     continue;
                 }
                 new_tiles += 1;
             }
-            image.draw(frame, body, top);
+            image.draw(frame, body, top, left);
         }
     }
 
@@ -520,7 +555,7 @@ mod tests {
             cell_height: 4,
         };
         let layout =
-            Layout::pdf_page(&pixels, 2.0, geometry, |_| {}).ok_or("page was not placed")?;
+            Layout::pdf_page(&pixels, 2.0, geometry, 1.0, |_| {}).ok_or("page was not placed")?;
         assert_eq!(layout.len(), 162);
         let mut terminal = Terminal::new(TestBackend::new(164, 4))?;
         terminal.draw(|frame| layout.draw_images(frame, Rect::new(1, 0, 162, 3), 159))?;
@@ -541,6 +576,49 @@ mod tests {
     }
 
     #[test]
+    fn fractional_pdf_zoom_pads_the_last_cell_and_starts_each_visible_tile_at_its_column()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let geometry = PdfGeometry {
+            columns: 85,
+            cell_width: 2,
+            cell_height: 4,
+        };
+        let pixels = image::DynamicImage::new_rgb8(13, 13);
+        let layout = Layout::pdf_page(&pixels, 1.0, geometry, 2.005, |raster| {
+            assert_eq!(raster.dimensions(), (341, 341));
+        })
+        .ok_or("page was not placed")?;
+        assert_eq!(layout.len(), 86);
+        let mut terminal = Terminal::new(TestBackend::new(87, 5))?;
+        let body = Rect::new(1, 1, 85, 3);
+        // Right-aligned viewport starts at raster column 86, inside the
+        // first tile. The next tile must restart at its own column zero.
+        let right = layout.pdf_pan_x(85, 0.5, i64::MAX);
+        terminal.draw(|frame| layout.draw_images_at(frame, body, 2, right))?;
+        let buffer = terminal.backend().buffer();
+        let (_, first_marks) = buffer[(1, 1)]
+            .symbol()
+            .rsplit_once('\u{10eeee}')
+            .ok_or("first visible tile did not render")?;
+        let offsets: Vec<_> = first_marks.chars().take(2).map(u32::from).collect();
+        assert_eq!(offsets, [0x30e, 0x732], "first visible tile row and column");
+        assert!(
+            buffer[(43, 1)]
+                .symbol()
+                .contains("\u{10eeee}\u{30e}\u{305}")
+        );
+        assert!(buffer[(85, 3)].symbol().contains('\u{10eeee}'));
+        for cell in [(0, 1), (86, 1), (1, 0), (1, 4)] {
+            assert_eq!(buffer[cell].symbol(), " ");
+        }
+        assert_eq!(layout.transmitted_ids().count(), 2);
+        assert!(!layout.pdf_transfer_pending(body, 2, right));
+        Ok(())
+    }
+
+    #[test]
     fn desktop_pdf_transfers_only_a_bounded_batch_of_visible_tiles_each_frame()
     -> Result<(), Box<dyn std::error::Error>> {
         use ratatui::{Terminal, backend::TestBackend};
@@ -552,12 +630,12 @@ mod tests {
         };
         let image = image::DynamicImage::new_rgb8(40, 160);
         let layout =
-            Layout::pdf_page(&image, 4.0, geometry, |_| {}).ok_or("page was not placed")?;
+            Layout::pdf_page(&image, 4.0, geometry, 1.0, |_| {}).ok_or("page was not placed")?;
         let body = Rect::new(0, 0, 128, 47);
         let mut screen = Terminal::new(TestBackend::new(128, 48))?;
         for top in [0, 48] {
             let mut frames = 0;
-            while layout.pdf_transfer_pending(body, top) {
+            while layout.pdf_transfer_pending(body, top, 0.5) {
                 screen.draw(|frame| layout.draw_images(frame, body, top))?;
                 let bytes: usize = screen
                     .backend()
