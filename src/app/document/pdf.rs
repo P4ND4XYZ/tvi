@@ -10,11 +10,11 @@ pub(crate) struct PdfDocument {
 }
 
 impl PdfDocument {
-    pub(super) fn new(page: Page) -> Self {
+    pub(super) fn new(page: Page, scale: f64) -> Self {
         Self {
             page,
             search: None,
-            scale: 1.0,
+            scale,
             center_x: 0.5,
         }
     }

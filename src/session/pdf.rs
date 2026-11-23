@@ -7,6 +7,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::layout::{Rect, Size};
 
 use crate::{
     app::{App, Direction, Document, Mode, Motion, PdfDocument, PdfSearch, ScrollEdge, ViewRows},
@@ -14,6 +15,7 @@ use crate::{
     pdf::{Failure, Page, Renderer, Source, Worker},
     terminal::{self, CellSizeStatus, ImageMode, Screen},
     ui::{
+        body_area,
         float::Floats,
         layout::{Layout, PdfGeometry as Geometry},
     },
@@ -39,7 +41,7 @@ pub(super) fn geometry(columns: u16, mode: ImageMode) -> Result<Geometry, Failur
             cell_width,
             cell_height,
         } if cell_width > 0 && cell_height > 0 => Ok(Geometry {
-            columns: columns.max(1),
+            columns,
             cell_width,
             cell_height,
         }),
@@ -47,28 +49,59 @@ pub(super) fn geometry(columns: u16, mode: ImageMode) -> Result<Geometry, Failur
     }
 }
 
-fn fit(
-    page: &Page,
+pub(super) fn normal_body_height(size: Size) -> u16 {
+    body_area(Rect::new(0, 0, size.width, size.height), Mode::Normal).height
+}
+
+#[derive(Clone, Copy)]
+enum Scale {
+    FitPage { body_rows: u16 },
+    Fixed(f64),
+}
+
+#[derive(Clone, Copy)]
+struct Target {
     geometry: Geometry,
-    marks: Option<&Marks>,
+    scale: Scale,
+}
+
+impl Target {
+    fn needs_refit(self, geometry: Geometry, body_height: u16) -> bool {
+        self.geometry != geometry
+            || matches!(self.scale, Scale::FitPage { body_rows } if body_rows != body_height)
+    }
+}
+
+struct Rendered {
+    layout: Layout<'static>,
     scale: f64,
-) -> Result<Layout<'static>, Failure> {
+}
+
+fn fit(page: &Page, target: Target, marks: Option<&Marks>) -> Result<Rendered, Failure> {
+    const DISPLAY_SIZE: Failure = Failure::new(
+        "pdf_layout",
+        "display_size",
+        "PDF page exceeds the display limits",
+    );
     let image = page.decode()?;
-    Layout::pdf_page(&image, page.aspect_height(), geometry, scale, |pixels| {
+    let aspect = page.aspect_height();
+    let geometry = target.geometry;
+    let scale = match target.scale {
+        Scale::FitPage { body_rows } => geometry
+            .initial_scale(aspect, body_rows)
+            .ok_or(DISPLAY_SIZE)?,
+        Scale::Fixed(scale) => scale,
+    };
+    let layout = Layout::pdf_page(&image, aspect, geometry, scale, |pixels| {
         if let Some(marks) = marks {
             marks.paint(page, pixels);
         }
     })
-    .ok_or_else(|| {
-        Failure::new(
-            "pdf_layout",
-            "display_size",
-            "PDF page exceeds the display limits",
-        )
-    })
+    .ok_or(DISPLAY_SIZE)?;
+    Ok(Rendered { layout, scale })
 }
 
-type ResultPage = Result<(Page, Result<Layout<'static>, Failure>), Failure>;
+type ResultPage = Result<(Page, Result<Rendered, Failure>), Failure>;
 
 fn try_result(receiver: &Receiver<ResultPage>) -> Option<ResultPage> {
     match receiver.try_recv() {
@@ -94,20 +127,14 @@ impl Work {
         Marks::for_page(search, index)
     }
 
-    fn place(
-        self,
-        renderer: &mut Renderer,
-        geometry: Geometry,
-        marks: Option<&Marks>,
-        scale: f64,
-    ) -> ResultPage {
+    fn place(self, renderer: &mut Renderer, target: Target, marks: Option<&Marks>) -> ResultPage {
         let page = match self {
             Self::Open(path) => renderer.open(&path)?,
             Self::Turn(source, index) => renderer.render(source, index)?,
             Self::Fit(page) => page,
         };
-        let layout = fit(&page, geometry, marks, scale);
-        Ok((page, layout))
+        let rendered = fit(&page, target, marks);
+        Ok((page, rendered))
     }
 }
 
@@ -181,11 +208,13 @@ impl Intent {
         }
     }
 
-    fn scale(&self, app: &App) -> f64 {
+    fn scale(&self, app: &App, body_height: u16) -> Scale {
         match self {
-            Self::Open { .. } => 1.0,
-            Self::Restore { scale, .. } | Self::Zoom { scale, .. } => *scale,
-            _ => app.document().as_pdf().map_or(1.0, PdfDocument::scale),
+            Self::Open { .. } => Scale::FitPage {
+                body_rows: body_height,
+            },
+            Self::Restore { scale, .. } | Self::Zoom { scale, .. } => Scale::Fixed(*scale),
+            _ => Scale::Fixed(app.document().as_pdf().map_or(1.0, PdfDocument::scale)),
         }
     }
 }
@@ -198,7 +227,7 @@ struct Request {
 struct Running {
     // Dropping the intent cancels publication, but the native call may still be completing.
     intent: Option<Intent>,
-    geometry: Geometry,
+    target: Target,
     marks: Option<Marks>,
     result: Receiver<ResultPage>,
 }
@@ -271,13 +300,12 @@ impl Jobs {
     fn submit(
         &self,
         work: Work,
-        geometry: Geometry,
+        target: Target,
         marks: Option<Marks>,
-        scale: f64,
     ) -> Result<Receiver<ResultPage>, Failure> {
         self.worker
             .borrow_mut()
-            .submit(move |renderer| work.place(renderer, geometry, marks.as_ref(), scale))
+            .submit(move |renderer| work.place(renderer, target, marks.as_ref()))
     }
 
     pub(super) fn reset(&mut self) {
@@ -349,8 +377,11 @@ impl Jobs {
         true
     }
 
-    pub(super) fn restore_pending(&self) -> bool {
-        matches!(self.pending(), Some(Intent::Restore { .. }))
+    pub(super) fn needs_cell_size_check(&self) -> bool {
+        matches!(
+            self.pending(),
+            Some(Intent::Open { .. } | Intent::Restore { .. })
+        )
     }
 
     pub(super) fn search_pending(&self) -> bool {
@@ -621,6 +652,7 @@ impl Jobs {
         app: &mut App,
         floats: &Floats,
         geometry: Result<Geometry, Failure>,
+        body_height: u16,
         cell_size: CellSizeStatus,
     ) -> Update {
         let key = page_key(app);
@@ -642,33 +674,28 @@ impl Jobs {
         }
         let search_cancelled = self.revalidate_search(app, floats, geometry);
         self.cancel_if(|intent| !intent.still_current(app, floats));
-        if self.restore_pending() {
-            match cell_size {
-                CellSizeStatus::Pending => {
-                    // Do not consume even an already rendered result until we
-                    // can compare it with the confirmed terminal geometry.
-                    return Update {
-                        redraw: search_cancelled,
-                        close_float: None,
-                    };
-                }
-                CellSizeStatus::Unconfirmed => {
-                    let Some(intent) = self.take_restore() else {
-                        unreachable!("restore_pending checked above");
-                    };
-                    return self.fail(app, intent, CELL_SIZE_UNCONFIRMED, None, None);
-                }
-                CellSizeStatus::Ready => {}
-            }
+        // Wait for a pending resize probe before publishing the first layout.
+        // Open can still use cached cells on timeout, as before; restore cannot.
+        if cell_size == CellSizeStatus::Pending && self.needs_cell_size_check() {
+            return Update {
+                redraw: search_cancelled,
+                close_float: None,
+            };
+        }
+        if cell_size == CellSizeStatus::Unconfirmed
+            && matches!(self.pending(), Some(Intent::Restore { .. }))
+            && let Some(intent) = self.take_restore()
+        {
+            return self.fail(app, intent, CELL_SIZE_UNCONFIRMED, None, None);
         }
         self.revalidate_turn(app, floats, geometry);
-        let mut update = self.poll_rendered(app, geometry);
+        let mut update = self.poll_rendered(app, geometry, body_height);
         update.redraw |= search_cancelled;
         update.redraw |= self.advance_search(app, geometry);
         update.redraw |= self.replay_resized_motion(app, geometry);
         self.queue_zoom(app);
         self.queue_fit(app, geometry);
-        if let Some(failed) = self.submit_queued(app, geometry) {
+        if let Some(failed) = self.submit_queued(app, geometry, body_height) {
             update.redraw |= failed.redraw;
         }
         update
@@ -686,12 +713,17 @@ impl Jobs {
         }
     }
 
-    fn poll_rendered(&mut self, app: &mut App, geometry: Result<Geometry, Failure>) -> Update {
+    fn poll_rendered(
+        &mut self,
+        app: &mut App,
+        geometry: Result<Geometry, Failure>,
+        body_height: u16,
+    ) -> Update {
         if let Some(running) = &mut self.running
             && let Some(result) = try_result(&running.result)
         {
             let intent = running.intent.take();
-            let placed_at = running.geometry;
+            let target = running.target;
             let marks = running.marks.take();
             self.running = None;
             if let Some(intent) = intent {
@@ -703,18 +735,18 @@ impl Jobs {
                     return Update::default();
                 }
                 return match (geometry, result) {
-                    (Ok(latest), Ok((page, _))) if placed_at != latest => {
+                    (Ok(latest), Ok((page, _))) if target.needs_refit(latest, body_height) => {
                         self.queued = Some(Request {
                             intent,
                             work: Work::Fit(page),
                         });
                         Update::default()
                     }
-                    (Ok(_), Ok((page, Ok(layout)))) => {
-                        self.commit(app, intent, page, placed_at, marks, layout)
+                    (Ok(_), Ok((page, Ok(rendered)))) => {
+                        self.commit(app, intent, page, target.geometry, marks, rendered)
                     }
                     (_, Err(error) | Ok((_, Err(error)))) => {
-                        self.fail(app, intent, error, Some(placed_at), marks)
+                        self.fail(app, intent, error, Some(target.geometry), marks)
                     }
                     (Err(error), Ok(_)) => self.fail(app, intent, error, None, marks),
                 };
@@ -753,26 +785,29 @@ impl Jobs {
         &mut self,
         app: &mut App,
         geometry: Result<Geometry, Failure>,
+        body_height: u16,
     ) -> Option<Update> {
         if self.running.is_some() {
             return None;
         }
         let Request { intent, work } = self.queued.take()?;
         let search = match &intent {
+            Intent::Open { .. } => None,
             Intent::Search { result, .. } => Some(result),
             Intent::Restore { .. } => app.history_pdf().and_then(|(_, pdf)| pdf.search()),
             _ => pdf_search(app),
         };
         let marks = work.marks(search);
-        let scale = intent.scale(app);
+        let scale = intent.scale(app, body_height);
         match geometry.and_then(|geometry| {
-            self.submit(work, geometry, marks.clone(), scale)
-                .map(|result| (geometry, result))
+            let target = Target { geometry, scale };
+            self.submit(work, target, marks.clone())
+                .map(|result| (target, result))
         }) {
-            Ok((geometry, result)) => {
+            Ok((target, result)) => {
                 self.running = Some(Running {
                     intent: Some(intent),
-                    geometry,
+                    target,
                     marks,
                     result,
                 });
@@ -789,12 +824,12 @@ impl Jobs {
         page: Page,
         geometry: Geometry,
         marks: Option<Marks>,
-        layout: Layout<'static>,
+        Rendered { layout, scale }: Rendered,
     ) -> Update {
         let close_float = match intent {
             Intent::Open { path, float, .. } => {
                 self.requested_zoom = None;
-                app.open_document(Document::pdf(path, page));
+                app.open_document(Document::pdf(path, page, scale));
                 float
             }
             Intent::Restore { .. } => {
@@ -823,7 +858,7 @@ impl Jobs {
                 app.clear_notice_if(FIT_NOTICE);
                 None
             }
-            Intent::Zoom { scale, .. } => {
+            Intent::Zoom { .. } => {
                 self.commit_zoom(app, geometry.columns, scale, &layout);
                 app.clear_notice_if(FIT_NOTICE);
                 None
@@ -941,9 +976,16 @@ pub(super) fn startup(
     let mode = input.image_mode();
     let mut size = terminal::check(screen.size(), "size", Some(mode), "exit")?;
     let report = |failure: &Failure| log_open_failure(&path, "startup", *failure);
-    let mut placed_at = geometry(size.width, mode).inspect_err(report)?;
+    let first_page_target = |geometry, body_rows| Target {
+        geometry,
+        scale: Scale::FitPage { body_rows },
+    };
+    let mut target = first_page_target(
+        geometry(size.width, mode).inspect_err(report)?,
+        normal_body_height(size),
+    );
     let mut receiver = jobs
-        .submit(Work::Open(path.clone()), placed_at, None, 1.0)
+        .submit(Work::Open(path.clone()), target, None)
         .inspect_err(report)?;
 
     loop {
@@ -953,24 +995,27 @@ pub(super) fn startup(
             size = latest_size;
             input.refresh_cell_size();
         }
-        if let Some(result) = try_result(&receiver) {
-            let (page, layout) = result.inspect_err(report)?;
+        if input.pdf_restore_cell_size() != CellSizeStatus::Pending
+            && let Some(result) = try_result(&receiver)
+        {
+            let (page, rendered) = result.inspect_err(report)?;
             let latest = geometry(size.width, mode).inspect_err(report)?;
-            if placed_at == latest {
-                let layout = layout.inspect_err(report)?;
-                let app = App::from_document(Document::pdf(path, page));
+            let body_rows = normal_body_height(size);
+            if !target.needs_refit(latest, body_rows) {
+                let Rendered { layout, scale } = rendered.inspect_err(report)?;
+                let app = App::from_document(Document::pdf(path, page, scale));
                 jobs.placed = page_key(&app).map(|key| Placement {
                     key,
-                    geometry: placed_at,
+                    geometry: target.geometry,
                     marks: None,
                     layout: Rc::new(layout),
                 });
                 return Ok(Some((app, jobs)));
             }
-            // Keep the native raster; only the placement needs to match the new width.
-            placed_at = latest;
+            // Keep the native raster; only the placement needs to match the new body size.
+            target = first_page_target(latest, body_rows);
             receiver = jobs
-                .submit(Work::Fit(page), placed_at, None, 1.0)
+                .submit(Work::Fit(page), target, None)
                 .inspect_err(report)?;
         }
         terminal::check(
@@ -1098,6 +1143,9 @@ mod tests {
                 session.borrow().prepared.is_none(),
                 "history must not reuse the old Markdown display"
             );
+            // These navigation tests exercise pages that overflow the viewport.
+            session.set_pdf_zoom(BODY_VIEW, 1.0)?;
+            wait(&session, &runtime)?;
             Ok(Self {
                 session,
                 runtime,
@@ -1116,6 +1164,91 @@ mod tests {
                 .borrow_mut()
                 .apply(Action::Move(motion), page, "");
         }
+    }
+
+    #[test]
+    fn opening_pdf_refits_to_latest_body_height_before_publishing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("manual.pdf");
+        fs::write(&path, crate::test_pdf::two_pages())?;
+        let session = test_session();
+        let original = session.borrow().app.document_id();
+        let (runtime, error) = Runtime::load_from(session.clone(), None);
+        assert!(error.is_none());
+        let sync_size = |state: &mut Session, width, height| {
+            state.sync_pdf_layout(Size::new(width, height), KITTY, &mut None, &mut Vec::new());
+        };
+        sync_size(&mut session.borrow_mut(), 80, 49);
+        assert!(matches!(
+            session.open_file(BODY_VIEW, &path)?,
+            FileOpen::Pending
+        ));
+        poll_pdf(&session, &runtime); // submit using the old height
+        {
+            let mut state = session.borrow_mut();
+            let running = state.pdf.running.as_mut().ok_or("expected open render")?;
+            let completed = running.result.recv_timeout(Duration::from_secs(15))?;
+            assert!(matches!(&completed, Ok((_, Ok(rendered))) if rendered.layout.len() == 48));
+            let (send, result) = mpsc::channel();
+            assert!(send.send(completed).is_ok());
+            running.result = result;
+            sync_size(&mut state, 80, 25);
+        }
+        poll_pdf(&session, &runtime);
+        assert_eq!(session.borrow().app.document_id(), original);
+        wait(&session, &runtime)?;
+        let first = place(&mut session.borrow_mut(), 24)?;
+        assert_eq!(first.len(), 24);
+        assert_eq!(page_key(&session.borrow().app).map(|key| key.1), Some(0));
+        let init = directory.path().join("zoom.lua");
+        fs::write(
+            &init,
+            "assert(tvi.ui.current_view():document():zoom() == 0.15)",
+        )?;
+        let (_, error) = Runtime::load_from(session.clone(), Some(init.clone()));
+        assert!(error.is_none(), "{error:?}");
+
+        // The fitted page is already at its end. One down scroll turns it.
+        let pdf_id = session.borrow().app.document_id();
+        let move_down = Action::Move(Motion::LineDown);
+        session.borrow_mut().apply(move_down, first.as_ref(), "");
+        wait(&session, &runtime)?;
+        let second = place(&mut session.borrow_mut(), 24)?;
+        assert_eq!(page_key(&session.borrow().app), Some((pdf_id, 1)));
+        assert_eq!(second.len(), 12);
+        assert_eq!(session.pdf_zoom(BODY_VIEW)?, 0.15);
+
+        sync_size(&mut session.borrow_mut(), 80, 41);
+        wait(&session, &runtime)?;
+        assert!(Rc::ptr_eq(&second, &place(&mut session.borrow_mut(), 40)?));
+        sync_size(&mut session.borrow_mut(), 40, 41);
+        wait(&session, &runtime)?;
+        assert_eq!(place(&mut session.borrow_mut(), 40)?.len(), 6);
+        assert_eq!(session.pdf_zoom(BODY_VIEW)?, 0.15);
+
+        let markdown = directory.path().join("other.md");
+        fs::write(&markdown, "Other Markdown")?;
+        assert!(matches!(
+            session.open_file(BODY_VIEW, &markdown)?,
+            FileOpen::Opened
+        ));
+        session.borrow_mut().apply(Action::JumpBack, &[], "");
+        wait(&session, &runtime)?;
+        assert_eq!(page_key(&session.borrow().app), Some((pdf_id, 1)));
+        assert_eq!(place(&mut session.borrow_mut(), 40)?.len(), 6);
+        assert_eq!(session.pdf_zoom(BODY_VIEW)?, 0.15);
+
+        fs::write(
+            &init,
+            "assert(tvi.ui.current_view():document():set_zoom(1.0))",
+        )?;
+        let (runtime, error) = Runtime::load_from(session.clone(), Some(init));
+        assert!(error.is_none(), "{error:?}");
+        wait(&session, &runtime)?;
+        assert_eq!(place(&mut session.borrow_mut(), 40)?.len(), 40);
+        assert_eq!(session.pdf_zoom(BODY_VIEW)?, 1.0);
+        Ok(())
     }
 
     #[test]
@@ -1186,17 +1319,21 @@ mod tests {
             app,
             pdf,
             pdf_geometry,
+            pdf_normal_height,
             ..
         } = &mut *demo.session.borrow_mut();
         pdf.queue_zoom(app);
         let Request { intent, work } = pdf.queued.take().ok_or("expected zoom render")?;
         assert!(matches!(intent, Intent::Zoom { .. }));
-        let geometry = pdf_geometry.map_err(io::Error::from)?;
+        let target = Target {
+            geometry: pdf_geometry.map_err(io::Error::from)?,
+            scale: intent.scale(app, *pdf_normal_height),
+        };
         let marks = work.marks(pdf_search(app));
         let completed = if let Some(failure) = failure {
             Err(failure)
         } else {
-            pdf.submit(work, geometry, marks.clone(), intent.scale(app))
+            pdf.submit(work, target, marks.clone())
                 .map_err(io::Error::from)?
                 .recv_timeout(Duration::from_secs(15))?
         };
@@ -1204,7 +1341,7 @@ mod tests {
         assert!(send.send(completed).is_ok());
         pdf.running = Some(Running {
             intent: Some(intent),
-            geometry,
+            target,
             marks,
             result,
         });
@@ -1289,8 +1426,8 @@ mod tests {
         ));
         let current = demo.page()?;
         assert_ne!(demo.session.borrow().app.document_id(), id);
-        assert_eq!(demo.session.pdf_zoom(BODY_VIEW)?, 1.0);
-        assert_eq!(current.len(), 160);
+        assert_eq!(demo.session.pdf_zoom(BODY_VIEW)?, 0.15);
+        assert_eq!(current.len(), 24);
         demo.session
             .borrow_mut()
             .apply(Action::JumpBack, current.as_ref(), "");
@@ -1391,16 +1528,20 @@ mod tests {
                 let request = state.pdf.queued.take().ok_or("expected turn")?;
                 assert!(matches!(request.intent, Intent::Turn { .. }));
                 // Wait without polling, then deliver the completed result to make this race deterministic.
+                let target = Target {
+                    geometry: narrow,
+                    scale: Scale::Fixed(1.0),
+                };
                 let completed = state
                     .pdf
-                    .submit(request.work, narrow, None, 1.0)
+                    .submit(request.work, target, None)
                     .map_err(io::Error::from)?
                     .recv_timeout(Duration::from_secs(15))?;
                 let (send, result) = mpsc::channel();
                 assert!(send.send(completed).is_ok());
                 state.pdf.running = Some(Running {
                     intent: Some(request.intent),
-                    geometry: narrow,
+                    target,
                     marks: None,
                     result,
                 });
@@ -1668,7 +1809,7 @@ mod tests {
                 let mut running = state.pdf.running.take().ok_or("expected history render")?;
                 let completed = running.result.recv_timeout(Duration::from_secs(15))?;
                 assert!(
-                    matches!(&completed, Ok((_, Ok(layout))) if layout.len() == original.len())
+                    matches!(&completed, Ok((_, Ok(rendered))) if rendered.layout.len() == original.len())
                 );
                 let (send, result) = mpsc::channel();
                 assert!(send.send(completed).is_ok());
@@ -1784,6 +1925,8 @@ mod tests {
         let pdf = state.document(BODY_VIEW)?.ok_or("no PDF document")?;
         assert_eq!(pdf.kind, DocumentKind::Pdf);
         assert_ne!(pdf.epoch, markdown.epoch);
+        state.set_pdf_zoom(BODY_VIEW, 1.0)?;
+        wait(&state, &runtime)?;
         let first = place(&mut state.borrow_mut(), 24)?;
         let id = state.borrow().app.document_id();
         {
@@ -1803,7 +1946,10 @@ mod tests {
                 .map_err(|_| io::Error::other("worker disconnected"))?;
             session.pdf.running = Some(Running {
                 intent: Some(intent),
-                geometry: FIRST,
+                target: Target {
+                    geometry: FIRST,
+                    scale: Scale::Fixed(1.0),
+                },
                 marks: None,
                 result,
             });
@@ -1892,7 +2038,9 @@ mod tests {
             state.borrow().app.document_path().canonicalize()?,
             path.canonicalize()?
         );
-        assert!(active_page(&state.borrow().app).is_some());
+        let first = place(&mut state.borrow_mut(), 24)?;
+        assert_eq!(first.len(), 24);
+        assert_eq!(state.pdf_zoom(BODY_VIEW)?, 0.15);
         // Run another Lua mapping to make sure cleanup also released the Lua handle.
         press(&mut keys, KeyCode::Char('f'));
         press(&mut keys, KeyCode::Char('f'));

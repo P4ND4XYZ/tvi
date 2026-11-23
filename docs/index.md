@@ -11,7 +11,7 @@ tviは端末上で文書を読むための閲覧専用ビューアです。Markd
 | 文書 | 説明 |
 |---|---|
 | [Markdown表示](features/markdown.md) | UTF-8ファイルの読み込み・自動再読み込み、折り返し、ローカル画像・Mermaidの図の表示、起動時のエラー |
-| [PDF表示](features/pdf.md) | 対応端末、開き方、ページ送り、テキスト検索、Luaからの倍率変更と横移動 |
+| [PDF表示](features/pdf.md) | 対応端末、開き方と初回表示、ページ送り、テキスト検索、Luaからの倍率変更と横移動 |
 | [文書内の移動](features/navigation.md) | 行・ページ単位の移動とリサイズ時の閲覧位置の保持 |
 | [動作モードと入力](features/modes.md) | NORMAL、COMMAND、SEARCHの役割と切り替え |
 | [検索](features/search.md) | Markdown・PDFの検索、一致箇所への移動とハイライト |

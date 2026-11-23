@@ -68,7 +68,7 @@ impl Document {
         self
     }
 
-    pub(crate) fn pdf(path: PathBuf, page: Page) -> Self {
+    pub(crate) fn pdf(path: PathBuf, page: Page, scale: f64) -> Self {
         let name = path
             .file_name()
             .unwrap_or(path.as_os_str())
@@ -78,7 +78,7 @@ impl Document {
             id: next_id(),
             name,
             path,
-            content: Content::Pdf(PdfDocument::new(page)),
+            content: Content::Pdf(PdfDocument::new(page, scale)),
         }
     }
 

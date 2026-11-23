@@ -19,6 +19,31 @@ pub(super) struct Raster {
 }
 
 impl PdfGeometry {
+    pub(crate) fn initial_scale(self, aspect_height: f64, body_rows: u16) -> Option<f64> {
+        let width = f64::from(u32::from(self.columns) * u32::from(self.cell_width));
+        let height = f64::from(u32::from(body_rows) * u32::from(self.cell_height));
+        if width == 0.0 || height == 0.0 || !aspect_height.is_finite() || aspect_height <= 0.0 {
+            return None;
+        }
+        let fitted_width = (height / aspect_height).min(width).max(1.0);
+        let scale = fitted_width / width;
+        // Check the same width raster() will round: dividing and multiplying
+        // by the body width can move the result across a half-pixel boundary.
+        let scale = if ((width * scale).round() * aspect_height).round() > height {
+            fitted_width.floor() / width
+        } else {
+            scale
+        };
+        // Keep the existing one-pixel minimum even if division rounds down.
+        let scale = if width * scale < 1.0 {
+            scale.next_up()
+        } else {
+            scale
+        };
+        let raster = self.raster(aspect_height, scale)?;
+        (raster.columns <= self.columns && raster.rows <= body_rows).then_some(scale)
+    }
+
     pub(crate) fn can_display(self, aspect_height: f64, scale: f64) -> bool {
         self.raster(aspect_height, scale).is_some()
     }
@@ -145,6 +170,61 @@ impl Raster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_scale_caps_width_and_avoids_rounding_into_an_extra_row() {
+        let geometry = PdfGeometry {
+            columns: 12,
+            cell_width: 2,
+            cell_height: 4,
+        };
+        let width_fit = geometry.initial_scale(0.5, 4);
+        assert_eq!(width_fit, Some(1.0));
+
+        // The 16-pixel body allows 10.66... pixels of width at 3:2. Rounding
+        // to 11 would produce 17 pixels of height in the existing raster path.
+        let raster = geometry
+            .initial_scale(1.5, 4)
+            .and_then(|scale| geometry.raster(1.5, scale))
+            .map(|raster| (raster.width, raster.height, raster.rows));
+        assert_eq!(raster, Some((10, 15, 4)));
+    }
+
+    #[test]
+    fn initial_scale_fits_after_half_pixel_rounding_through_zoom() {
+        let geometry = PdfGeometry {
+            columns: 80,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let aspect = 768.0 / 353.0;
+        let dimensions = geometry
+            .initial_scale(aspect, 24)
+            .and_then(|scale| geometry.raster(aspect, scale))
+            .map(|raster| (raster.width, raster.height, raster.columns, raster.rows));
+        assert_eq!(dimensions, Some((176, 383, 22, 24)));
+    }
+
+    #[test]
+    fn initial_scale_requires_a_displayable_raster_in_the_body() {
+        let geometry = PdfGeometry {
+            columns: 12,
+            cell_width: 2,
+            cell_height: 4,
+        };
+        assert_eq!(geometry.initial_scale(16.49, 4), Some(1.0 / 24.0));
+        assert!(geometry.initial_scale(16.5, 4).is_none());
+        assert!(geometry.initial_scale(1.0, 0).is_none());
+        assert!(
+            PdfGeometry {
+                columns: 4096,
+                cell_width: 8,
+                cell_height: 16,
+            }
+            .initial_scale(0.125, 256)
+            .is_none()
+        );
+    }
 
     #[test]
     fn zoom_range_accounts_for_pixel_budget_row_limit_and_one_pixel_minimum() {

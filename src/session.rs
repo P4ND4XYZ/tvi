@@ -46,7 +46,7 @@ struct Session {
     source_scroll: Option<(u64, usize)>,
     pdf: pdf::Jobs,
     pdf_geometry: Result<PdfGeometry, PdfFailure>,
-    pdf_normal_height: Option<usize>,
+    pdf_normal_height: u16,
 }
 
 #[derive(Default)]
@@ -86,7 +86,7 @@ impl Session {
             source_scroll: None,
             pdf: pdf::Jobs::default(),
             pdf_geometry: pdf::geometry(80, image_mode),
-            pdf_normal_height: None,
+            pdf_normal_height: 24,
         }
     }
 
@@ -98,9 +98,7 @@ impl Session {
                     self.pdf.start_search(&mut self.app, input, direction);
                     // The origin was the prompt viewport, but the jump uses the
                     // normal body height, even if results arrive before redraw.
-                    if let Some(height) = self.pdf_normal_height {
-                        self.app.reflow(rows, height);
-                    }
+                    self.app.reflow(rows, usize::from(self.pdf_normal_height));
                     return;
                 }
                 (Mode::Normal, Action::RepeatSearch { reverse }) => {
@@ -156,11 +154,6 @@ impl Session {
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>, layout: &Layout<'_>, runtime: &Runtime) {
         let area = frame.area();
         let body = ui::body_area(area, self.app.mode());
-        self.pdf_normal_height = self
-            .app
-            .document()
-            .as_pdf()
-            .map(|_| usize::from(ui::body_area(area, Mode::Normal).height));
         self.app.reflow(layout, usize::from(body.height));
         if let Some((id, line)) = self.source_scroll.take()
             && id == self.app.document_id()
@@ -181,12 +174,13 @@ impl Session {
 
     fn sync_pdf_layout(
         &mut self,
-        width: u16,
+        size: Size,
         mode: ImageMode,
         active: &mut Option<pdf::PlacedPage>,
         retired: &mut Vec<u32>,
     ) {
-        self.pdf_geometry = pdf::geometry(width, mode);
+        self.pdf_geometry = pdf::geometry(size.width, mode);
+        self.pdf_normal_height = pdf::normal_body_height(size);
         let latest = self.pdf.placed(&self.app);
         if active
             .as_ref()
@@ -577,6 +571,7 @@ fn run_app(
     );
     initial.pdf = jobs;
     initial.pdf_geometry = pdf::geometry(size.width, mode);
+    initial.pdf_normal_height = pdf::normal_body_height(size);
     if initial.app.document().as_pdf().is_none() {
         drop(initial.display());
     }
@@ -655,7 +650,7 @@ fn run_document(
                 markdown_layout = build_markdown(width, image_mode);
             }
             let mut session = session.borrow_mut();
-            session.sync_pdf_layout(area.width, mode, &mut pdf_layout, retired);
+            session.sync_pdf_layout(drawn_size, mode, &mut pdf_layout, retired);
             let layout = markdown_layout
                 .as_ref()
                 .or_else(|| {
@@ -729,7 +724,7 @@ fn run_document(
                 image_mode,
             )?;
             let pdf_redraw = !resized && {
-                let cell_size = if session.borrow().pdf.restore_pending() {
+                let cell_size = if session.borrow().pdf.needs_cell_size_check() {
                     terminal_input.pdf_restore_cell_size()
                 } else {
                     CellSizeStatus::Ready
@@ -815,12 +810,13 @@ fn poll_pdf_with_cell_size(
             app,
             floats,
             pdf_geometry,
+            pdf_normal_height,
             prepared,
             source_scroll,
             ..
         } = &mut *state;
         let id = app.document_id();
-        let update = pdf.poll(app, floats, *pdf_geometry, cell_size);
+        let update = pdf.poll(app, floats, *pdf_geometry, *pdf_normal_height, cell_size);
         if app.document_id() != id {
             // Markdown history must re-read images even if a PDF was the only intervening view.
             *prepared = None;

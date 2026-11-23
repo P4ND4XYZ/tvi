@@ -294,10 +294,7 @@ fn check_clipped_labels(path_clip: &str, mode: u8, count: usize) -> Result<(), B
     let path = dir.path().join("labels.pdf");
     fs::write(&path, crate::test_pdf::clipped_labels(path_clip, mode))?;
     let mut view = View::new()?;
-    assert!(matches!(
-        view.session.open_file(BODY_VIEW, &path)?,
-        FileOpen::Pending
-    ));
+    view.open_at_width(&path)?;
     let plain = view.sync()?;
     let base = viewport_pixels(&mut view, &plain)?;
     view.query(&plain, '/', "TAG")?;
@@ -515,8 +512,11 @@ fn failed_or_cancelled_search_render_does_not_replace_the_page_or_selection()
         assert!(send.send(Err(failure)).is_ok());
         // Substitute only native completion, not input, extraction or navigation.
         state.pdf.running = Some(Running {
+            target: super::Target {
+                geometry: state.pdf_geometry.map_err(io::Error::from)?,
+                scale: request.intent.scale(&state.app, state.pdf_normal_height),
+            },
             intent: Some(request.intent),
-            geometry: state.pdf_geometry.map_err(io::Error::from)?,
             marks: None,
             result,
         });
@@ -598,11 +598,19 @@ impl View {
         let path = dir.path().join("kana-probe.pdf");
         fs::write(&path, crate::test_pdf::japanese_text_pages())?;
         let view = Self::new()?;
+        view.open_at_width(&path)?;
+        Ok((view, dir))
+    }
+
+    fn open_at_width(&self, path: &std::path::Path) -> Result<(), Box<dyn Error>> {
         assert!(matches!(
-            view.session.open_file(BODY_VIEW, &path)?,
+            self.session.open_file(BODY_VIEW, path)?,
             FileOpen::Pending
         ));
-        Ok((view, dir))
+        wait(&self.session, &self.runtime)?;
+        // Clip and coordinate probes need a page taller than their viewport.
+        self.session.set_pdf_zoom(BODY_VIEW, 1.0)?;
+        Ok(())
     }
 
     fn new() -> Result<Self, Box<dyn Error>> {
@@ -621,14 +629,14 @@ impl View {
             kitty: KittyClip::default(),
             input: InputQueue::default(),
         };
-        view.sync_width()?;
+        view.sync_size()?;
         Ok(view)
     }
 
-    fn sync_width(&mut self) -> Result<(), Box<dyn Error>> {
+    fn sync_size(&mut self) -> Result<(), Box<dyn Error>> {
         let mut retired = Vec::new();
         self.session.borrow_mut().sync_pdf_layout(
-            self.terminal.size()?.width,
+            self.terminal.size()?,
             KITTY,
             &mut self.active,
             &mut retired,
@@ -638,9 +646,9 @@ impl View {
     }
 
     fn sync(&mut self) -> Result<PlacedPage, Box<dyn Error>> {
-        self.sync_width()?;
+        self.sync_size()?;
         wait(&self.session, &self.runtime)?;
-        self.sync_width()?;
+        self.sync_size()?;
         let layout = self.active.clone().ok_or("missing live PDF placement")?;
         self.draw(&layout)?;
         Ok(layout)
