@@ -1,7 +1,7 @@
 local follow = require("plugins.follow")
 
 local function with_follow(run)
-  local env = { HERDR_WORKSPACE_ID = "work-資料" }
+  local env = { HERDR_TAB_ID = "work-資料" }
   local state = { path = "/docs/Current.md", calls = 0, closed = 0, opened = {}, scrolls = {} }
   local view = {}
   function view:document()
@@ -49,9 +49,9 @@ end
 
 local function start_and_stop_are_opt_in(state, env)
   assert(state.calls == 0)
-  env.HERDR_WORKSPACE_ID = nil
+  env.HERDR_TAB_ID = nil
   assert(follow.start() == nil and state.calls == 0)
-  env.HERDR_WORKSPACE_ID = "work-資料"
+  env.HERDR_TAB_ID = "work-資料"
   assert(follow.start())
   assert(follow.start() and state.calls == 1 and state.port == 23511)
   follow.stop()

@@ -1089,7 +1089,7 @@ mod tests {
         let init = scratch.init(&format!(
             r#"
             os.getenv = function(name)
-                if name == 'HERDR_WORKSPACE_ID' then return 'workspace' end
+                if name == 'HERDR_TAB_ID' then return 'w1:t1' end
                 if name == 'TVI_FOLLOW_PORT' then return '{}' end
             end
             local follow = (function()
@@ -1106,7 +1106,7 @@ mod tests {
         assert_eq!(error, None);
         let send = |line: usize| -> io::Result<()> {
             let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1))?;
-            writeln!(stream, "workspace\t{line}\t{}", source.display())?;
+            writeln!(stream, "w1:t1\t{line}\t{}", source.display())?;
             stream.shutdown(Shutdown::Write)
         };
         let id = session.borrow().app.document_id();

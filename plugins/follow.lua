@@ -6,7 +6,7 @@ local function fail(message)
   return nil, message
 end
 
-local function follow_port(workspace)
+local function follow_port(tab_id)
   local override = os.getenv("TVI_FOLLOW_PORT")
   if override ~= nil then
     local port = override:match("^[0-9]+$") and math.tointeger(tonumber(override))
@@ -16,8 +16,8 @@ local function follow_port(workspace)
     return nil
   end
   local hash = 5381
-  for i = 1, #workspace do
-    hash = (hash * 33 + workspace:byte(i)) % 4294967296
+  for i = 1, #tab_id do
+    hash = (hash * 33 + tab_id:byte(i)) % 4294967296
   end
   return 20000 + hash % 40001
 end
@@ -26,11 +26,11 @@ function M.start()
   if listener then
     return true
   end
-  local workspace = os.getenv("HERDR_WORKSPACE_ID")
-  if not workspace or workspace == "" or workspace:find("[\t\r\n%z]") or not utf8.len(workspace) then
-    return fail("follow: HERDR_WORKSPACE_ID is missing or invalid")
+  local tab_id = os.getenv("HERDR_TAB_ID")
+  if not tab_id or tab_id == "" or tab_id:find("[\t\r\n%z]") or not utf8.len(tab_id) then
+    return fail("follow: HERDR_TAB_ID is missing or invalid")
   end
-  local port = follow_port(workspace)
+  local port = follow_port(tab_id)
   if not port then
     return fail("follow: TVI_FOLLOW_PORT must be a decimal integer from 1 to 65535")
   end
@@ -39,7 +39,7 @@ function M.start()
       return false
     end
     local id, line_text, path = payload:match("^([^\t]+)\t([0-9]+)\t(.+)$")
-    if id ~= workspace then
+    if id ~= tab_id then
       return false
     end
     local line = math.tointeger(tonumber(line_text))
