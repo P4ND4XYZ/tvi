@@ -15,6 +15,7 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -193,6 +194,48 @@ fn deadline_cleans_process_and_workspace_and_limits_the_document() {
         document.convert("red", pixel).result,
         Err(Failure::Timeout(TimeoutScope::Document))
     );
+    assert!(!fixture.cache.exists());
+}
+
+#[test]
+fn cancellation_stops_the_renderer_and_cleans_its_workspace() {
+    let fixture = Fixture::new(true);
+    let options = fixture.options(4096).with_limits(Limits {
+        per_diagram: Duration::from_secs(8),
+        per_document: Duration::from_secs(12),
+    });
+    let cancelled = AtomicBool::new(false);
+    let marker = if cfg!(unix) { "cooperative" } else { "timeout" };
+    let result = thread::scope(|scope| {
+        let task = scope.spawn(|| {
+            options
+                .start_document()
+                .with_cancellation(&cancelled)
+                .convert(marker, pixel)
+        });
+        let started = Instant::now();
+        while !(fixture.work.join("ready").is_file()
+            && fixture.work.join("descendant-ready").is_file())
+        {
+            if started.elapsed() >= Duration::from_secs(3) {
+                cancelled.store(true, Ordering::Relaxed);
+                panic!("renderer and descendant did not start");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        cancelled.store(true, Ordering::Relaxed);
+        task.join().unwrap()
+    });
+    assert_eq!(result.result, Err(Failure::Cancelled));
+    assert_process_stopped(&fixture.work, "running", "ready");
+    assert_process_stopped(&fixture.work, "descendant-running", "descendant-ready");
+    #[cfg(unix)]
+    {
+        let graceful = fixture.work.join("term-handled");
+        assert!(graceful.is_file());
+        fs::remove_file(graceful).unwrap();
+    }
+    fixture.assert_clean();
     assert!(!fixture.cache.exists());
 }
 

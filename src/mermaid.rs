@@ -1,4 +1,4 @@
-//! Synchronous Mermaid conversion. The caller owns fallback rendering and reporting.
+//! Cancellable Mermaid conversion. The caller owns scheduling and rendering.
 
 #[path = "mermaid/cache.rs"]
 mod cache;
@@ -11,6 +11,7 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -27,8 +28,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            per_diagram: Duration::from_secs(5),
-            per_document: Duration::from_secs(15),
+            per_diagram: Duration::from_secs(10),
+            per_document: Duration::from_secs(30),
         }
     }
 }
@@ -61,6 +62,7 @@ pub enum Failure {
         code: Option<i32>,
     },
     Timeout(TimeoutScope),
+    Cancelled,
     MissingOutput,
     ReadOutput(io::ErrorKind),
     InvalidPng,
@@ -72,7 +74,9 @@ impl Failure {
             Self::Unavailable => Stage::Discovery,
             Self::Prepare(_) => Stage::Prepare,
             Self::Launch { .. } => Stage::Launch,
-            Self::Wait(_) | Self::Exit { .. } | Self::Timeout(_) => Stage::Execute,
+            Self::Wait(_) | Self::Exit { .. } | Self::Timeout(_) | Self::Cancelled => {
+                Stage::Execute
+            }
             Self::MissingOutput | Self::ReadOutput(_) | Self::InvalidPng => Stage::Output,
         }
     }
@@ -102,6 +106,7 @@ pub struct Conversion<T> {
     pub cache: CacheReport,
 }
 
+#[derive(Clone)]
 pub struct Mermaid {
     path: Option<OsString>,
     cache: Option<cache::Cache>,
@@ -130,6 +135,7 @@ impl Mermaid {
             options: self,
             executable: process::find(self.path.as_deref()),
             started: Instant::now(),
+            cancelled: None,
         }
     }
 
@@ -156,16 +162,26 @@ pub struct Document<'a> {
     options: &'a Mermaid,
     executable: Option<PathBuf>,
     started: Instant,
+    cancelled: Option<&'a AtomicBool>,
 }
 
-struct Deadline {
+struct Deadline<'a> {
     started: Instant,
     budget: Duration,
     scope: TimeoutScope,
+    cancelled: Option<&'a AtomicBool>,
 }
 
-impl Deadline {
+impl Deadline<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
     fn check(&self) -> Result<(), Failure> {
+        if self.is_cancelled() {
+            return Err(Failure::Cancelled);
+        }
         if self.started.elapsed() >= self.budget {
             Err(Failure::Timeout(self.scope))
         } else {
@@ -178,12 +194,17 @@ impl Deadline {
     dead_code,
     reason = "the core is also compiled standalone for integration tests"
 )]
-impl Document<'_> {
+impl<'a> Document<'a> {
+    pub(crate) fn with_cancellation(mut self, cancelled: &'a AtomicBool) -> Self {
+        self.cancelled = Some(cancelled);
+        self
+    }
+
     pub(crate) fn available(&self) -> bool {
         self.executable.is_some()
     }
 
-    /// Read-only history lookup; never launches the renderer or modifies the cache.
+    /// Read-only cache lookup; never launches the renderer or modifies the cache.
     pub(crate) fn cached_png(&self, source: &str) -> Result<Option<Vec<u8>>, CacheIssue> {
         if !self.available() {
             return Ok(None);
@@ -225,6 +246,7 @@ impl Document<'_> {
             started,
             budget,
             scope,
+            cancelled: self.cancelled,
         };
         let result = deadline
             .check()
@@ -245,7 +267,7 @@ impl Document<'_> {
         &self,
         source: &str,
         decode: &mut impl FnMut(&[u8]) -> Option<T>,
-        deadline: &Deadline,
+        deadline: &Deadline<'_>,
         report: &mut CacheReport,
     ) -> Result<T, Failure> {
         let executable = self.executable.as_deref().ok_or(Failure::Unavailable)?;

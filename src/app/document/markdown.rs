@@ -132,6 +132,24 @@ impl Markdown {
         self.search.refresh(text, remap, *anchor);
     }
 
+    pub(super) fn collapse_diagram_positions(
+        &mut self,
+        anchor: &mut usize,
+        text: &str,
+        ranges: &[Range<usize>],
+    ) {
+        let remap = |offset: usize| {
+            let removed = ranges
+                .iter()
+                .take_while(|range| range.start < offset)
+                .map(|range| offset.min(range.end) - range.start)
+                .sum::<usize>();
+            offset - removed
+        };
+        *anchor = remap(*anchor);
+        self.search.refresh(text, remap, *anchor);
+    }
+
     pub(super) fn refresh_reloaded_positions(&mut self, anchor: &mut usize, text: &str) {
         *anchor = (*anchor).min(text.len());
         self.search.refresh(text, |offset| offset, *anchor);

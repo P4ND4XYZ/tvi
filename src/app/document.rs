@@ -127,6 +127,17 @@ impl Document {
         Some((&app.document.path, text, resources))
     }
 
+    pub(crate) fn departing_markdown_resources(
+        app: &mut App,
+        id: u64,
+    ) -> Option<&mut MarkdownResources> {
+        let departing = &mut app.history.last_mut()?.document;
+        if departing.id != id {
+            return None;
+        }
+        Some(departing.markdown_mut()?.display_input().1)
+    }
+
     pub(crate) fn restore_display_positions(
         app: &mut App,
         text: &str,
@@ -140,6 +151,12 @@ impl Document {
                 expansions,
                 uncertain,
             );
+        }
+    }
+
+    pub(crate) fn collapse_diagram_positions(app: &mut App, text: &str, ranges: &[Range<usize>]) {
+        if let Some(markdown) = app.document.markdown_mut() {
+            markdown.collapse_diagram_positions(&mut app.viewport.anchor.byte, text, ranges);
         }
     }
 

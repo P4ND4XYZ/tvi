@@ -9,7 +9,7 @@ Luaでtviを設定し、キーの割り当てや本文ビューの操作を追�
 | OS | 設定ファイル |
 |---|---|
 | Windows | `%LOCALAPPDATA%\tvi\init.lua` |
-| Linux | `$XDG_CONFIG_HOME/tvi/init.lua`。未設定・空・相対パスの場合は `~/.config/tvi/init.lua` |
+| Linux | `$XDG_CONFIG_HOME/tvi/init.lua` あるいは `~/.config/tvi/init.lua` |
 
 起動時に該当する `init.lua` を読み込みます。`--config` は設けません。設定ファイルがなければ通常どおり起動し、エラーがあればファイル名と理由を通知して、既定の操作で閲覧を続けられるようにします。
 

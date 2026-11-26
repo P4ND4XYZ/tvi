@@ -11,6 +11,8 @@ use std::{
 use super::{Deadline, Failure, INPUT, OUTPUT};
 
 pub(super) const RENDER_ARGS: [&str; 6] = ["-i", INPUT, "-o", OUTPUT, "--scale", "2"];
+#[cfg(unix)]
+const MAX_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 #[cfg(unix)]
 #[path = "process/unix.rs"]
@@ -43,17 +45,19 @@ pub(super) fn run(
     executable: &Path,
     path: &OsStr,
     work: &Path,
-    deadline: &Deadline,
+    deadline: &Deadline<'_>,
 ) -> Result<(), Failure> {
     let Deadline {
         started,
         budget,
         scope,
+        ..
     } = *deadline;
+    deadline.check()?;
     // Reserve part of the existing Unix deadline for cooperative shutdown.
     // This never adds grace beyond the caller's budget.
     #[cfg(unix)]
-    let run_budget = budget - (budget / 5).min(Duration::from_millis(250));
+    let run_budget = budget - (budget / 5).min(MAX_SHUTDOWN_GRACE);
     #[cfg(windows)]
     let run_budget = budget;
     if started.elapsed() >= run_budget {
@@ -76,6 +80,18 @@ pub(super) fn run(
     })?;
 
     loop {
+        if deadline.is_cancelled() {
+            #[cfg(unix)]
+            {
+                // The launcher may be able to stop a browser outside its group.
+                let now = std::time::Instant::now();
+                let grace = budget
+                    .saturating_sub(now.duration_since(started))
+                    .min(MAX_SHUTDOWN_GRACE);
+                running.graceful_shutdown(now, grace);
+            }
+            return Err(Failure::Cancelled);
+        }
         let remaining = run_budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             #[cfg(unix)]

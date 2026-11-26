@@ -10,7 +10,7 @@ tviは端末上で文書を読むための閲覧専用ビューアです。Markd
 
 | 文書 | 説明 |
 |---|---|
-| [Markdown表示](features/markdown.md) | UTF-8ファイルの読み込み・自動再読み込み、折り返し、ローカル画像・Mermaidの図の表示、起動時のエラー |
+| [Markdown表示](features/markdown.md) | UTF-8ファイルの読み込み・自動再読み込み、折り返し、ローカル画像の表示・Mermaidのバックグラウンド変換、起動時のエラー |
 | [PDF表示](features/pdf.md) | 対応端末、開き方と初回表示、ページ送り、テキスト検索、Luaからの倍率変更と横移動 |
 | [文書内の移動](features/navigation.md) | 行・ページ単位の移動とリサイズ時の閲覧位置の保持 |
 | [動作モードと入力](features/modes.md) | NORMAL、COMMAND、SEARCHの役割と切り替え |
@@ -26,4 +26,4 @@ tviは端末上で文書を読むための閲覧専用ビューアです。Markd
 
 - [モジュール構成と依存関係](design/architecture.md): 各モジュールの責務、Markdown adapterの境界、[PDFワーカーの処理の流れ](design/architecture.md#pdfワーカーの処理の流れ)と文書の保持期間
 - [Lua連携の設計](design/lua-integration.md): RustとLuaの責務、入力と状態の管理
-- [Mermaid表示の設計](design/mermaid.md): 変換プロセスと既存の画像表示の境界、PNGキャッシュ、検証方針
+- [Mermaid表示の設計](design/mermaid.md): 非同期変換と既存の画像表示の境界、PNGキャッシュ

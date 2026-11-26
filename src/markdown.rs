@@ -34,8 +34,12 @@ pub struct MarkdownResources {
     pub links: Vec<MarkdownLink>,
     pub images: Vec<ImageReference>,
     pub image_count: usize,
-    // None: newly opened. Some: only these block ordinals may be restored from cache.
+    // None: newly opened. Some: these previously displayed blocks may be restored from cache.
     pub(crate) successful_diagrams: Option<Vec<usize>>,
+    // Completed before departure, but still shown as code at departure.
+    pub(crate) unshown_diagrams: Vec<usize>,
+    // Still awaiting a result when the viewer left this history entry.
+    pub(crate) pending_diagrams: Vec<usize>,
 }
 
 /// すべての画像開始イベントを数えた文書内通番。

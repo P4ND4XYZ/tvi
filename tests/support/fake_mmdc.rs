@@ -1,6 +1,13 @@
 //! Standalone renderer substitute, compiled with rustc by the integration test.
 
-use std::{env, fs, path::Path, process::Command, thread, time::Duration};
+use std::{
+    env, fs,
+    io::Write,
+    path::Path,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
 
 const RED: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0,
@@ -33,7 +40,7 @@ fn main() {
     if marker.trim_end() == "record_launch" {
         fs::write("../renderer-launched", b"started").unwrap();
     }
-    match marker.as_str() {
+    match marker.trim_end() {
         "exit" => {
             eprintln!("private renderer data");
             std::process::exit(17);
@@ -50,9 +57,30 @@ fn main() {
         }
         #[cfg(unix)]
         "cooperative" | "unresponsive" => unix::simulate(marker == "cooperative"),
+        "gate" => gated_png(),
         "blue" => fs::write("output.png", BLUE).unwrap(),
         _ => fs::write("output.png", RED).unwrap(),
     }
+}
+
+fn gated_png() {
+    let lock = fs::File::create("../gate.lock").unwrap();
+    lock.lock().unwrap();
+    let mut starts = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("../gate-started")
+        .unwrap();
+    starts.write_all(b".").unwrap();
+    let started = Instant::now();
+    while !Path::new("../gate-release").exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "fake render was not released"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    fs::write("output.png", BLUE).unwrap();
 }
 
 #[cfg(unix)]
@@ -62,7 +90,6 @@ mod unix {
         ffi::c_int,
         os::unix::process::CommandExt,
         sync::atomic::{AtomicBool, Ordering},
-        time::Instant,
     };
 
     type Handler = extern "C" fn(c_int);

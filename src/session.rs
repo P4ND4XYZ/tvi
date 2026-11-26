@@ -41,6 +41,7 @@ struct Session {
     floats: Floats,
     image_mode: ImageMode,
     renderer: Option<crate::mermaid::Mermaid>,
+    mermaid_jobs: mermaid::Jobs,
     prepared: Option<(u64, Rc<mermaid::PreparedDisplay>)>,
     reload_positions: Option<u64>,
     source_scroll: Option<(u64, usize)>,
@@ -81,6 +82,7 @@ impl Session {
             floats: Floats::default(),
             image_mode,
             renderer,
+            mermaid_jobs: mermaid::Jobs::default(),
             prepared: None,
             reload_positions: None,
             source_scroll: None,
@@ -128,7 +130,33 @@ impl Session {
         {
             return;
         }
+        let epoch = self.app.display_epoch();
         self.app.apply(action, rows, text);
+        if self.app.display_epoch() != epoch {
+            self.clear_markdown();
+        }
+    }
+
+    fn clear_markdown(&mut self) {
+        self.mermaid_jobs.cancel();
+        self.prepared = None;
+    }
+
+    fn archive_markdown(&mut self, id: u64) {
+        let completed = self.mermaid_jobs.cancel_for_history();
+        if let Some(resources) = Document::departing_markdown_resources(&mut self.app, id) {
+            mermaid::archive_completed(resources, completed);
+        }
+        self.prepared = None;
+    }
+
+    fn publish_mermaid(&mut self, updates: Vec<mermaid::Event>) {
+        if let Some((id, prepared)) = &mut self.prepared
+            && *id == self.app.document_id()
+            && let Some(prepared) = Rc::get_mut(prepared)
+        {
+            mermaid::publish(&mut self.app, prepared, updates);
+        }
     }
 
     fn display(&mut self) -> Rc<mermaid::PreparedDisplay> {
@@ -138,11 +166,12 @@ impl Session {
         {
             return Rc::clone(prepared);
         }
-        self.prepared = None;
+        self.clear_markdown();
         let prepared = Rc::new(mermaid::prepare(
             &mut self.app,
             self.image_mode,
             self.renderer.as_ref(),
+            &mut self.mermaid_jobs,
         ));
         if self.reload_positions.take() == Some(id) {
             Document::refresh_reloaded_positions(&mut self.app, prepared.document.search_text());
@@ -484,11 +513,12 @@ impl Host for RefCell<Session> {
             }
         })?;
         let mut session = self.borrow_mut();
-        session.prepared = None;
         session.source_scroll = None;
         let Session { app, pdf, .. } = &mut *session;
+        let id = app.document_id();
         pdf.cancel_search(app);
         app.open_document(document);
+        session.archive_markdown(id);
         Ok(FileOpen::Opened)
     }
 
@@ -611,10 +641,11 @@ fn run_document(
 ) -> io::Result<()> {
     let mut image_mode = terminal_input.image_mode();
     let mut width = terminal::check(screen.size(), "size", Some(image_mode), "exit")?.width;
-    let (document_id, prepared) = {
+    let (document_id, epoch, prepared) = {
         let mut session = session.borrow_mut();
         (
             session.app.document_id(),
+            session.app.display_epoch(),
             session
                 .app
                 .document()
@@ -632,6 +663,12 @@ fn run_document(
     let mut pdf_layout: Option<pdf::PlacedPage> = None;
     let blank = Layout::empty_pdf();
     let search_text = prepared.as_ref().map_or("", |md| md.document.search_text());
+    let mut updates = Vec::new();
+    let departed = |state: &Session| {
+        state.app.should_quit()
+            || state.app.document_id() != document_id
+            || state.app.display_epoch() != epoch
+    };
     let result = (|| loop {
         let size = terminal::check(screen.size(), "size", Some(image_mode), "exit")?;
         observe_terminal_size(terminal_input, previous_size, size);
@@ -709,9 +746,7 @@ fn run_document(
             let redraw = keys.dispatch(key, session, runtime, layout, search_text);
             let now = Instant::now();
             let net_redraw = poll_net(session, runtime, now, before);
-            if session.borrow().app.should_quit()
-                || session.borrow().app.document_id() != document_id
-            {
+            if departed(&session.borrow()) {
                 return Ok(());
             }
             // A resize can occur during dispatch (including a Lua callback). Check
@@ -732,16 +767,21 @@ fn run_document(
                 poll_pdf_with_cell_size(session, runtime, cell_size)
             };
             let reload_redraw = reload.poll(&mut session.borrow_mut(), now, keys.busy(now));
-            if session.borrow().app.document_id() != document_id {
+            if departed(&session.borrow()) {
                 return Ok(());
+            }
+            if prepared.is_some() {
+                updates = session.borrow_mut().mermaid_jobs.poll();
+                if !updates.is_empty() {
+                    return Ok(());
+                }
             }
             if redraw || reload_redraw || net_redraw || pdf_redraw || resized || more_tiles {
                 break;
             }
         }
     })();
-    session.borrow_mut().pdf.depart(document_id);
-    result.and(terminal::check(
+    let result = result.and(terminal::check(
         terminal::delete_images(
             markdown_layout
                 .as_ref()
@@ -752,7 +792,17 @@ fn run_document(
         "delete_images",
         Some(image_mode),
         "exit",
-    ))
+    ));
+    drop(markdown_layout);
+    drop(prepared);
+    let mut state = session.borrow_mut();
+    if result.is_err() || departed(&state) {
+        state.pdf.depart(document_id);
+        state.clear_markdown();
+    } else {
+        state.publish_mermaid(updates);
+    }
+    result
 }
 
 fn observe_terminal_size(input: &mut terminal::Input, previous_size: &mut Size, size: Size) {
@@ -811,16 +861,14 @@ fn poll_pdf_with_cell_size(
             floats,
             pdf_geometry,
             pdf_normal_height,
-            prepared,
-            source_scroll,
             ..
         } = &mut *state;
         let id = app.document_id();
         let update = pdf.poll(app, floats, *pdf_geometry, *pdf_normal_height, cell_size);
         if app.document_id() != id {
             // Markdown history must re-read images even if a PDF was the only intervening view.
-            *prepared = None;
-            *source_scroll = None;
+            state.archive_markdown(id);
+            state.source_scroll = None;
         }
         update
     };
@@ -848,7 +896,7 @@ impl InputQueue {
     }
 
     fn busy(&self, now: Instant) -> bool {
-        // Let an ambiguous key sequence resolve before synchronous display preparation.
+        // Let an ambiguous key sequence resolve before replacing the displayed document.
         // Pure prefixes have no input deadline and can survive a reload.
         !self.replay.is_empty()
             || self

@@ -243,9 +243,9 @@ impl Reload {
         if markdown == session.app.document().markdown().unwrap().text() {
             return Ok(false);
         }
-        session
-            .app
-            .replace_document(document_from_markdown(path, markdown));
+        let replacement = document_from_markdown(path, markdown);
+        session.clear_markdown();
+        session.app.replace_document(replacement);
         let id = session.app.document_id();
         session.reload_positions = Some(id);
         self.current = Some(id);

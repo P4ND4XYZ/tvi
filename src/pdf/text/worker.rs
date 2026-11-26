@@ -243,7 +243,7 @@ fn decode(bytes: &[u8], count: u32) -> ResultHits {
         [0, hits @ ..] if hits.len() <= MAX_HITS * HIT_BYTES && hits.len() % HIT_BYTES == 0 => {
             let mut result = Vec::with_capacity(hits.len() / HIT_BYTES);
             let mut last = (0, 0.0);
-            for entry in hits.chunks_exact(HIT_BYTES) {
+            for entry in hits.as_chunks::<HIT_BYTES>().0 {
                 let page = u32::from_le_bytes(entry[..4].try_into().map_err(|_| PROCESS)?);
                 let from_top = f64::from_le_bytes(entry[4..12].try_into().map_err(|_| PROCESS)?);
                 let aspect_height =

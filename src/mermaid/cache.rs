@@ -13,6 +13,7 @@ use super::{CacheIssue, Failure, process::RENDER_ARGS, read_png};
 const CAPACITY: u64 = 128 * 1024 * 1024;
 const STAGING_PREFIX: &str = ".staging-";
 
+#[derive(Clone)]
 pub(super) struct Cache {
     pub(super) root: PathBuf,
     pub(super) capacity: u64,
